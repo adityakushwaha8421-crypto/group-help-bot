@@ -1,0 +1,71 @@
+# Selectors for the Illunise admin panel. Login selectors were taken from the live login page.
+# Orders page selectors are DEFAULT GUESSES for a standard HTML table; verify them once against
+# https://illunise.in/admin/orders and adjust. Every key can be a CSS selector or "text=..." Playwright selector.
+login:
+  path: /admin/login
+  username: "#username"
+  password: "#password"
+  submit: "button.login-btn, button[type=submit]"
+  # Checked ONLY while still on the login page after submit (the dashboard legitimately shows "FAILED" counters)
+  error: ".error, .alert-danger, .login-error, .invalid-feedback, text=/invalid (username|password|credentials)|incorrect password|login failed/i"
+  # Any of these means a second factor / captcha is required -> manual auth step
+  second_factor: "input[name*=otp], input[name*=code], iframe[src*=recaptcha], .g-recaptcha, .h-captcha"
+  # URL substring that indicates we are still on the login page
+  login_url_marker: "/admin/login"
+
+orders:
+  path: /admin/orders
+  # Search box + how to submit it (press Enter if submit is empty)
+  search_input: "input[type=search], input[name=search], input[name=q], input[placeholder*=earch]"
+  search_submit: ""
+  # Optional: a query-string based search instead of typing (e.g. "?search={query}"); empty = use the input
+  search_query_param: "?search={query}"
+  # Wait for this after searching
+  results_ready: "table"
+  table: "table"
+  header_cells: "thead th"
+  rows: "tbody tr"
+  cells: "td"
+  # Optional link inside a row that opens the order detail page (extra fields are merged from there)
+  detail_link: "a:has-text('View'), button:has-text('View')"
+  # View page: /admin/orders/<ORDER ID>. Read for every candidate (up to max_detail_pages) because the
+  # list has no mobile/name column, and the registration number IS the customer's registered mobile.
+  detail_path: "/admin/orders/{order_id}"
+  detail_fields: "dl, table"
+  max_detail_pages: 15
+  # Pagination
+  next_page: "a[rel=next], li.next a, a:has-text('Next')"
+  max_pages: 5
+  empty_marker: "text=/no (orders|records|results|data)/i"
+
+# Live /admin/orders headers seen on 2026-09-10: ORDER ID | AMOUNT | STATUS | GATEWAY | LOCATION | DATE & TIME | UTR | (View)
+# The table has NO registration/mobile column: registration matching relies on the search box and/or the View page.
+# Map canonical fields -> header aliases (case-insensitive, whitespace/underscore-insensitive).
+# Adjust once you see the real column headers on /admin/orders.
+columns:
+  illunise_order_id: ["order id", "order", "id", "order no", "order number", "#"]
+  betex_order_id: ["betex order id", "betix order id", "betex pay order", "merchant order no", "merchant order", "gateway order id", "pg order id", "txn id", "transaction id", "reference", "ref"]
+  registration_number: ["registration", "registration no", "registration number", "reg no", "reg", "user id", "mobile", "phone", "customer id"]
+  gateway: ["gateway", "sms gateway"]
+  amount: ["amount", "order amount", "total", "price"]
+  paid_amount: ["paid amount", "paid"]
+  status: ["status", "order status", "payment status"]
+  created_at: ["created", "created at", "date", "time", "order time", "created time", "date & time", "date and time"]
+  paid_at: ["paid at", "payment time", "updated", "updated at"]
+  utr: ["utr", "utr no", "bank ref", "rrn"]
+  upi_id: ["upi", "upi id", "vpa", "payer upi", "payer vpa"]
+  payer_name: ["payer", "payer name", "name", "customer", "customer name", "user"]
+
+# View-page labels -> canonical fields (live page 2026-09-10: Name, Mobile, Email, IP Address, Location, Coordinates,
+# ISP / Network, Timezone, Amount, Charges, Net, UTR, Status, SMS Gateway, Created, Updated, Callback URL, Return URL)
+view_fields:
+  registration_number: ["Mobile", "Phone", "Registered Mobile"]
+  payer_name: ["Name", "Customer", "Customer Name"]
+  email: ["Email"]
+  amount: ["Amount"]
+  padded_amount: ["Padded Amount", "Paid Amount", "Payable", "Payable Amount"]
+  utr: ["UTR"]
+  status: ["Status"]
+  gateway: ["SMS Gateway", "Gateway"]
+  created_at: ["Created"]
+  paid_at: ["Updated"]

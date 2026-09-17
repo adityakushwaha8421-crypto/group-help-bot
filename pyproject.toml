@@ -1,0 +1,14 @@
+[project]
+name = "betix-payment-verifier"
+version = "0.1.0"
+description = "AI-assisted payment verification: Telegram intake -> Illunise admin order match -> Betix Pay group posting, monitoring, follow-ups and admin notification"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110

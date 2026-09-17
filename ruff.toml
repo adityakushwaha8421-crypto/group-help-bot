@@ -1,0 +1,10 @@
+line-length = 120
+target-version = "py312"
+extend-exclude = ["app/db/migrations"]
+
+[lint]
+select = ["F", "I", "E", "W"]
+ignore = ["E501", "E731", "E741"]
+
+[lint.per-file-ignores]
+"tests/*" = ["F811"]

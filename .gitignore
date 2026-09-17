@@ -1,0 +1,24 @@
+# --- secrets and local state: never in git ---
+.env
+telegram_session.txt
+*.session
+*.session-journal
+# database cluster, evidence files, browser cookies, dev sqlite
+data/
+app/data/
+logs/
+# case dumps (customer data)
+backups/
+# bundled PostgreSQL binaries (machine specific, 144 MB)
+pg/
+
+# --- python ---
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# --- editors / os ---
+.idea/
+.DS_Store
