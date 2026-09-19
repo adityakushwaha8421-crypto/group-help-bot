@@ -314,4 +314,5 @@ def test_closest_order_scores_highest_among_earlier_orders():
         )
         leads[m] = r.best.signals["time"]["score"]
         assert r.decision == "MATCHED", m  # inside the window: still auto-selectable
-    assert leads[0] == 1.0 and leads[0] > leads[1] > leads[5] > leads[15] > leads[30] >= 0.7
+    # a minute or two before the payment costs nothing (both clocks show minutes only); after that, closest wins
+    assert leads[0] == leads[1] == 1.0 and leads[1] > leads[5] > leads[15] > leads[30] >= 0.7

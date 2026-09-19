@@ -536,10 +536,31 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
     if result.decision == "NO_CANDIDATES":
         reason = f"No Illunise order exists for this number (payment {when}, ₹{case.amount:,.2f})."
     else:
-        reason = (
-            f"No order was created around the payment ({when}, ₹{case.amount:,.2f}) for this number; "
-            f"best candidate scored only {result.best.score:.2f} of the required {s.order_match_threshold:.2f}."
-        )
+        best = result.best
+        sig = best.signals
+        near = (sig.get("time", {}).get("score") or 0) >= 0.7 and sig.get("amount", {}).get("score") == 1.0
+        if near:
+            # An order DOES sit right before the payment with the right amount: say what held it back instead
+            # of claiming there is none.
+            blockers = {
+                "registration": "it is registered to another mobile number",
+                "utr": f"the panel already holds a different UTR for it ({sig.get('utr', {}).get('candidate')})",
+                "gateway": f"it belongs to another gateway ({sig.get('gateway', {}).get('candidate')})",
+                "status": f"its status is {best.candidate.status}",
+            }
+            why = [text for key, text in blockers.items() if sig.get(key, {}).get("score") == 0.0]
+            lead = sig.get("time", {}).get("lead_minutes")
+            reason = (
+                f"Order {best.candidate.betex_order_id or best.candidate.illunise_order_id} was created "
+                f"{lead:.0f} min before the payment ({when}, ₹{case.amount:,.2f}) with the right amount, but "
+                + (" and ".join(why) if why else "the overall score stayed too low")
+                + f" (score {best.score:.2f} of {s.order_match_threshold:.2f})."
+            )
+        else:
+            reason = (
+                f"No order was created around the payment ({when}, ₹{case.amount:,.2f}) for this number; "
+                f"best candidate scored only {best.score:.2f} of the required {s.order_match_threshold:.2f}."
+            )
     lines = []
     for sc in result.scored[:3]:
         c = sc.candidate

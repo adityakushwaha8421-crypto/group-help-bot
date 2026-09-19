@@ -155,8 +155,10 @@ def apply_view_fields(cand: Candidate, fields: dict[str, str], view_map: dict[st
     if plat and get_settings().plat_order_pattern.fullmatch(plat.strip()):
         cand.betix_plat_order_no = plat.strip()
     ref = fields.get("gateway.refNo")
-    if ref and not cand.utr:
-        cand.utr = ref.strip()
+    if ref and ref.strip():
+        # Kept apart from `utr`: the View page of an unpaid order shows UTR "-" next to a refNo, and copying it
+        # into the UTR made every such order look like it "holds a different UTR" (live 2026-09-18, capped 0.50).
+        cand.gateway_ref = ref.strip()
     padded = normalize_amount(get("padded_amount"))
     if padded is not None:
         cand.padded_amount = padded

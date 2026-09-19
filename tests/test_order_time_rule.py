@@ -87,3 +87,51 @@ def test_the_same_utr_still_wins_over_a_sibling():
 def test_a_wrong_amount_is_still_rejected_whatever_the_time():
     r = match_orders(ev(), MOB, [order("ILLUN-1", "2026-09-12 14:41:00", amount=2500.0)], **KW2)
     assert r.decision == "NO_MATCH"
+
+
+# ---------------------------------------------------------------- live 2026-09-18: expired order, earlier attempt's UTR
+def test_expired_order_created_a_minute_before_with_a_stale_utr_is_selected(env):
+    """Rs 2,878.99 paid 18 Sep 05:24; ILLUN-178968923584262 (Rs 2,879) created 05:23, Expired, and the panel holds
+    the UTR of an earlier attempt. Everything else lines up, so the stale UTR must not cap it at 0.50."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.admin.matcher import Candidate, match_orders
+    from app.ai.extractor import Extraction, Field
+    from app.config import get_settings
+
+    s = get_settings()
+    ist = timezone(timedelta(hours=5, minutes=30))
+    ev = Extraction()
+    ev.amount = Field(2878.99, 0.99, "payment_screenshot")
+    ev.utr = Field("111122223333", 0.99, "payment_screenshot")
+    ev.payment_time = Field(datetime(2026, 9, 18, 5, 24, tzinfo=ist), 0.99, "payment_screenshot")
+
+    def cand(status, utr=None, ref="626195940467"):
+        return Candidate(
+            illunise_order_id="ILLUN-178968923584262", betex_order_id="ILLUN-178968923584262", amount=2879.0,
+            registration_number="9022708364", order_time=datetime(2026, 9, 18, 5, 23, tzinfo=ist), status=status,
+            utr=utr, gateway_ref=ref, gateway="BETIXPAY",
+        )  # fmt: skip
+
+    def run(c):
+        return match_orders(
+            ev, "9022708364", [c], weights=s.match_weights, threshold=s.order_match_threshold,
+            ambiguity_gap=s.order_match_ambiguity_gap, time_window_minutes=s.payment_time_window_minutes,
+            amount_tolerance=s.order_amount_tolerance, time_rule=s.time_rule, gateway_name=s.betix_gateway_name,
+            compatible_statuses=s.compatible_statuses, expired_statuses=s.expired_statuses,
+            success_statuses=s.success_statuses, time_tiebreak_minutes=s.order_time_tiebreak_minutes,
+        )  # fmt: skip
+
+    r = run(cand("Expired"))
+    assert r.decision == "MATCHED" and r.best.candidate.betex_order_id == "ILLUN-178968923584262"
+    assert r.best.signals["time"]["score"] == 1.0  # one minute before: no deduction at all
+    assert r.best.signals["amount"]["score"] == 1.0  # Rs 2,879 = Rs 2,878.99 within the Rs 1 tolerance
+    assert r.best.signals["utr"]["score"] is None and r.best.score >= 0.95  # the refNo never counts against it
+    # the same refNo as the screenshot's UTR, on the other hand, pins the order
+    ev.utr = Field("626195940467", 0.99, "payment_screenshot")
+    pinned = run(cand("Expired"))
+    assert pinned.decision == "MATCHED" and pinned.best.signals["utr"]["score"] == 1.0
+    ev.utr = Field("111122223333", 0.99, "payment_screenshot")
+    # a REAL different UTR in the panel's own UTR field still rules the order out (paid by another payment)
+    assert run(cand("Success", utr="999988887777", ref=None)).decision != "MATCHED"
+    assert run(cand("Expired", utr="999988887777", ref=None)).decision != "MATCHED"

@@ -21,7 +21,11 @@ class Candidate:
     found_by: str = "mobile"  # which search produced it: mobile | utr | padded_amount
     order_time: datetime | None = None  # order CREATED time
     status: str | None = None
-    utr: str | None = None
+    utr: str | None = None  # the panel's own UTR field: the payment the order was matched to
+    # The gateway's reference (View page JSON, refNo). NOT the order's UTR: an unpaid / expired order shows
+    # UTR "-" and still carries a refNo. The same number as the screenshot's UTR confirms the order; a
+    # different one proves nothing.
+    gateway_ref: str | None = None
     upi_id: str | None = None
     payer_name: str | None = None
     gateway: str | None = None
@@ -50,6 +54,9 @@ class MatchResult:
         return self.best.score if self.best else None
 
 
+FLAT_MINUTES = 2  # an order created up to this long before the payment is a full time match
+
+
 def _time_score(
     payment_time: datetime | None, order_created: datetime | None, rule: dict[str, int]
 ) -> tuple[float | None, float | None, str | None]:
@@ -71,7 +78,13 @@ def _time_score(
     if lead < lo:
         return 0.0, lead, "created AFTER the payment: not this order"
     if lead <= hi:
-        return round(1.0 - 0.3 * (lead - lo) / max(hi - lo, 1), 4), lead, "created before the payment"
+        # The customer opens the order and pays a moment later: the first FLAT_MINUTES cost nothing (the panel
+        # and the payment app both show minutes only, so "1 minute apart" can be a few seconds). After that the
+        # score slides to 0.7 at max_before, so the closest order still scores highest.
+        flat = lo + FLAT_MINUTES
+        if lead <= flat:
+            return 1.0, lead, "created just before the payment"
+        return round(1.0 - 0.3 * (lead - flat) / max(hi - flat, 1), 4), lead, "created before the payment"
     if lead <= hi + tol:
         return 0.6, lead, "created just outside the window"
     if lead <= 2 * hi:
@@ -164,9 +177,12 @@ def score_candidate(
     signals["gateway"] = {"expected": gateway_name, "candidate": cand.gateway, "score": s}
     parts.append(("gateway", s))
 
-    u_ev, u_c = normalize_utr(ev.utr.value), normalize_utr(cand.utr)
+    u_ev, u_c, u_ref = normalize_utr(ev.utr.value), normalize_utr(cand.utr), normalize_utr(cand.gateway_ref)
     s = (1.0 if u_ev == u_c else 0.0) if (u_ev and u_c) else None
-    signals["utr"] = {"evidence": u_ev, "candidate": u_c, "score": s}
+    how_utr = None
+    if u_ev and u_ref and u_ev == u_ref and s != 1.0 and not u_c:
+        s, u_c, how_utr = 1.0, u_ref, "the gateway reference on the order is this payment's UTR"
+    signals["utr"] = {"evidence": u_ev, "candidate": u_c, "score": s, "how": how_utr}
     parts.append(("utr", s))
     utr_exact = s == 1.0
 
