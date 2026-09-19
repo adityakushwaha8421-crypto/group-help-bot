@@ -172,6 +172,115 @@ def apply_view_fields(cand: Candidate, fields: dict[str, str], view_map: dict[st
     return cand
 
 
+# The panel shows minutes only: an order created in the payment's own minute can read as "after" it. One minute
+# of slack covers that; anything later was created AFTER the payment and is never read.
+SKEW_MINUTES = 1
+
+
+def search_dates(evidence_time, window_minutes: int, tz: str) -> tuple[str, str] | None:
+    """The panel date range (YYYY-MM-DD, panel-local) that can hold the order for a payment at `evidence_time`:
+    the payment's own day - plus the day before when the window reaches back across midnight. An order is
+    created BEFORE its payment, so no later day is ever needed."""
+    if evidence_time is None:
+        return None
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    from app.utils.timeutil import ensure_utc
+
+    local = ensure_utc(evidence_time).astimezone(ZoneInfo(tz))
+    start = local - timedelta(minutes=window_minutes)
+    return start.strftime("%Y-%m-%d"), local.strftime("%Y-%m-%d")
+
+
+def search_url(sel: dict, base: str, query: str, dates: tuple[str, str] | None = None, page: int = 1) -> str:
+    url = base + sel["search_query_param"].format(query=quote(query, safe=""))
+    if dates and sel.get("date_query_param"):
+        url += sel["date_query_param"].format(from_date=dates[0], to_date=dates[1])
+    if page > 1 and sel.get("page_query_param"):
+        url += sel["page_query_param"].format(page=page)
+    return url
+
+
+def _lead_minutes(c: Candidate, evidence_time) -> float | None:
+    """Minutes the order was created BEFORE the payment (negative: created after it)."""
+    if evidence_time is None or c.order_time is None:
+        return None
+    from app.utils.timeutil import ensure_utc
+
+    return (ensure_utc(evidence_time) - ensure_utc(c.order_time)).total_seconds() / 60
+
+
+def closeness_key(c: Candidate, evidence_time, evidence_amount: float | None, tol: float):
+    """Reading order: created before the payment first, amount matches first, then closest to the payment."""
+    lead = _lead_minutes(c, evidence_time)
+    after = 0 if lead is None or lead >= -SKEW_MINUTES else 1
+    amt = 0 if (evidence_amount is not None and c.amount is not None and abs(c.amount - evidence_amount) <= tol) else 1
+    return (after, amt, abs(lead) if lead is not None else 1e9)
+
+
+def narrow_candidates(
+    candidates: list[Candidate],
+    evidence_time,
+    *,
+    window_minutes: int,
+    keep_closest: int,
+    dates=None,
+    tz: str = "Asia/Kolkata",
+) -> list[Candidate]:
+    """From everything the panel returned, the orders worth reading: created within `window_minutes` before the
+    payment (SKEW_MINUTES of slack for the panel's minute resolution). Rows outside the requested dates are dropped first - the
+    result must not depend on the panel honouring its filter. When nothing is inside the window, the few closest
+    are kept so the manual-review message can still name them; they can never auto-match (the matcher's time
+    rule sees to that)."""
+    if evidence_time is None:
+        return candidates
+    from zoneinfo import ZoneInfo
+
+    from app.utils.timeutil import ensure_utc
+
+    pool = candidates
+    if dates:
+        kept = []
+        for c in pool:
+            day = ensure_utc(c.order_time).astimezone(ZoneInfo(tz)).strftime("%Y-%m-%d") if c.order_time else None
+            if day is None or dates[0] <= day <= dates[1]:
+                kept.append(c)
+        if len(kept) != len(pool):
+            log.warning("panel returned orders outside the requested dates; dropped", dropped=len(pool) - len(kept))
+        pool = kept
+    inside = []
+    for c in pool:
+        lead = _lead_minutes(c, evidence_time)
+        if lead is None or -SKEW_MINUTES <= lead <= window_minutes:
+            inside.append(c)
+    if inside:
+        return inside
+
+    def distance(c: Candidate) -> float:
+        lead = _lead_minutes(c, evidence_time)
+        return abs(lead) if lead is not None else 1e9
+
+    return sorted(pool, key=distance)[:keep_closest]
+
+
+def is_clear_match(c: Candidate, query: str, evidence_time, evidence_amount, tol: float, window: int) -> bool:
+    """After its View page was read: this is the customer's own order for this payment - same registered mobile,
+    same amount, created shortly before the payment. Nothing further needs reading."""
+    digits = re.sub(r"\D", "", query or "")
+    lead = _lead_minutes(c, evidence_time)
+    return bool(
+        len(digits) == 10
+        and c.registration_number
+        and re.sub(r"\D", "", c.registration_number)[-10:] == digits
+        and evidence_amount is not None
+        and c.amount is not None
+        and abs(c.amount - evidence_amount) <= tol
+        and lead is not None
+        and 0 <= lead <= window
+    )
+
+
 async def enrich_candidates(
     browser: AdminBrowser,
     candidates: list[Candidate],
@@ -179,6 +288,7 @@ async def enrich_candidates(
     evidence_amount: float | None = None,
     evidence_time=None,
     max_pages: int | None = None,
+    query: str = "",
 ) -> list[Candidate]:
     """Read the View page of the most promising candidates: amount matches (within the padded-amount tolerance)
     first, closest to the payment time next, newest otherwise."""
@@ -190,21 +300,8 @@ async def enrich_candidates(
         return candidates
     tol = s.order_amount_tolerance + 1e-9
 
-    def priority(c: Candidate) -> tuple[int, float]:
-        amt_match = (
-            0
-            if (evidence_amount is not None and c.amount is not None and abs(c.amount - evidence_amount) <= tol)
-            else 1
-        )
-        if evidence_time is not None and c.order_time is not None:
-            from app.utils.timeutil import ensure_utc
-
-            distance = abs((ensure_utc(evidence_time) - ensure_utc(c.order_time)).total_seconds())
-        else:
-            distance = -(c.order_time.timestamp() if c.order_time else 0)
-        return (amt_match, distance)
-
-    for c in sorted(candidates, key=priority)[:limit]:
+    ordered = sorted(candidates, key=lambda c: closeness_key(c, evidence_time, evidence_amount, tol))
+    for n, c in enumerate(ordered[:limit], start=1):
         oid = c.illunise_order_id or c.betex_order_id
         if not oid:
             continue
@@ -213,6 +310,10 @@ async def enrich_candidates(
             apply_view_fields(c, fields, view_map, s.timezone)
         except Exception as exc:  # noqa: BLE001
             log.warning("view page read failed", order_id=oid, error=str(exc)[:120])
+            continue
+        if is_clear_match(c, query, evidence_time, evidence_amount, tol, s.order_search_window_minutes):
+            log.info("clear match; no further orders read", order_id=oid, read=n, of=len(ordered))
+            break
     return candidates
 
 
@@ -239,11 +340,12 @@ async def search_orders(
     s = get_settings()
     sel = browser.selectors["orders"]
     page = browser.page
-    if sel.get("search_query_param"):
-        await page.goto(
-            browser.url(sel["path"]) + sel["search_query_param"].format(query=quote(query, safe="")),
-            wait_until="domcontentloaded",
-        )
+    dates = (
+        search_dates(evidence_time, s.order_search_window_minutes, s.timezone) if sel.get("date_query_param") else None
+    )
+    by_url = bool(sel.get("search_query_param"))
+    if by_url:
+        await page.goto(search_url(sel, browser.url(sel["path"]), query, dates), wait_until="domcontentloaded")
     else:
         await page.goto(browser.url(sel["path"]), wait_until="domcontentloaded")
         box = await browser.first_locator(sel["search_input"])
@@ -259,10 +361,13 @@ async def search_orders(
         return []
     candidates: list[Candidate] = []
     column_map = browser.selectors.get("columns", {})
-    for _ in range(int(sel.get("max_pages", 1))):
+    max_pages = int(sel.get("max_pages", 1))
+    for page_no in range(1, max_pages + 1):
         try:
             headers, rows = await _read_table(browser)
         except LayoutChanged:
+            if page_no > 1:
+                break  # past the last page
             art = await browser.save_debug("orders-layout")
             raise LayoutChanged(f"orders table not found; debug artifacts: {art}")
         for cells in rows:
@@ -270,14 +375,31 @@ async def search_orders(
         nxt = sel.get("next_page")
         if not nxt or not await browser.any_visible(nxt, 500):
             break
-        loc = await browser.first_locator(nxt, 2000)
-        await loc.click()
+        if page_no == max_pages:
+            log.warning("order list truncated at the page cap", pages=max_pages, rows=len(candidates))
+            break
+        if by_url and sel.get("page_query_param"):
+            nxt_url = search_url(sel, browser.url(sel["path"]), query, dates, page_no + 1)
+            await page.goto(nxt_url, wait_until="domcontentloaded")
+        else:
+            loc = await browser.first_locator(nxt, 2000)
+            await loc.click()
         await page.wait_for_load_state("networkidle")
+    listed = len(candidates)
+    candidates = narrow_candidates(
+        candidates,
+        evidence_time,
+        window_minutes=s.order_search_window_minutes,
+        keep_closest=s.order_search_keep_closest,
+        dates=dates,
+        tz=s.timezone,
+    )
+    log.info("order search", dates=dates, listed=listed, kept=len(candidates))
     # The list view has no mobile/name column, so a mobile search cannot be re-checked against the row text.
     # The View page (enrichment below) supplies the mobile; the matcher then verifies it exactly.
     if enrich:
         candidates = await enrich_candidates(
-            browser, candidates, evidence_amount=evidence_amount, evidence_time=evidence_time
+            browser, candidates, evidence_amount=evidence_amount, evidence_time=evidence_time, query=query
         )
     return candidates
 

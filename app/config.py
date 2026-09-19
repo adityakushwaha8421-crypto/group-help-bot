@@ -200,6 +200,11 @@ class Settings(BaseSettings):
     order_time_tiebreak_minutes: int = 2
     # Kept for compatibility with older configs; the before-payment window above is what is used.
     payment_time_window_minutes: int = 15
+    # Order search narrowing: only orders created within this many minutes BEFORE the payment (and a couple
+    # after, for clock skew) are read in detail; when none is that close, the few closest are kept for the
+    # manual-review message.
+    order_search_window_minutes: int = 30
+    order_search_keep_closest: int = 10
     # The customer pays a "padded" amount (₹13,999.35 for a ₹14,000 order); tolerance in currency units.
     order_amount_tolerance: float = 1.0
     betix_gateway_name: str = "BetixPay"

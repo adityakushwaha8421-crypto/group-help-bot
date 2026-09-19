@@ -77,7 +77,11 @@ async def test_order_under_another_number_is_found_by_padded_amount(db, fake_bot
         case_id, outcome = await run_until_ready(db, lambda *_: None)
     finally:
         manager.set_order_search(None)
-    assert outcome == "ready" and queries == [MOBILE, "611532946151", "6499.92"]
+    assert outcome == "ready" and queries == [
+        MOBILE,
+        "611532946151",
+        "6499.92",
+    ]  # found by the padded amount: the search stops there
     async with db.session_scope() as s:
         assert (await get_case(s, case_id)).betex_pay_order_id == "ILLUN-178904900000002"
 
@@ -88,11 +92,16 @@ async def test_nothing_anywhere_escalates_with_a_clear_reason(db, fake_bot, fake
         case_id, outcome = await run_until_ready(db, lambda *_: None)
     finally:
         manager.set_order_search(None)
-    assert outcome == "escalated" and queries == [MOBILE, "611532946151", "6499.92"]
+    assert outcome == "escalated" and queries == [
+        MOBILE,
+        "611532946151",
+        "6499.92",
+        "6500",
+    ]  # mobile, UTR, padded amount, whole-rupee order amount
     alert = [t for _, t in fake_bot.sent if "MANUAL REVIEW NEEDED" in t][0]
     assert "No order was created around the payment" in alert and "ILLUN-178660472036384" in alert
     assert "created 13 Aug" in alert and "Failed" in alert
-    assert "Also searched by UTR and padded amount" in alert and "another registered number" in alert
+    assert "Also searched by UTR and padded amount and order amount" in alert and "another registered number" in alert
 
 
 async def test_no_fallback_when_the_mobile_search_already_matches(db, fake_bot, fake_ai, no_download):

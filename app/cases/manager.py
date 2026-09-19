@@ -3,6 +3,7 @@ All external effects (browser, AI, Telegram) are injectable so the flow is unit-
 
 from __future__ import annotations
 
+import math
 from datetime import timedelta
 from typing import Awaitable, Callable
 
@@ -397,6 +398,12 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
             queries.append(("utr", case.utr))
         if case.amount is not None:
             queries.append(("padded_amount", f"{case.amount:.2f}"))
+            # The panel lists the ORDER amount (Rs 2,879), the customer paid the padded one (Rs 2,878.99): the
+            # padded figure finds nothing there. The whole-rupee amount does - and since the search is limited to
+            # the payment day and the minutes before the payment, it stays a handful of orders.
+            whole = str(math.ceil(case.amount - 1e-9))
+            if float(whole) != case.amount:
+                queries.append(("order_amount", whole))
         for how, q in queries:
             fallbacks_tried.append(how)
             try:
@@ -546,7 +553,10 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
         top += (
             ("\n" if top else "")
             + "Also searched by "
-            + " and ".join(fallbacks_tried).replace("padded_amount", "padded amount").replace("utr", "UTR")
+            + " and ".join(
+                {"utr": "UTR", "padded_amount": "padded amount", "order_amount": "order amount"}.get(x, x)
+                for x in fallbacks_tried
+            )
             + ": no order for this payment."
         )
     top += "\nLikely: the order was made under another registered number, or the payment was made without an order."

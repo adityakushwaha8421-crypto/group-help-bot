@@ -20,6 +20,11 @@ orders:
   search_submit: ""
   # Optional: a query-string based search instead of typing (e.g. "?search={query}"); empty = use the input
   search_query_param: "?search={query}"
+  # The panel's own date filter (GET form fields from_date / to_date, YYYY-MM-DD, panel-local = IST). Verified
+  # live 2026-09-19: a mobile with 273 orders returns 14 for the payment day. Appended when the payment time is known.
+  date_query_param: "&from_date={from_date}&to_date={to_date}"
+  # Pages are addressed by URL (100 rows per page); more reliable than clicking "Next"
+  page_query_param: "&page={page}"
   # Wait for this after searching
   results_ready: "table"
   table: "table"
@@ -35,7 +40,7 @@ orders:
   max_detail_pages: 15
   # Pagination
   next_page: "a[rel=next], li.next a, a:has-text('Next')"
-  max_pages: 5
+  max_pages: 10   # safety cap; a date-filtered search rarely needs more than one
   empty_marker: "text=/no (orders|records|results|data)/i"
 
 # Live /admin/orders headers seen on 2026-09-10: ORDER ID | AMOUNT | STATUS | GATEWAY | LOCATION | DATE & TIME | UTR | (View)
