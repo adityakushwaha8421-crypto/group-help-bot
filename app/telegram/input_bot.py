@@ -115,13 +115,28 @@ def help_text() -> str:
         f"{code('/status [ORDER-ID]')} — where a case stands\n"
         f"{code('/cases')} — all open cases\n"
         f"{code('/summary [DAYS]')} — overview by stage\n"
-        f"{code('/cancel')} — discard what's in progress",
+        f"{code('/cancel')} — discard what's in progress\n"
+        f"{code('/restart')} — restart the bot",
     )
 
 
 @router.message(Command("start", "help"))
 async def cmd_help(message: Message):
     await message.answer(help_text(), parse_mode="HTML")
+
+
+@router.message(Command("restart"))
+async def cmd_restart(message: Message):
+    """Restart the bot process. Cases, follow-ups and queued jobs live in the database and carry on."""
+    from app import restart
+
+    if restart.is_stale(message.date.timestamp()):
+        return  # the /restart that started this very process, delivered again
+    await message.answer(
+        para("\U0001f504 " + b("RESTARTING"), "\u23f3 Back in a few seconds...", i("Open cases and follow-ups are kept.")),
+        parse_mode="HTML",
+    )
+    asyncio.get_running_loop().call_later(1.0, restart.request, message.chat.id)
 
 
 @router.message(Command("search"))
@@ -721,6 +736,7 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("cases", "All open cases"),
     ("summary", "All-time overview by stage (or /summary 7 for a week)"),
     ("cancel", "Discard the case (or search) in progress"),
+    ("restart", "Restart the bot (cases and follow-ups are kept)"),
     ("help", "How to use the bot"),
 ]
 
@@ -757,6 +773,16 @@ async def run_polling(stop_event: asyncio.Event | None = None) -> None:
     register_self(me.id, me.username)  # our own messages in the Betix group are never a confirmation
     await register_commands(bot)  # the "/" menu, refreshed on every run
     log.info("input bot started", username=me.username)
+    from app import restart
+
+    asked_by = restart.pop_notice()
+    if asked_by:
+        try:
+            await bot.send_message(
+                asked_by, para("\u2705 " + b("BOT RESTARTED"), "\U0001f7e2 Running again."), parse_mode="HTML"
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not confirm the restart", error=str(exc)[:200])
     if stop_event is None:
         await dp.start_polling(bot, allowed_updates=["message"])
     else:

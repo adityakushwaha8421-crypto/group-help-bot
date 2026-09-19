@@ -92,7 +92,15 @@ async def health():
 
 def main() -> None:
     s = get_settings()
-    uvicorn.run("app.main:app", host=s.api_host, port=s.api_port, log_level=s.log_level.lower())
+    from app import restart
+
+    server = uvicorn.Server(
+        uvicorn.Config("app.main:app", host=s.api_host, port=s.api_port, log_level=s.log_level.lower())
+    )
+    restart.bind(server)
+    server.run()
+    if restart.requested():  # /restart: everything is closed now, start afresh
+        restart.reexec()
 
 
 if __name__ == "__main__":
