@@ -136,6 +136,27 @@ def format_manual_review(case: Case, reason: str, extra: str = "") -> str:
     )
 
 
+def format_withdrawal_reversed(case: Case, actor: str, extra: str = "") -> str:
+    """Betix answered a withdrawal with "Reversed": the payout came back, so the customer is paid by hand."""
+    rows = [f"\U0001f5c2 Case: {code(case_label(case))}"]
+    if case.original_username:
+        rows.append(f"\U0001f464 Customer: @{_esc(case.original_username.lstrip('@'))}")
+    elif case.original_user_id:
+        who = " ".join(x for x in (case.original_first_name, case.original_last_name) if x).strip()
+        rows.append(f'\U0001f464 Customer: <a href="tg://user?id={case.original_user_id}">{_esc(who or "open chat")}</a>')
+    if case.original_user_id:
+        rows.append(f"\U0001f194 User ID: {code(str(case.original_user_id))}")
+    if case.amount is not None:
+        rows.append(f"\U0001f4b0 Amount: {_money(case.amount, case.currency)}")
+    rows.append(f"\U0001f4e3 Reported by: {_esc(actor)}")
+    return para(
+        "\U0001f504 " + b("WITHDRAWAL REVERSED"),
+        rows,
+        ["\u2705 Solved \u2014 Betix reversed this withdrawal.", "\U0001f4b8 Please pay the customer manually."],
+        i(extra) if extra else "",
+    )
+
+
 def format_info(case: Case, title_text: str, detail: str) -> str:
     return para(
         "\u2139\ufe0f " + b(title_text),

@@ -34,7 +34,14 @@ from app.db.repository import (
 from app.evidence.manager import analyze_evidence, download_evidence
 from app.followups.service import cancel_case_followups, schedule_case_followups
 from app.telegram.confirmation import Classification, is_confirmed
-from app.telegram.notifications import format_confirmed, format_info, format_manual_review, get_bot, notify_admin
+from app.telegram.notifications import (
+    format_confirmed,
+    format_info,
+    format_manual_review,
+    format_withdrawal_reversed,
+    get_bot,
+    notify_admin,
+)
 from app.telegram.upi_check import ocr_upi, parse_pi_answer, upi_ending_match
 from app.utils.logging import get_logger
 from app.utils.timeutil import fmt_local, utcnow
@@ -1003,7 +1010,10 @@ async def verify_case(
     confirmation_message_id: int | None = None,
     confirmation_user_id: int | None = None,
     confirmation_username: str | None = None,
+    reversed_quote: str | None = None,
 ) -> bool:
+    """`reversed_quote`: Betix answered a WITHDRAWAL with "Reversed" - the issue is solved on their side
+    (the payout came back) and the staff pay the customer by hand. Closed like a confirmation, told as it is."""
     if case.status in TERMINAL_OK:
         return False
     from app.cases.state_machine import can_transition
@@ -1015,21 +1025,36 @@ async def verify_case(
     case.confirmed_by = confirmed_by
     case.verified_at = utcnow()
     case.confirmation_type = confirmation_type or case.confirmation_type or "manual"
+    if reversed_quote is not None:
+        case.confirmation_type = "reversed"
     case.confirmation_message_id = confirmation_message_id
     case.confirmation_user_id = confirmation_user_id
     case.confirmation_username = confirmation_username
     case.confirmation_at = case.verified_at
     await transition(
-        session, case, CaseStatus.VERIFIED, reason=f"confirmed by {confirmed_by}", actor=actor, strict=False
+        session,
+        case,
+        CaseStatus.VERIFIED,
+        reason=f"{'reversed' if reversed_quote is not None else 'confirmed'} by {confirmed_by}",
+        actor=actor,
+        strict=False,
     )
     await audit(
         session,
         "CASE_VERIFIED",
         case_id=case.case_id,
         actor=actor,
-        result="verified",
+        result="reversed" if reversed_quote is not None else "verified",
         details={"confirmed_by": confirmed_by},
     )
+    if reversed_quote is not None:
+        await notify_admin(
+            session,
+            kind="withdrawal_reversed",
+            case=case,
+            text=format_withdrawal_reversed(case, confirmed_by, reversed_quote),
+        )
+        return True
     evidence = await list_evidence(session, case.case_id)
     await notify_admin(
         session,
@@ -1172,6 +1197,18 @@ async def apply_verification_signal(
         if "belong" in (cls.matched or "").lower():  # "❌ UPI Does not belong to us": manual review, no /upi
             await escalate_case(session, case, "Betix: UPI does not belong to us.", (cls.matched or "")[:200])
             return "escalated_failed"
+        if case.kind == KIND_WITHDRAWAL and "revers" in (cls.matched or "").lower():
+            # "Reversed" on a withdrawal: solved on Betix's side; the staff pay the customer by hand
+            await verify_case(
+                session,
+                case,
+                confirmed_by=actor,
+                confirmation_message_id=betix_message_id,
+                confirmation_user_id=sender_id,
+                confirmation_username=sender_username,
+                reversed_quote=(cls.matched or "")[:200],
+            )
+            return "reversed"
         await escalate_case(
             session, case, f"Betix reports the payment as FAILED / not received ({actor}).", (cls.matched or "")[:200]
         )

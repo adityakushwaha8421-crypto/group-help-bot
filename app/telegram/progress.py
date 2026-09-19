@@ -77,6 +77,15 @@ def progress_card(case: Case) -> str:
         if sent:
             rows.append(f"\U0001f504 Follow-ups sent: {sent}")
         return _card("\U0001f4e4 SENT TO BETIX", rows, "\U0001f440 Waiting for Betix to confirm...")
+    if st == S.VERIFIED.value and case.confirmation_type == "reversed":
+        rows = [ident]
+        if case.confirmed_by:
+            rows.append(f"\U0001f464 Reported by: {esc(case.confirmed_by)}")
+        return _card(
+            "\U0001f504 WITHDRAWAL REVERSED",
+            rows,
+            "\u2705 Solved \u2014 Betix reversed this withdrawal.\n\U0001f4b8 Please pay the customer manually.",
+        )
     if st == S.VERIFIED.value:
         rows = [f"\U0001f9fe Order: {order}"]
         if case.confirmed_by:
