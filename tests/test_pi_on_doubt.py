@@ -66,3 +66,16 @@ async def test_an_order_that_fits_neither_amount_nor_time_is_never_asked(
     manager.set_order_search(None)
     _, outcome = await run_until_ready(db, order_search, wrong)
     assert outcome == "escalated" and pi_queries(fake_poster) == {}
+
+
+async def test_nearby_orders_are_named_never_no_order(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, setup
+):
+    """/pi is not possible (the screenshot prints no receiver UPI): the alert lists the nearby orders."""
+    fake_ai.receiver_upi = None
+    _, outcome = await run_until_ready(db, order_search, DOUBT_TWO)
+    assert outcome == "escalated" and pi_queries(fake_poster) == {}
+    alert = [t for _, t in fake_bot.sent if "MANUAL REVIEW" in t][-1]
+    assert "2 order(s)" in alert and "created just before the payment" in alert and "No order" not in alert
+    assert alert.index(B) < alert.index(A)  # closest first
+    assert "no payee UPI printed on the screenshot" in alert

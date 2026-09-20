@@ -197,9 +197,23 @@ async def test_wrong_amount_or_wrong_time_is_still_manual_review(db, fake_bot, f
     assert any("MANUAL REVIEW NEEDED" in t for _, t in fake_bot.sent)
 
 
-async def test_the_number_still_counts_when_it_has_orders_of_its_own(db, fake_bot, fake_ai, no_download):
-    """Orders exist under the customer's number: someone else's same-amount order is NOT taken over."""
+async def test_own_orders_at_other_times_do_not_hide_the_nearby_order(db, fake_bot, fake_ai, no_download):
+    """The number has orders that day - none near the payment. The order with the right amount created just before
+    the payment (under another number) is still found and taken: never "no order"."""
     own = {**OLD_FAILED[0], "order_time": "2026-09-10 12:00:00"}
     other = other_number("ILLUN-178904900000050", 6500.0, "2026-09-10 19:30:00")
-    _, outcome, _ = await _run(db, {MOBILE: [own], "6500": [other]})
-    assert outcome == "escalated"
+    case_id, outcome, _ = await _run(db, {MOBILE: [own], "6500": [other]})
+    assert outcome == "ready"
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).betex_pay_order_id == "ILLUN-178904900000050"
+
+
+async def test_an_own_order_near_the_time_with_another_amount_does_not_block_the_search(
+    db, fake_bot, fake_ai, no_download
+):
+    own = {**OLD_FAILED[0], "amount": 500.0, "status": "Pending", "order_time": "2026-09-10 19:31:00"}
+    other = other_number("ILLUN-178904900000051", 6500.0, "2026-09-10 19:30:00")
+    case_id, outcome, queries = await _run(db, {MOBILE: [own], "6500": [other]})
+    assert outcome == "ready" and "6500" in queries
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).betex_pay_order_id == "ILLUN-178904900000051"

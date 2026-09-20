@@ -521,11 +521,17 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
 
     first = match_orders(merged, case.mobile, candidates, **_kw())
     fallbacks_tried: list[str] = []
-    if first.decision not in ("MATCHED", "AMBIGUOUS") and not any(
-        sc.signals.get("time", {}).get("score", 0) >= 0.7 for sc in first.scored
-    ):
+
+    def fits(sc) -> bool:
+        """Right amount (within the tolerance) AND created before the payment inside the window."""
+        return (sc.signals.get("amount") or {}).get("score") == 1.0 and (
+            (sc.signals.get("time") or {}).get("score") or 0
+        ) >= 0.7
+
+    # The number given has no order that fits this payment (none at all, or only other amounts / other times): it
+    # cannot be what identifies the order, so every order near the payment time with the right amount is looked at.
+    if first.decision not in ("MATCHED", "AMBIGUOUS") and not any(fits(sc) for sc in first.scored):
         seen = {c.betex_order_id or c.illunise_order_id for c in candidates}
-        number_has_no_orders = not candidates  # then the number cannot be what identifies the order
         queries = []
         if case.utr:
             queries.append(("utr", case.utr))
@@ -552,7 +558,7 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
                 key = c.betex_order_id or c.illunise_order_id
                 if key not in seen:
                     c.found_by = how
-                    c.registration_waived = number_has_no_orders and how != "utr"
+                    c.registration_waived = how != "utr"  # a UTR hit is pinned by the UTR itself
                     candidates.append(c)
                     seen.add(key)
             await audit(
@@ -673,6 +679,7 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
     # inside the window: each one's UPI is checked with /pi, closest first, and the first that fits the
     # screenshot's receiver UPI is the order. Nothing fits -> manual review, as before.
     doubtful = doubt_candidates(result)
+    pi_note = ""
     if s.betix_pi_check and doubtful:
         started, pi_note = await start_pi_check(
             session, case, doubtful, f"no order is a clear match ({result.reason}); {len(doubtful)} fit amount and time"
@@ -681,6 +688,26 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
             return "checking_upi"
     tz = s.timezone
     when = fmt_local(case.payment_time, tz, "%d %b %H:%M") if case.payment_time else "?"
+    if doubtful:
+        # Orders DO sit right before the payment with the right amount: never "no order". Say which, and why none
+        # of them could be confirmed (no receiver UPI on the screenshot, /pi not possible ...).
+        first_fit = doubtful[0].candidate
+        reason = (
+            f"{len(doubtful)} order(s) of about ₹{case.amount:,.2f} were created just before the payment ({when}), "
+            f"nearest {first_fit.betex_order_id}, but none could be confirmed" + (f": {pi_note}" if pi_note else ".")
+        )
+        lines = [
+            f"- {sc.candidate.betex_order_id}: ₹{(sc.candidate.amount or 0):,.2f} · created "
+            f"{fmt_local(sc.candidate.order_time, tz, '%d %b %H:%M')} · {sc.candidate.status or '-'}"
+            for sc in doubtful
+        ]
+        await escalate_case(
+            session,
+            case,
+            reason,
+            "Nearby orders (closest first):\n" + "\n".join(lines) + "\nPick the right one in Illunise.",
+        )
+        return "escalated"
     if result.decision == "NO_CANDIDATES":
         tol = s.order_amount_tolerance
         reason = (
