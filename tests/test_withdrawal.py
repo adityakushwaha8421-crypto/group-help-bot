@@ -1,6 +1,9 @@
 """WITHDRAWAL cases: the operator sends only a withdrawal id ("WD-84425-67115") and the bank statement. The Betix
 group receives "BXWD-84425-67115" as a plain message and the statement as a reply to it - nothing else. No
-screenshot, mobile or video is asked for, no AI read, no Illunise search, and one id is posted once."""
+screenshot, mobile or video is asked for, and one id is posted once. Before anything is sent the withdrawal is
+looked up in Illunise payouts and the statement must belong to the bank account it was paid to."""
+
+import pytest
 
 from app.ai.extractor import extract_from_text, extract_mobile, extract_withdrawal_id
 from app.cases import manager
@@ -13,6 +16,10 @@ from tests.conftest import make_group_msg, make_input
 from tests.test_flow import SYS_OK
 
 WD = "WD-84425-67115"
+
+pytestmark = pytest.mark.usefixtures(
+    "payout"
+)  # Illunise payouts faked: the account matches unless a test says otherwise
 
 
 def test_the_id_is_recognised_in_any_wording():
@@ -132,8 +139,66 @@ async def test_reversed_means_pay_the_customer_by_hand(db, fake_bot, fake_ai, or
         assert c.status == CaseStatus.VERIFIED.value and c.followup_cancelled  # solved: closed, no more follow-ups
         card = progress_card(c)
     alerts = [t for _, t in fake_bot.sent if "WITHDRAWAL REVERSED" in t]
-    assert len(alerts) == 1 and f"BX{WD}" in alerts[0] and "pay the customer manually" in alerts[0] and "Solved" in alerts[0]
+    assert (
+        len(alerts) == 1
+        and f"BX{WD}" in alerts[0]
+        and "pay the customer manually" in alerts[0]
+        and "Solved" in alerts[0]
+    )
     assert "User ID: <code>" in alerts[0]  # the customer to pay is named
     assert "Mobile" not in alerts[0] and "FAILED / not received" not in alerts[0]
     assert "WITHDRAWAL REVERSED" in card and "MANUAL REVIEW" not in card and "PAYMENT CONFIRMED" not in card
     assert not any("MANUAL REVIEW" in t or "PAYMENT CONFIRMED" in t for _, t in fake_bot.sent)
+
+
+# ------------------------------------------------------------------ withdrawal verification (payout account)
+async def _case_with_statement(db):
+    async with db.session_scope() as s:
+        cid = (await attach_message(s, make_input(1, "text", WD))).case.case_id
+        await attach_message(s, make_input(2, "document"))
+    return cid
+
+
+async def test_a_statement_of_the_same_account_is_sent(db, fake_bot, no_download, fake_poster, payout):
+    seen = payout(statement="match")
+    cid = await _case_with_statement(db)
+    async with db.session_scope() as s:
+        assert await manager.process_case(s, cid, force=True) == "ready"
+        assert (await get_case(s, cid)).amount == 926.25  # read from the payout
+    assert seen["lookups"] == 1
+
+
+async def test_a_statement_of_another_account_is_not_sent(db, fake_bot, no_download, fake_poster, payout):
+    from app.telegram.progress import progress_card
+
+    payout(statement="mismatch", account="50100123451231", seen="99887766554433")
+    cid = await _case_with_statement(db)
+    async with db.session_scope() as s:
+        assert await manager.process_case(s, cid, force=True) == "escalated"
+        c = await get_case(s, cid)
+        assert c.status == CaseStatus.ESCALATED.value
+        assert await manager.post_case_to_betix(s, cid, fake_poster) != "posted"
+        card = progress_card(c)
+    assert fake_poster.texts == []  # nothing reached the Betix group
+    alert = next(t for _, t in fake_bot.sent if "MANUAL REVIEW" in t)
+    assert "ACCOUNT DOES NOT MATCH" in alert and "Not sent to Betix" in alert
+    assert "50100123451231" not in alert and "\u20221231" in alert and "\u20224433" in alert  # numbers are masked
+    assert "ACCOUNT DOES NOT MATCH" in card
+
+
+async def test_an_unreadable_account_is_kept_for_a_person(db, fake_bot, no_download, fake_poster, payout):
+    payout(statement="unknown")
+    cid = await _case_with_statement(db)
+    async with db.session_scope() as s:
+        assert await manager.process_case(s, cid, force=True) == "escalated"
+    assert fake_poster.texts == []
+    assert any("could not be verified" in t for _, t in fake_bot.sent)
+
+
+async def test_an_unknown_withdrawal_id_is_not_sent(db, fake_bot, no_download, fake_poster, payout):
+    payout(found=False)
+    cid = await _case_with_statement(db)
+    async with db.session_scope() as s:
+        assert await manager.process_case(s, cid, force=True) == "escalated"
+    assert fake_poster.texts == []
+    assert any("not found in Illunise payouts" in t for _, t in fake_bot.sent)

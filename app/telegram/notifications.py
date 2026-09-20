@@ -143,7 +143,9 @@ def format_withdrawal_reversed(case: Case, actor: str, extra: str = "") -> str:
         rows.append(f"\U0001f464 Customer: @{_esc(case.original_username.lstrip('@'))}")
     elif case.original_user_id:
         who = " ".join(x for x in (case.original_first_name, case.original_last_name) if x).strip()
-        rows.append(f'\U0001f464 Customer: <a href="tg://user?id={case.original_user_id}">{_esc(who or "open chat")}</a>')
+        rows.append(
+            f'\U0001f464 Customer: <a href="tg://user?id={case.original_user_id}">{_esc(who or "open chat")}</a>'
+        )
     if case.original_user_id:
         rows.append(f"\U0001f194 User ID: {code(str(case.original_user_id))}")
     if case.amount is not None:

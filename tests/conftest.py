@@ -234,6 +234,39 @@ def order_search(env):
 
 
 @pytest.fixture
+def payout(env):
+    """Illunise payouts + the statement check, faked. payout(account="...", statement="match|mismatch|unknown")."""
+    from app.admin.payouts import Payout
+    from app.cases import manager
+    from app.evidence.statement_account import AccountCheck
+
+    holder = {"found": True, "account": "50100123451231", "statement": "match", "seen": "99887766554433", "lookups": 0}
+
+    async def _lookup(wd):
+        holder["lookups"] += 1
+        if not holder["found"]:
+            return None
+        return Payout(
+            withdraw_id=wd, account=holder["account"], ifsc="KKBK0001770", beneficiary="Test User",
+            bank="Kotak Mahindra Bank", amount=926.25, status="Success",
+        )  # fmt: skip
+
+    async def _check(path, account):
+        r = holder["statement"]
+        return AccountCheck(r, "full" if r == "match" else "labelled", account if r == "match" else holder["seen"])
+
+    def set_(**kw):
+        holder.update(kw)
+        return holder
+
+    manager.set_payout_lookup(_lookup)
+    manager.set_statement_checker(_check)
+    yield set_
+    manager.set_payout_lookup(None)
+    manager.set_statement_checker(None)
+
+
+@pytest.fixture
 def no_download(env):
     from app.cases import manager
 

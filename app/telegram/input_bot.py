@@ -98,7 +98,9 @@ def help_text() -> str:
         + ": send the withdrawal id ("
         + code("WD-84425-67115")
         + ") and the bank statement.\n"
-        "I post " + code("BXWD-84425-67115") + " to Betix with the statement as its reply.",
+        "I find it in Illunise payouts and check the statement is for the SAME bank account.\n"
+        "\u2705 Match: I post " + code("BXWD-84425-67115") + " to Betix with the statement as its reply.\n"
+        "\u274c No match: nothing is sent \u2014 I tell you and keep it for manual review.",
         "\u2139\ufe0f "
         + b("Good to know")
         + "\n"
@@ -133,7 +135,9 @@ async def cmd_restart(message: Message):
     if restart.is_stale(message.date.timestamp()):
         return  # the /restart that started this very process, delivered again
     await message.answer(
-        para("\U0001f504 " + b("RESTARTING"), "\u23f3 Back in a few seconds...", i("Open cases and follow-ups are kept.")),
+        para(
+            "\U0001f504 " + b("RESTARTING"), "\u23f3 Back in a few seconds...", i("Open cases and follow-ups are kept.")
+        ),
         parse_mode="HTML",
     )
     asyncio.get_running_loop().call_later(1.0, restart.request, message.chat.id)

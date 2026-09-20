@@ -59,6 +59,47 @@ def set_order_search(fn: OrderSearch | None) -> None:
     _order_search = fn
 
 
+_payout_lookup = None
+_statement_checker = None
+
+
+def set_payout_lookup(fn) -> None:
+    global _payout_lookup
+    _payout_lookup = fn
+
+
+def set_statement_checker(fn) -> None:
+    global _statement_checker
+    _statement_checker = fn
+
+
+async def _find_payout(withdraw_id: str):
+    if _payout_lookup is not None:
+        return await _payout_lookup(withdraw_id)
+    from app.admin.payouts import find_payout
+
+    return await find_payout(withdraw_id)
+
+
+async def _check_statement(path, account: str, password: str | None):
+    """Open the statement (with the password when it is protected) and compare its account with `account`."""
+    if _statement_checker is not None:
+        return await _statement_checker(path, account)
+    from pathlib import Path
+
+    from app.evidence.pdf import decrypt_pdf, pdf_is_encrypted, pdf_view
+    from app.evidence.statement_account import UNKNOWN, AccountCheck, check_statement
+
+    if not path:
+        return AccountCheck(UNKNOWN, "none")
+    view = pdf_view(path) or Path(path)
+    if pdf_is_encrypted(view):
+        view = decrypt_pdf(path, password) if password else None
+        if view is None:
+            return AccountCheck(UNKNOWN, "none")
+    return await check_statement(Path(view), account)
+
+
 def _get_order_search() -> OrderSearch:
     if _order_search is not None:
         return _order_search
@@ -210,6 +251,90 @@ async def ready_withdrawal(session: AsyncSession, case: Case) -> str:
     return "ready"
 
 
+ACCOUNT_MISMATCH = "ACCOUNT DOES NOT MATCH"
+
+
+async def process_withdrawal(session: AsyncSession, case: Case, evidence, *, force_send: bool = False) -> str:
+    """WITHDRAWAL VERIFICATION: find the exact withdrawal in Illunise payouts, read the bank account it was paid
+    to, and send to Betix ONLY when the statement belongs to that same account. Anything else stays here."""
+    from app.ai.analyzer import AIUnavailable
+    from app.evidence.statement_account import MATCH, MISMATCH, mask_account
+
+    wd = case.withdrawal_id
+    await transition(session, case, CaseStatus.SEARCHING_ORDER, reason="looking up the withdrawal", strict=False)
+    version0 = case.processing_version
+    password = case.statement_password
+    statements = [e for e in evidence if e.type == EvidenceType.bank_statement.value]
+    await session.commit()  # unlocked while the browser and the PDF work
+
+    problem: tuple[str, str] | None = None
+    payout = None
+    check = None
+    ai_down: str | None = None
+    try:
+        payout = await _find_payout(wd)
+    except ManualAuthRequired as exc:
+        problem = (f"Admin login needs manual authentication: {exc}", "Run: python -m app.admin.login --manual")
+    except (LoginFailed, LayoutChanged, AdminError) as exc:
+        problem = (f"Illunise payouts could not be read: {exc}", "")
+    except Exception as exc:  # noqa: BLE001
+        log.exception("payout lookup crashed", case_id=case.case_id)
+        problem = (f"Payout lookup error: {exc!r}", "")
+    if problem is None and payout is not None and payout.account:
+        try:
+            for ev in statements:  # any one of the statements sent may be the right one
+                check = await _check_statement(await _download(ev), payout.account, password)
+                if check.ok:
+                    break
+        except AIUnavailable as exc:
+            ai_down = str(exc)
+
+    if await _relock(session, case, version0) is None:
+        return "stale"
+    if ai_down:
+        return await hold_for_ai(session, case, ai_down, force_send=force_send)
+    if problem is not None:
+        await escalate_case(session, case, *problem)
+        return "escalated"
+    if payout is None:
+        await escalate_case(
+            session, case, f"Withdrawal {wd} was not found in Illunise payouts.", "Nothing was sent to Betix."
+        )
+        return "escalated"
+    if payout.amount is not None and case.amount is None:
+        case.amount = payout.amount
+    details = {"payout": {**payout.as_dict(), "account": mask_account(payout.account)}}
+    details["check"] = {"result": check.result, "how": check.how, "seen": mask_account(check.seen)} if check else None
+    await audit(
+        session,
+        "WITHDRAWAL_ACCOUNT_CHECK",
+        case_id=case.case_id,
+        result=check.result if check else "unknown",
+        details=details,
+    )
+    paid_to = f"Paid to: {payout.bank or 'bank'} a/c {mask_account(payout.account)}"
+    if payout.beneficiary:
+        paid_to += f" ({payout.beneficiary})"
+    if check is not None and check.result == MATCH:
+        return await ready_withdrawal(session, case)
+    if check is not None and check.result == MISMATCH:
+        await escalate_case(
+            session,
+            case,
+            f"{ACCOUNT_MISMATCH} \u2014 the statement is for a/c {mask_account(check.seen)}, "
+            f"the withdrawal went to a/c {mask_account(payout.account)}.",
+            f"{paid_to}\nNot sent to Betix. Ask for the statement of the account the withdrawal was paid to.",
+        )
+        return "escalated"
+    await escalate_case(
+        session,
+        case,
+        "The statement's account number could not be verified against the withdrawal.",
+        f"{paid_to}\nNot sent to Betix. Please check the statement by hand.",
+    )
+    return "escalated"
+
+
 async def _relock(session: AsyncSession, case: Case, version0: int) -> Case | None:
     """Take the case's row lock back after an unlocked stretch (file reads, AI calls, the Illunise browser).
 
@@ -256,7 +381,7 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
             )
         return "not_ready"
     if case.kind == KIND_WITHDRAWAL:
-        return await ready_withdrawal(session, case)
+        return await process_withdrawal(session, case, evidence, force_send=force_send)
 
     # ---- 1. evidence analysis
     await transition(session, case, CaseStatus.ANALYZING_EVIDENCE, reason="evidence complete", strict=False)

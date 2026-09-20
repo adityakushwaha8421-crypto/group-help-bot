@@ -159,3 +159,27 @@ PENDING (still being processed), CHECKING (reviewer acknowledges and is looking)
 (asks for statement/video/UTR), ACK (automatic acknowledgement), NOT_FOUND, IRRELEVANT (channel notices,
 balance reports, unrelated chatter), UNKNOWN. Mixed Hindi/English is common ("ho gaya" = done, "nahi hua" = not done).
 Be conservative: only SUCCESS when the text clearly states the payment is confirmed."""
+
+
+STATEMENT_ACCOUNT_SCHEMA = {
+    "name": "statement_account",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "properties": {"account_number": FIELD_SCHEMA},
+        "required": ["account_number"],
+        "additionalProperties": False,
+    },
+}
+
+STATEMENT_ACCOUNT_SYSTEM = """You read a bank statement PDF and return the ACCOUNT NUMBER OF THE ACCOUNT HOLDER -
+the account this statement was issued for, printed in the header next to the holder's name
+("Account No", "A/c No", "Account Number", "Savings A/c").
+
+Rules:
+- Copy it exactly as printed. If the bank masks it ("XXXXXX1231", "5012****1231"), return it masked, as printed.
+  Never complete, guess or reformat digits.
+- Never return an account number that appears only inside a transaction row / narration (the other party of a
+  transfer), a customer id, CIF, IFSC, MICR, mobile number or card number.
+- If the header shows no account number, return value=null with confidence=0.
+evidence_text = the header line the value came from."""

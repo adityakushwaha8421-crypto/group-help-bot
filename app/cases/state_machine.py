@@ -10,8 +10,8 @@ from app.utils.timeutil import utcnow
 
 S = CaseStatus
 ALLOWED: dict[CaseStatus, set[CaseStatus]] = {
-    # READY / ALREADY_SENT straight from WAITING: a withdrawal needs no reading or search
-    S.WAITING_FOR_INPUT: {S.ANALYZING_EVIDENCE, S.READY_FOR_BETIX, S.ALREADY_SENT, S.FAILED},
+    # A withdrawal skips the reading: WAITING -> SEARCHING (the payout lookup) -> READY / ALREADY_SENT / ESCALATED
+    S.WAITING_FOR_INPUT: {S.ANALYZING_EVIDENCE, S.SEARCHING_ORDER, S.READY_FOR_BETIX, S.ALREADY_SENT, S.FAILED},
     S.ANALYZING_EVIDENCE: {S.SEARCHING_ORDER, S.WAITING_FOR_INPUT, S.FAILED, S.ESCALATED},
     S.SEARCHING_ORDER: {
         S.ORDER_MATCH_FOUND,
@@ -20,6 +20,8 @@ ALLOWED: dict[CaseStatus, set[CaseStatus]] = {
         S.FAILED,
         S.ESCALATED,
         S.WAITING_FOR_INPUT,
+        S.READY_FOR_BETIX,  # withdrawal: the statement's account matches the payout
+        S.ALREADY_SENT,
     },
     S.CHECKING_ORDER_UPI: {S.ORDER_MATCH_FOUND, S.ORDER_MATCH_AMBIGUOUS, S.ESCALATED, S.FAILED, S.WAITING_FOR_INPUT},
     S.ORDER_MATCH_FOUND: {S.READY_FOR_BETIX, S.FAILED, S.ESCALATED, S.ALREADY_SUCCESS, S.ALREADY_SENT},

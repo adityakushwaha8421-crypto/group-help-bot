@@ -19,6 +19,8 @@ from app.ai.prompts import (
     PASSWORD_SYSTEM,
     RECEIVER_UPI_SCHEMA,
     RECEIVER_UPI_SYSTEM,
+    STATEMENT_ACCOUNT_SCHEMA,
+    STATEMENT_ACCOUNT_SYSTEM,
 )
 from app.config import get_settings
 from app.utils.logging import get_logger
@@ -161,6 +163,11 @@ class Analyzer:
         """Reason about one operator message and return the PDF password it states, or a null field."""
         parts = [{"type": "input_text", "text": f"Message:\n{text}"}]
         return (await _structured(PASSWORD_SYSTEM, parts, PASSWORD_SCHEMA))["statement_password"]
+
+    async def read_statement_account(self, statement: Path) -> dict:
+        """The account number printed in a statement's header: {"value", "confidence", "evidence_text"}."""
+        parts = [{"type": "input_text", "text": "Bank statement:"}, _pdf_part(statement)]
+        return (await _structured(STATEMENT_ACCOUNT_SYSTEM, parts, STATEMENT_ACCOUNT_SCHEMA))["account_number"]
 
     async def classify_betix_reply(self, text: str, *, context: str = "") -> dict:
         parts = [{"type": "input_text", "text": f"Context: {context}\n\nMessage:\n{text}"}]

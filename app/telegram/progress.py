@@ -40,6 +40,12 @@ def progress_card(case: Case) -> str:
         return _card("\u23f3 WAITING FOR EVIDENCE", [ident], "\U0001f4e9 Send the remaining files and I'll continue.")
     if st == S.ANALYZING_EVIDENCE.value:
         return _card("\U0001f9e0 READING EVIDENCE", [ident], "\u23f3 Pulling out the payment details...")
+    if st == S.SEARCHING_ORDER.value and case.kind == "withdrawal":
+        return _card(
+            "\U0001f50e CHECKING WITHDRAWAL",
+            [f"\U0001f4b8 Withdrawal: {code(case.withdrawal_id or '-')}"],
+            "\u23f3 Reading the payout in Illunise and matching the statement's bank account...",
+        )
     if st == S.SEARCHING_ORDER.value:
         return _card("\U0001f50e SEARCHING ILLUNISE", [ident], "\u23f3 Looking for the matching order...")
     if st == S.CHECKING_ORDER_UPI.value:
@@ -103,6 +109,8 @@ def progress_card(case: Case) -> str:
             [f"\U0001f9fe Order: {order}"],
             "\u2139\ufe0f Sent earlier from another case \u2014 not sent again.",
         )
+    if st == S.ESCALATED.value and (case.failure_reason or "").startswith("ACCOUNT DOES NOT MATCH"):
+        return _card("\u274c ACCOUNT DOES NOT MATCH", [ident], f"\u2757 {i(reason)}\n\U0001f6ab Not sent to Betix.")
     if st == S.ESCALATED.value:
         return _card("\U0001f6a8 MANUAL REVIEW NEEDED", [ident], f"\u2757 {i(reason)}" if reason else "")
     return _card("\u26d4 CASE CLOSED", [ident], f"\u2757 {i(reason)}" if reason else "")
