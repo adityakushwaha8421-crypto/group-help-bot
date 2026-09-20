@@ -1007,13 +1007,28 @@ async def resolve_pi_check(session: AsyncSession, case_id: str, *, timed_out: st
     return "ambiguous"
 
 
-async def post_case_to_betix(session: AsyncSession, case_id: str, poster) -> str:
+async def force_push(session: AsyncSession, case_id: str, poster, *, actor: str = "operator") -> str:
+    """FORCE SEND (/push, or the button under "ALREADY WITH BETIX"): the operator wants this case in the Betix
+    group although another case sent the same order earlier. Only ever on the operator's word.
+    Returns: posted | escalated | missing | not_applicable"""
+    case = await get_case_for_update(session, case_id)
+    if case is None:
+        return "missing"
+    if case.status != CaseStatus.ALREADY_SENT.value:
+        return "not_applicable"
+    await audit(session, "FORCE_PUSH", case_id=case.case_id, actor=actor, result=case.betex_pay_order_id)
+    case.failure_reason = None
+    await transition(session, case, CaseStatus.READY_FOR_BETIX, reason=f"force send by {actor}", actor=actor)
+    return await post_case_to_betix(session, case_id, poster, force=True)
+
+
+async def post_case_to_betix(session: AsyncSession, case_id: str, poster, *, force: bool = False) -> str:
     case = await get_case_for_update(session, case_id)
     if case is None:
         return "missing"
     if case.status not in (CaseStatus.READY_FOR_BETIX.value, CaseStatus.POSTED_TO_BETIX.value):
         return "already"
-    if case.betex_pay_order_id and not case.betix_root_message_id:
+    if case.betex_pay_order_id and not case.betix_root_message_id and not force:
         # The last gate before the group: under a per-order lock, refuse when another case has posted this order
         # id in the meantime (two submissions of the same payment processed side by side).
         await lock_order_id(session, case.betex_pay_order_id)

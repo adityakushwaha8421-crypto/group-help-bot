@@ -49,7 +49,7 @@ ALLOWED: dict[CaseStatus, set[CaseStatus]] = {
     },
     S.VERIFIED: set(),
     S.ALREADY_SUCCESS: set(),
-    S.ALREADY_SENT: set(),
+    S.ALREADY_SENT: {S.READY_FOR_BETIX},  # the operator's FORCE SEND (/push) - never automatic
     S.FAILED: {S.SEARCHING_ORDER, S.WAITING_FOR_INPUT, S.READY_FOR_BETIX},
 }
 

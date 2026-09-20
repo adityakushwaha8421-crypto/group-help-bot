@@ -107,7 +107,8 @@ def progress_card(case: Case) -> str:
         return _card(
             "\U0001f501 ALREADY WITH BETIX",
             [f"\U0001f9fe Order: {order}"],
-            "\u2139\ufe0f Sent earlier from another case \u2014 not sent again.",
+            "\u2139\ufe0f Sent earlier from another case \u2014 not sent again.\n"
+            "\U0001f4e4 Need it sent anyway? Tap the button or use /push.",
         )
     if st == S.ESCALATED.value and (case.failure_reason or "").startswith("ACCOUNT DOES NOT MATCH"):
         return _card("\u274c ACCOUNT DOES NOT MATCH", [ident], f"\u2757 {i(reason)}\n\U0001f6ab Not sent to Betix.")
@@ -120,6 +121,19 @@ def _card(head: str, rows: list[str], foot: str) -> str:
     """Heading, a blank line, one detail per line, a blank line, the next step."""
     blocks = ["<b>" + head + "</b>", "\n".join(x for x in rows if x), foot]
     return "\n\n".join(x for x in blocks if x)
+
+
+def card_buttons(case: Case):
+    """The buttons under the card. Only "ALREADY WITH BETIX" has one: FORCE SEND. None removes any old button."""
+    if case.status != S.ALREADY_SENT.value:
+        return None
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="\U0001f4e4 Force send to Betix", callback_data=f"push:{case.case_id}")]
+        ]
+    )
 
 
 async def push(session: AsyncSession, case: Case) -> bool:
@@ -135,7 +149,11 @@ async def push(session: AsyncSession, case: Case) -> bool:
         await get_throttle().run(
             case.progress_chat_id,
             lambda: notifications.get_bot().edit_message_text(
-                text, chat_id=case.progress_chat_id, message_id=case.progress_message_id, parse_mode="HTML"
+                text,
+                chat_id=case.progress_chat_id,
+                message_id=case.progress_message_id,
+                parse_mode="HTML",
+                reply_markup=card_buttons(case),
             ),
         )
         return True

@@ -15,8 +15,10 @@ from aiogram.types import (
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeDefault,
+    CallbackQuery,
     Message,
 )
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from app.cases import manager
@@ -29,7 +31,7 @@ from app.cases.correlation import (
     statement_needs_password,
 )
 from app.config import get_settings
-from app.db.models import KIND_WITHDRAWAL, CaseStatus
+from app.db.models import KIND_WITHDRAWAL, Case, CaseStatus
 from app.db.repository import (
     case_evidence_requested,
     find_case_by_order_id,
@@ -117,6 +119,7 @@ def help_text() -> str:
         f"{code('/status [ORDER-ID]')} — where a case stands\n"
         f"{code('/cases')} — all open cases\n"
         f"{code('/summary [DAYS]')} — overview by stage\n"
+        f"{code('/push [ORDER-ID]')} — force send a case marked “Already with Betix”\n"
         f"{code('/cancel')} — discard what's in progress\n"
         f"{code('/restart')} — pull the latest code and restart",
     )
@@ -125,6 +128,89 @@ def help_text() -> str:
 @router.message(Command("start", "help"))
 async def cmd_help(message: Message):
     await message.answer(help_text(), parse_mode="HTML")
+
+
+async def _force_push(case_id: str, actor: str) -> tuple[str, str]:
+    """Force-send one "ALREADY WITH BETIX" case. (outcome, the line to show the operator)."""
+    async with session_scope() as session:
+        outcome = await manager.force_push(session, case_id, manager.get_poster(), actor=actor)
+        case = await get_case(session, case_id)
+        label = code(case_label(case)) if case else code(case_id)
+    await refresh_progress(case_id)
+    if outcome == "posted":
+        return outcome, para(
+            "\U0001f4e4 " + b("FORCE SENT TO BETIX"),
+            f"\U0001f9fe Order: {label}",
+            "\U0001f440 Waiting for Betix to confirm...",
+        )
+    if outcome == "not_applicable":
+        return outcome, para(
+            "\u2139\ufe0f " + b("NOTHING TO FORCE SEND"),
+            f"\U0001f9fe Order: {label}",
+            "This case is not in \u201cAlready with Betix\u201d.",
+        )
+    if outcome == "missing":
+        return outcome, "\U0001f914 I couldn't find that case."
+    return outcome, para(
+        "\u26a0\ufe0f " + b("FORCE SEND FAILED"), f"\U0001f9fe Order: {label}", "See the manual-review message."
+    )
+
+
+@router.message(Command("push"))
+async def cmd_push(message: Message, command: CommandObject):
+    """/push [ORDER-ID]: send an "ALREADY WITH BETIX" case to the Betix group anyway."""
+    q = (command.args or "").strip()
+    async with session_scope() as session:
+        if q:
+            case = await get_case(session, q)
+            if case is None or case.status != CaseStatus.ALREADY_SENT.value:
+                # the order id belongs to two cases: the one that sent it and the one that was held back
+                res = await session.execute(
+                    select(Case)
+                    .where(
+                        func.upper(Case.betex_pay_order_id) == q.upper(), Case.status == CaseStatus.ALREADY_SENT.value
+                    )
+                    .order_by(Case.id.desc())
+                    .limit(1)
+                )
+                case = res.scalar_one_or_none() or case
+        else:
+            res = await session.execute(
+                select(Case)
+                .where(Case.source_chat_id == message.chat.id, Case.status == CaseStatus.ALREADY_SENT.value)
+                .order_by(Case.id.desc())
+                .limit(1)
+            )
+            case = res.scalar_one_or_none()
+        case_id = case.case_id if case else None
+    if not case_id:
+        await message.answer(
+            para(
+                "\u2139\ufe0f " + b("NOTHING TO FORCE SEND"),
+                "No case is in \u201cAlready with Betix\u201d.",
+                i("Use /push ORDER-ID for a specific one."),
+            ),
+            parse_mode="HTML",
+        )
+        return
+    who = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
+    _, text = await _force_push(case_id, who)
+    await message.answer(text, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("push:"))
+async def on_push_button(query: CallbackQuery):
+    """The "Force send to Betix" button under an ALREADY WITH BETIX card."""
+    if query.from_user.id not in get_settings().admin_user_ids:
+        await query.answer("\u26d4 Not authorized", show_alert=True)
+        return
+    who = f"@{query.from_user.username}" if query.from_user.username else str(query.from_user.id)
+    outcome, text = await _force_push(query.data.split(":", 1)[1], who)
+    await query.answer(
+        {"posted": "\U0001f4e4 Sent to Betix", "not_applicable": "Already handled"}.get(outcome, "\u26a0\ufe0f Failed")
+    )
+    if outcome != "posted" and query.message:  # "posted" shows on the card itself
+        await query.message.answer(text, parse_mode="HTML")
 
 
 @router.message(Command("restart"))
@@ -742,6 +828,7 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("status", "Where the current case stands (or /status ORDER-ID)"),
     ("cases", "All open cases"),
     ("summary", "All-time overview by stage (or /summary 7 for a week)"),
+    ("push", "Force send a case marked 'Already with Betix' (/push ORDER-ID)"),
     ("cancel", "Discard the case (or search) in progress"),
     ("restart", "Pull the latest code and restart the bot"),
     ("help", "How to use the bot"),
@@ -791,9 +878,11 @@ async def run_polling(stop_event: asyncio.Event | None = None) -> None:
         except Exception as exc:  # noqa: BLE001
             log.warning("could not confirm the restart", error=str(exc)[:200])
     if stop_event is None:
-        await dp.start_polling(bot, allowed_updates=["message"])
+        await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     else:
-        task = asyncio.create_task(dp.start_polling(bot, allowed_updates=["message"], handle_signals=False))
+        task = asyncio.create_task(
+            dp.start_polling(bot, allowed_updates=["message", "callback_query"], handle_signals=False)
+        )
         await stop_event.wait()
         await dp.stop_polling()
         await task
