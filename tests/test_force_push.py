@@ -72,3 +72,25 @@ async def test_the_automatic_path_still_never_sends_twice(
     _, second = await held_back_case(db, order_search, fake_poster)
     assert await post(db, second, fake_poster) == "already"
     assert len(screenshot_posts(fake_poster)) == 1
+
+
+# ------------------------------------------------------------------ which case does /push mean?
+async def test_plain_push_means_the_current_case_never_an_older_one(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    from app.telegram.input_bot import pick_push_case
+
+    _, held = await held_back_case(db, order_search, fake_poster)  # an OLD case in "Already with Betix"
+    async with db.session_scope() as s:
+        assert (await pick_push_case(s, 111, None, None)).case_id == held  # it is the newest: the current case
+    newer = await submit_again(db, 40)  # a NEW case arrives; it is the current one now
+    async with db.session_scope() as s:
+        picked = await pick_push_case(s, 111, None, None)
+        assert picked.case_id == newer and picked.status != CaseStatus.ALREADY_SENT.value
+        # -> the handler answers "nothing to force send"; the old held-back case is NOT reached back for
+        assert (await pick_push_case(s, 111, ORDER, None)).case_id == held  # only when named ...
+        old = await get_case(s, held)
+        old.progress_chat_id, old.progress_message_id = 111, 777
+    async with db.session_scope() as s:
+        assert (await pick_push_case(s, 111, None, 777)).case_id == held  # ... or when its card is replied to
+        assert (await pick_push_case(s, 222, None, None)) is None  # another chat has no current case

@@ -93,7 +93,9 @@ class Settings(BaseSettings):
     # processed and sent to Betix with what it has. Late files still go out as replies. 0 = wait for everything.
     # A payment screenshot must actually SHOW a UTR / transaction id. No UTR readable -> the operator is asked for a
     # clear screenshot and nothing is searched or sent. A UTR is never assumed from anywhere else.
-    require_screenshot_utr: bool = True
+    # UTR is NOT mandatory (2026-09-20): when the screenshot shows one it is a strong extra signal, when it does
+    # not, matching goes on with mobile + amount + time. True brings back "UTR Not Found - send a clearer one".
+    require_screenshot_utr: bool = False
     ai_retry_seconds: int = 600  # a case held because the AI service was unavailable is retried this often
     # Database pool. Every concurrent case, job and command holds one connection while it works; the defaults
     # (5 + 10) stall the whole bot once a handful of cases run at the same time.
@@ -206,6 +208,10 @@ class Settings(BaseSettings):
     order_search_window_minutes: int = 30
     order_search_keep_closest: int = 10
     # The customer pays a "padded" amount (₹13,999.35 for a ₹14,000 order); tolerance in currency units.
+    # Betix "Reversed" on a withdrawal: after the operator approves ("Refund now"), it is refunded in Illunise
+    # payouts and the panel is watched until it shows Refunded (the payout bot works the queue every ~20 s).
+    refund_wait_seconds: int = 180
+    refund_poll_seconds: int = 8
     order_amount_tolerance: float = 1.0
     betix_gateway_name: str = "BetixPay"
     # Order statuses that are compatible with a payment being verified (comma separated, case-insensitive)

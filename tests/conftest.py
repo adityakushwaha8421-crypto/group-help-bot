@@ -46,6 +46,16 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("ADMIN_STORAGE_STATE_PATH", str(tmp_path / "state.json"))
     from app.config import reset_settings_cache
 
+    # A test must never reach the real Illunise panel (least of all its Refund button).
+    async def _no_real_panel(*a, **kw):
+        raise RuntimeError("a test tried to use the real Illunise panel")
+
+    import app.admin.orders
+    import app.admin.payouts
+
+    monkeypatch.setattr(app.admin.orders, "find_candidates", _no_real_panel)
+    monkeypatch.setattr(app.admin.payouts, "find_payout", _no_real_panel)
+    monkeypatch.setattr(app.admin.payouts, "refund_payout", _no_real_panel)
     reset_settings_cache()
     yield
     reset_settings_cache()
@@ -240,7 +250,14 @@ def payout(env):
     from app.cases import manager
     from app.evidence.statement_account import AccountCheck
 
-    holder = {"found": True, "account": "50100123451231", "statement": "match", "seen": "99887766554433", "lookups": 0}
+    holder = {
+        "found": True,
+        "account": "50100123451231",
+        "statement": "match",
+        "seen": "99887766554433",
+        "lookups": 0,
+        "status": "Success",
+    }
 
     async def _lookup(wd):
         holder["lookups"] += 1
@@ -248,7 +265,7 @@ def payout(env):
             return None
         return Payout(
             withdraw_id=wd, account=holder["account"], ifsc="KKBK0001770", beneficiary="Test User",
-            bank="Kotak Mahindra Bank", amount=926.25, status="Success",
+            bank="Kotak Mahindra Bank", amount=926.25, status=holder["status"],
         )  # fmt: skip
 
     async def _check(path, account):

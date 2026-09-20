@@ -669,6 +669,16 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
             "Candidates:\n" + "\n".join(lines) + (f"\n{note}" if note else "") + "\nCheck them in the Illunise panel.",
         )
         return "ambiguous"
+    # ANY DOUBT -> ask Betix. No order cleared the bar, but some fit the amount and were created before the payment
+    # inside the window: each one's UPI is checked with /pi, closest first, and the first that fits the
+    # screenshot's receiver UPI is the order. Nothing fits -> manual review, as before.
+    doubtful = doubt_candidates(result)
+    if s.betix_pi_check and doubtful:
+        started, pi_note = await start_pi_check(
+            session, case, doubtful, f"no order is a clear match ({result.reason}); {len(doubtful)} fit amount and time"
+        )
+        if started:
+            return "checking_upi"
     tz = s.timezone
     when = fmt_local(case.payment_time, tz, "%d %b %H:%M") if case.payment_time else "?"
     if result.decision == "NO_CANDIDATES":
@@ -767,9 +777,11 @@ async def select_order(session: AsyncSession, case: Case, b, *, reason: str, con
         source="matcher",
         details=signals,
     )
-    if (b.status or "").strip().lower() in s.success_statuses:
-        # Illunise already shows this order as Success: Betix has confirmed it before. Nothing to send.
-        case.failure_reason = f"Order already Success in Illunise (status: {b.status})"
+    same_utr = bool(case.utr and getattr(b, "utr", None) and str(b.utr).strip() == str(case.utr).strip())
+    if (b.status or "").strip().lower() in s.success_statuses and same_utr:
+        # Illunise shows this order as Success WITH THIS PAYMENT'S UTR: it has been credited. Nothing to send.
+        # A Success status alone proves nothing about this payment - then the order still goes to Betix.
+        case.failure_reason = f"Order already Success in Illunise with this UTR (status: {b.status})"
         await transition(session, case, CaseStatus.ALREADY_SUCCESS, reason=case.failure_reason)
         await audit(
             session,
@@ -796,6 +808,26 @@ async def alert_ambiguous(session: AsyncSession, case: Case, reason: str, extra:
         text=format_manual_review(case, reason, extra),
         dedupe_suffix=reason[:60],
     )
+
+
+def doubt_candidates(result: MatchResult) -> list:
+    """NO clear match: the orders still worth asking Betix about - the amount fits, created before the payment
+    inside the window, a Betix order (never another gateway's) - CLOSEST to the payment first."""
+    s = get_settings()
+
+    def lead(sc) -> float:
+        v = (sc.signals.get("time") or {}).get("lead_minutes")
+        return v if v is not None and v >= 0 else float("inf")
+
+    fit = [
+        sc
+        for sc in result.scored
+        if sc.candidate.betex_order_id
+        and (sc.signals.get("amount") or {}).get("score") == 1.0
+        and ((sc.signals.get("time") or {}).get("score") or 0) >= 0.7
+        and (sc.signals.get("gateway") or {}).get("score") != 0.0
+    ]
+    return sorted(fit, key=lambda sc: (lead(sc), -sc.score))[: s.pi_check_max_orders]
 
 
 def close_candidates(result: MatchResult) -> list:
@@ -1214,6 +1246,229 @@ async def verify_case(
     return True
 
 
+# ------------------------------------------------------------------ withdrawal reversed by Betix
+# Betix says "Reversed" -> the payout is READ -> the operator gets a "Refund now" button -> only their tap makes
+# the bot click Refund -> "solved" is reported only once the panel shows Refunded. No refund without a person.
+_refunder = None
+
+
+def set_refunder(fn) -> None:
+    global _refunder
+    _refunder = fn
+
+
+async def _refund(withdraw_id: str):
+    if _refunder is not None:
+        return await _refunder(withdraw_id)
+    from app.admin.payouts import refund_payout
+
+    return await refund_payout(withdraw_id)
+
+
+async def start_reversal(
+    session: AsyncSession, case: Case, *, actor: str, betix_message_id, sender_id, sender_username, quote: str
+) -> str:
+    """Betix said "Reversed". Remember who said it (the audit row survives a restart); the check runs as a job."""
+    await cancel_case_followups(session, case, "Betix reversed the withdrawal")  # Betix has answered
+    await audit(
+        session,
+        "BETIX_REVERSED",
+        case_id=case.case_id,
+        actor=actor,
+        result=case.withdrawal_id,
+        source="betix_group",
+        details={
+            "betix_message_id": betix_message_id,
+            "sender_id": sender_id,
+            "sender_username": sender_username,
+            "quote": quote,
+        },
+    )
+    await enqueue("reversal_check_job", case.case_id, job_id=f"reversal-{case.case_id}-{betix_message_id}")
+    return "reversal_check_queued"
+
+
+async def _reversal_info(session: AsyncSession, case_id: str) -> tuple[str, dict] | None:
+    from sqlalchemy import select
+
+    from app.db.models import AuditLog
+
+    row = (
+        (
+            await session.execute(
+                select(AuditLog)
+                .where(AuditLog.case_id == case_id, AuditLog.action == "BETIX_REVERSED")
+                .order_by(AuditLog.id.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    return (row.actor, dict(row.details or {})) if row else None
+
+
+def _reversal_open(case: Case | None) -> bool:
+    return bool(
+        case
+        and case.kind == KIND_WITHDRAWAL
+        and case.withdrawal_id
+        and case.status not in TERMINAL_OK
+        and case.status not in (CaseStatus.ESCALATED.value, CaseStatus.FAILED.value)
+    )
+
+
+async def _close_reversed(session: AsyncSession, case: Case, actor: str, info: dict, payout) -> None:
+    if payout is not None and payout.amount is not None:
+        case.amount = payout.amount
+    await verify_case(
+        session,
+        case,
+        confirmed_by=actor,
+        confirmation_message_id=info.get("betix_message_id"),
+        confirmation_user_id=info.get("sender_id"),
+        confirmation_username=info.get("sender_username"),
+        reversed_quote=info.get("quote") or "Reversed",
+    )
+
+
+async def reversal_check(case_id: str) -> str:
+    """READ the payout Betix reversed. Already Refunded -> solved. Success -> ask the operator to approve the
+    refund (button). Anything else -> Manual Review. Nothing is clicked here.
+    Returns: reversed | asked | escalated | skipped"""
+    from app.db.session import session_scope
+    from app.telegram.notifications import format_refund_request, refund_button
+
+    async with session_scope() as session:
+        case = await get_case_for_update(session, case_id)
+        found = await _reversal_info(session, case_id) if _reversal_open(case) else None
+        if found is None:
+            return "skipped"
+        wd = case.withdrawal_id
+    actor, info = found
+    problem, payout = None, None
+    try:
+        payout = await _find_payout(wd)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("payout read failed", case_id=case_id, error=str(exc)[:200])
+        problem = f"Illunise payouts could not be read: {exc}"
+    async with session_scope() as session:
+        case = await get_case_for_update(session, case_id)
+        if not _reversal_open(case):
+            return "skipped"
+        status = (payout.status or "").strip().lower() if payout else ""
+        if status == "refunded":
+            await audit(session, "WITHDRAWAL_REFUND", case_id=case_id, result="already_refunded", details={"id": wd})
+            await _close_reversed(session, case, actor, info, payout)
+            return "reversed"
+        if status == "success":
+            if payout.amount is not None:
+                case.amount = payout.amount
+            await notify_admin(
+                session,
+                kind="refund_request",
+                case=case,
+                dedupe_suffix=str(info.get("betix_message_id") or ""),
+                text=format_refund_request(case, actor, payout),
+                reply_markup=refund_button(case),
+            )
+            return "asked"
+        why = problem or (
+            f"withdrawal {wd} was not found in Illunise payouts."
+            if payout is None
+            else f"the payout's status is {payout.status or 'unknown'}, not Success \u2014 nothing was refunded."
+        )
+        await escalate_case(
+            session,
+            case,
+            f"Betix reversed this withdrawal ({actor}), but {why}",
+            "Check the payout in Illunise by hand.",
+        )
+        return "escalated"
+
+
+async def approve_refund(session: AsyncSession, case_id: str, approver: str) -> str:
+    """The operator tapped "Refund now". Recorded once; the refund itself runs as a job.
+    Returns: queued | already | not_applicable"""
+    case = await get_case_for_update(session, case_id)
+    if not _reversal_open(case) or await _reversal_info(session, case_id) is None:
+        return "not_applicable"
+    from sqlalchemy import select
+
+    from app.db.models import AuditLog
+
+    seen = await session.execute(
+        select(AuditLog.id).where(AuditLog.case_id == case_id, AuditLog.action == "REFUND_APPROVED").limit(1)
+    )
+    if seen.first() is not None:
+        return "already"
+    await audit(session, "REFUND_APPROVED", case_id=case_id, actor=approver, result=case.withdrawal_id)
+    await enqueue("refund_withdrawal_job", case_id, job_id=f"refund-{case_id}")
+    return "queued"
+
+
+async def refund_approved_withdrawal(case_id: str) -> str:
+    """Runs only after REFUND_APPROVED: refund the exact payout and report "solved" once the panel shows Refunded.
+    Returns: reversed | escalated | skipped"""
+    from sqlalchemy import select
+
+    from app.db.models import AuditLog
+    from app.db.session import session_scope
+
+    async with session_scope() as session:
+        case = await get_case_for_update(session, case_id)
+        found = await _reversal_info(session, case_id) if _reversal_open(case) else None
+        approved = await session.execute(
+            select(AuditLog.actor).where(AuditLog.case_id == case_id, AuditLog.action == "REFUND_APPROVED").limit(1)
+        )
+        approver = approved.scalar_one_or_none()
+        if found is None or approver is None:
+            return "skipped"  # no "Reversed" from Betix, or no approval from the operator: never refund
+        wd = case.withdrawal_id  # the EXACT id this case was opened with
+    actor, info = found
+    problem, result = None, None
+    try:
+        result = await _refund(wd)  # up to a few minutes: no database transaction is held meanwhile
+    except Exception as exc:  # noqa: BLE001
+        log.exception("refund crashed", case_id=case_id)
+        problem = f"the refund could not be run ({exc})."
+    async with session_scope() as session:
+        case = await get_case_for_update(session, case_id)
+        if not _reversal_open(case):
+            return "skipped"
+        await audit(
+            session,
+            "WITHDRAWAL_REFUND",
+            case_id=case_id,
+            actor=approver,
+            result=result.outcome if result else "error",
+            source="illunise_admin",
+            details={
+                "id": wd,
+                "before": result.status_before if result else None,
+                "after": result.status_after if result else None,
+                "detail": result.detail if result else problem,
+            },
+        )
+        if result is not None and result.ok:
+            await _close_reversed(session, case, actor, info, result.payout)
+            return "reversed"
+        why = problem or {
+            "not_success": f"the payout's status is {result.status_before or 'unknown'}, not Success \u2014 "
+            "Refund was NOT clicked.",
+            "not_found": f"withdrawal {wd} was not found in Illunise payouts.",
+            "not_confirmed": f"Refund was clicked, but the panel does not show Refunded yet ({result.detail}).",
+            "refund_failed": f"the refund did not go through ({result.detail}).",
+        }.get(result.outcome, result.detail)
+        await escalate_case(
+            session,
+            case,
+            f"Betix reversed this withdrawal ({actor}), but it is NOT refunded: {why}",
+            "Check the payout in Illunise by hand. Do not pay the customer before the panel shows Refunded.",
+        )
+        return "escalated"
+
+
 async def apply_verification_signal(
     session: AsyncSession,
     case: Case,
@@ -1344,17 +1599,17 @@ async def apply_verification_signal(
             await escalate_case(session, case, "Betix: UPI does not belong to us.", (cls.matched or "")[:200])
             return "escalated_failed"
         if case.kind == KIND_WITHDRAWAL and "revers" in (cls.matched or "").lower():
-            # "Reversed" on a withdrawal: solved on Betix's side; the staff pay the customer by hand
-            await verify_case(
+            # "Reversed" on a withdrawal: the payout came back. The payout is looked at (read-only) and the
+            # operator is asked to approve the refund - see reversal_check / refund_approved_withdrawal.
+            return await start_reversal(
                 session,
                 case,
-                confirmed_by=actor,
-                confirmation_message_id=betix_message_id,
-                confirmation_user_id=sender_id,
-                confirmation_username=sender_username,
-                reversed_quote=(cls.matched or "")[:200],
+                actor=actor,
+                betix_message_id=betix_message_id,
+                sender_id=sender_id,
+                sender_username=sender_username,
+                quote=(cls.matched or "")[:200],
             )
-            return "reversed"
         await escalate_case(
             session, case, f"Betix reports the payment as FAILED / not received ({actor}).", (cls.matched or "")[:200]
         )

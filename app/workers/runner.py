@@ -22,7 +22,15 @@ from app.utils.logging import get_logger
 
 log = get_logger("runner")
 
-CASE_JOBS = {"process_case_job", "post_case_job", "late_evidence_job", "added_evidence_job", "pi_check_timeout_job"}
+CASE_JOBS = {
+    "process_case_job",
+    "post_case_job",
+    "reversal_check_job",
+    "refund_withdrawal_job",
+    "late_evidence_job",
+    "added_evidence_job",
+    "pi_check_timeout_job",
+}
 
 
 @dataclass

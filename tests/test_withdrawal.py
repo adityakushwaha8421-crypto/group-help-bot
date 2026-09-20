@@ -123,34 +123,6 @@ async def test_a_protected_statement_asks_for_the_password_first(db, fake_bot, t
         assert missing_items(r.case, await list_evidence(s, r.case.case_id)) == []
 
 
-async def test_reversed_means_pay_the_customer_by_hand(db, fake_bot, fake_ai, order_search, no_download, fake_poster):
-    """Betix answers a withdrawal with "Reversed": that is not a failed PAYMENT - the payout came back."""
-    from app.telegram.progress import progress_card
-
-    async with db.session_scope() as s:
-        cid = (await attach_message(s, make_input(1, "text", WD))).case.case_id
-        await attach_message(s, make_input(2, "document"))
-    async with db.session_scope() as s:
-        await manager.process_case(s, cid, force=True)
-        await manager.post_case_to_betix(s, cid, fake_poster)
-        r = await handle_group_message(s, make_group_msg(602, "Reversed", sender_username="Wendy", reply_to=501))
-        assert r["action"] == "reversed"
-        c = await get_case(s, cid)
-        assert c.status == CaseStatus.VERIFIED.value and c.followup_cancelled  # solved: closed, no more follow-ups
-        card = progress_card(c)
-    alerts = [t for _, t in fake_bot.sent if "WITHDRAWAL REVERSED" in t]
-    assert (
-        len(alerts) == 1
-        and f"BX{WD}" in alerts[0]
-        and "pay the customer manually" in alerts[0]
-        and "Solved" in alerts[0]
-    )
-    assert "User ID: <code>" in alerts[0]  # the customer to pay is named
-    assert "Mobile" not in alerts[0] and "FAILED / not received" not in alerts[0]
-    assert "WITHDRAWAL REVERSED" in card and "MANUAL REVIEW" not in card and "PAYMENT CONFIRMED" not in card
-    assert not any("MANUAL REVIEW" in t or "PAYMENT CONFIRMED" in t for _, t in fake_bot.sent)
-
-
 # ------------------------------------------------------------------ withdrawal verification (payout account)
 async def _case_with_statement(db):
     async with db.session_scope() as s:

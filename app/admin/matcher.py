@@ -212,7 +212,11 @@ def score_candidate(
                 else "expired; paid after expiry?"
             )
         else:
-            s = 0.0
+            # Failed / cancelled / refunded ...: what the panel says about the order is not what happened to the
+            # money. It weighs the order down a little and never rejects it: Betix verifies the payment.
+            s = 1.0 if utr_exact else 0.5
+            status_tier = "closed"
+            how = f"status {cand.status}: does not by itself rule the order out"
     else:
         s = None
     signals["status"] = {"candidate": cand.status, "score": s, "how": how}
@@ -295,8 +299,6 @@ def score_candidate(
         score = min(score, 0.6)  # created after the payment, or far too long before it
     elif signals["time"]["score"] is not None and signals["time"]["score"] < 0.7:
         score = min(score, 0.7)  # outside the before-payment window: never auto-selectable
-    if signals["status"]["score"] == 0.0:
-        score = min(score, 0.6)
     # With only one comparable signal we can never be confident.
     if len(avail) < 2:
         score = min(score, 0.6)

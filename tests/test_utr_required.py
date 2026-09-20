@@ -1,6 +1,9 @@
-"""A payment screenshot must actually SHOW a UTR / transaction id. If none is readable the operator is asked for a
+"""REQUIRE_SCREENSHOT_UTR=true (optional since 2026-09-20; the default is OFF - see test_utr_optional.py):
+a payment screenshot must actually SHOW a UTR / transaction id. If none is readable the operator is asked for a
 clear screenshot, nothing is searched in Illunise and nothing is sent to Betix. A UTR is never taken from elsewhere
 and never invented."""
+
+import pytest
 
 from app.cases import manager
 from app.cases.correlation import attach_message
@@ -15,6 +18,16 @@ NO_UTR = {
     "payment_time": {"value": "2026-09-10 19:32:12", "confidence": 0.95},
     "payment_status": {"value": "Successful", "confidence": 0.9},
 }
+
+
+@pytest.fixture(autouse=True)
+def utr_required(env, monkeypatch):
+    from app.config import reset_settings_cache
+
+    monkeypatch.setenv("REQUIRE_SCREENSHOT_UTR", "true")
+    reset_settings_cache()
+
+
 MESSAGE = "UTR Not Found ❌\n\nPlease send a clear payment screenshot where the UTR/Transaction ID is visible."
 
 

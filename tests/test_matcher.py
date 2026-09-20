@@ -173,10 +173,12 @@ def test_gateway_and_status_signals_cap_the_score():
     expired = mobile_cand("B", 500.0, "2026-09-10 14:58:00", status="Failed")
     good = mobile_cand("C", 500.0, "2026-09-10 14:58:00")
     r = match_orders(e, "9876543210", [good, other_gw, expired], **KW2)
-    assert r.decision == "MATCHED" and r.best.candidate.illunise_order_id == "C"
+    assert r.best.candidate.illunise_order_id == "C"  # the open order leads ...
     by = {s.candidate.illunise_order_id: s for s in r.scored}
-    assert by["A"].signals["gateway"]["score"] == 0.0 and by["A"].score <= 0.5
-    assert by["B"].signals["status"]["score"] == 0.0 and by["B"].score <= 0.6
+    assert by["A"].signals["gateway"]["score"] == 0.0 and by["A"].score <= 0.5  # another gateway: never
+    # ... but a Failed twin created the same minute is NOT ruled out by its status: too close -> /pi decides
+    assert by["B"].signals["status"]["score"] == 0.5 and by["B"].score > 0.6 and r.decision == "AMBIGUOUS"
+    assert match_orders(e, "9876543210", [good, other_gw], **KW2).decision == "MATCHED"
 
 
 def test_closest_order_before_the_payment_wins():
@@ -247,12 +249,16 @@ def test_expired_order_with_a_different_utr_is_not_the_order():
     assert r.decision == "NO_MATCH" and r.best.score <= 0.5
 
 
-def test_failed_or_cancelled_orders_stay_capped():
+def test_status_alone_never_rejects_a_strong_match():
+    """Mobile, amount, time (and here the UTR) all fit: Failed / Cancelled / Refunded does not throw it out."""
     e = ev(amount=2999.05, t="2026-09-10 19:18:00", utr="877586526811")
     for st in ("Failed", "Cancelled", "Refunded"):
         c = mobile_cand("A", 3000.0, "2026-09-10 19:18:00", status=st, utr="877586526811")
-        r = match_orders(e, "9876543210", [c], **KW2)
-        assert r.decision == "NO_MATCH" and r.best.score <= 0.6, st
+        assert match_orders(e, "9876543210", [c], **KW2).decision == "MATCHED", st
+        no_utr = mobile_cand("A", 3000.0, "2026-09-10 19:18:00", status=st)
+        assert match_orders(ev(amount=2999.05, t="2026-09-10 19:18:00"), "9876543210", [no_utr], **KW2).decision == (
+            "MATCHED"
+        ), st
 
 
 # ---------------------------------------------------------------- live case 2026-09-11, ₹199.83 (two ₹200 orders 1 min apart)

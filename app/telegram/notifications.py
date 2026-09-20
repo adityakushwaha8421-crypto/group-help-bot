@@ -159,6 +159,28 @@ def format_withdrawal_reversed(case: Case, actor: str, extra: str = "") -> str:
     )
 
 
+def format_refund_request(case: Case, actor: str, payout) -> str:
+    """Betix reversed a withdrawal and the payout is still Success: ask the operator before any refund."""
+    rows = [f"\U0001f5c2 Case: {code(case_label(case))}", f"\U0001f4b8 Withdrawal: {code(payout.withdraw_id)}"]
+    if payout.amount is not None:
+        rows.append(f"\U0001f4b0 Amount: {_money(payout.amount, case.currency)}")
+    rows.append(f"\U0001f3f7 Panel status: {b(_esc(payout.status or '-'))}")
+    rows.append(f"\U0001f4e3 Reported by: {_esc(actor)}")
+    return para(
+        "\U0001f504 " + b("BETIX REVERSED \u2014 REFUND NEEDED"),
+        rows,
+        ["\U0001f447 Tap to refund it in Illunise.", "I report it as solved only after the panel shows Refunded."],
+    )
+
+
+def refund_button(case: Case):
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="\U0001f4b8 Refund now", callback_data=f"refund:{case.case_id}")]]
+    )
+
+
 def format_info(case: Case, title_text: str, detail: str) -> str:
     return para(
         "\u2139\ufe0f " + b(title_text),
@@ -175,6 +197,7 @@ async def notify_admin(
     case: Case | None = None,
     dedupe_suffix: str = "",
     parse_mode: str | None = "HTML",
+    reply_markup=None,
 ) -> Notification | None:
     """Send a notification to EVERY chat in ADMIN_NOTIFY_CHAT_ID, exactly once per (case, kind, suffix)."""
     s = get_settings()
@@ -196,9 +219,12 @@ async def notify_admin(
         log.warning("ADMIN_NOTIFY_CHAT_ID not configured; notification stored only", kind=kind)
         return row
     errors = []
+    markup = {"reply_markup": reply_markup} if reply_markup is not None else {}
     for chat in chats:  # one failure never stops the others: each admin gets their own copy
         try:
-            msg = await get_throttle().run(chat, lambda: get_bot().send_message(chat, text, parse_mode=parse_mode))
+            msg = await get_throttle().run(
+                chat, lambda: get_bot().send_message(chat, text, parse_mode=parse_mode, **markup)
+            )
             row.sent = True
             row.telegram_message_id = row.telegram_message_id or msg.message_id
         except Exception as exc:  # noqa: BLE001

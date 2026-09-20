@@ -30,7 +30,9 @@ async def test_chatter_text_does_not_open_a_case(db):
 
 
 async def test_already_success_case_ignores_betix_messages(db, fake_bot, fake_ai, order_search, no_download):
-    case_id, outcome = await run_until_ready(db, order_search, [{**GOOD[0], "status": "Success"}])
+    case_id, outcome = await run_until_ready(
+        db, order_search, [{**GOOD[0], "status": "Success", "utr": "611532946151"}]
+    )
     assert outcome == "already_success"
     async with db.session_scope() as s:
         ok = await handle_group_message(s, make_group_msg(700, SYS_OK, sender_username="betixpay_cs_bot", is_bot=True))

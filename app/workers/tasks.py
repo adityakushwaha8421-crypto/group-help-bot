@@ -56,6 +56,20 @@ async def post_case_job(ctx, case_id: str) -> str:
     return outcome
 
 
+async def reversal_check_job(ctx, case_id: str) -> str:
+    """Betix reversed a withdrawal: read the payout and ask the operator to approve the refund."""
+    outcome = await manager.reversal_check(case_id)
+    log.info("reversal_check", case_id=case_id, outcome=outcome)
+    return outcome
+
+
+async def refund_withdrawal_job(ctx, case_id: str) -> str:
+    """The operator approved the refund: do it in Illunise payouts, then report (see manager)."""
+    outcome = await manager.refund_approved_withdrawal(case_id)
+    log.info("refund_withdrawal", case_id=case_id, outcome=outcome)
+    return outcome
+
+
 async def late_evidence_job(ctx, case_id: str) -> int:
     async with session_scope() as session:
         case = await get_case(session, case_id)
@@ -206,6 +220,8 @@ class WorkerSettings:
     functions = [
         process_case_job,
         post_case_job,
+        reversal_check_job,
+        refund_withdrawal_job,
         late_evidence_job,
         added_evidence_job,
         betix_message_job,

@@ -1,5 +1,5 @@
-"""An order that Illunise already shows as Success is never posted to Betix: the case ends as ALREADY_SUCCESS
-and the operator sees "Order already Success"."""
+"""An order that Illunise shows as Success WITH THIS PAYMENT'S UTR has been credited: it is never posted to Betix,
+the case ends as ALREADY_SUCCESS. A Success status alone does not reject the order - it goes to Betix."""
 
 from app.cases import manager
 from app.db.models import CaseStatus
@@ -9,7 +9,8 @@ from app.telegram.progress import progress_card
 from tests.conftest import make_input
 from tests.test_flow import GOOD, MOBILE, run_until_ready
 
-DONE = [{**GOOD[0], "status": "Success"}]
+DONE = [{**GOOD[0], "status": "Success", "utr": "611532946151"}]  # the screenshot's UTR
+SUCCESS_ONLY = [{**GOOD[0], "status": "Success"}]
 
 
 async def test_success_order_is_not_posted(db, fake_bot, fake_ai, order_search, no_download, fake_poster):
@@ -76,3 +77,11 @@ async def test_a_finished_case_cannot_be_failed_afterwards(db):
         assert c.status == CaseStatus.ALREADY_SUCCESS.value and c.failure_reason is None
         c.status = CaseStatus.VERIFIED.value
         assert await manager.fail_case(s, c, "x") is False and c.status == CaseStatus.VERIFIED.value
+
+
+async def test_a_success_status_alone_does_not_stop_the_order(db, fake_bot, fake_ai, order_search, no_download):
+    """Status must not by itself reject a strong match: without the payment's UTR on it, Betix verifies it."""
+    case_id, outcome = await run_until_ready(db, order_search, SUCCESS_ONLY)
+    assert outcome == "ready"
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).betex_pay_order_id == "ILLUN-178621243657290"

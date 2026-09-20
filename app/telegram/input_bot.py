@@ -108,7 +108,7 @@ def help_text() -> str:
         + "\n"
         + i(f"\u23f1 Everything sent within {q}s becomes one case.")
         + "\n"
-        + i("\U0001f522 The screenshot must show the UTR.")
+        + i("\U0001f522 A visible UTR helps the match; it is not required.")
         + "\n"
         + i(f"\U0001f4e4 Missing statement or video? I still send to Betix after {secs}s.")
         + "\n"
@@ -119,7 +119,7 @@ def help_text() -> str:
         f"{code('/status [ORDER-ID]')} — where a case stands\n"
         f"{code('/cases')} — all open cases\n"
         f"{code('/summary [DAYS]')} — overview by stage\n"
-        f"{code('/push [ORDER-ID]')} — force send a case marked “Already with Betix”\n"
+        f"{code('/push')} — force send the current case when it is “Already with Betix”\n"
         f"{code('/cancel')} — discard what's in progress\n"
         f"{code('/restart')} — pull the latest code and restart",
     )
@@ -156,39 +156,50 @@ async def _force_push(case_id: str, actor: str) -> tuple[str, str]:
     )
 
 
+async def pick_push_case(session, chat_id: int, order_id: str | None, replied_to: int | None) -> Case | None:
+    """Which case /push means. NEVER an older one picked by guesswork:
+    - sent as a REPLY to a case card      -> that card's case
+    - /push ORDER-ID                       -> the held-back case of exactly that order
+    - plain /push                          -> the CURRENT case of this chat (the newest one), whatever its state;
+                                              an older "Already with Betix" case is never reached back for."""
+    if replied_to:
+        res = await session.execute(
+            select(Case).where(Case.progress_chat_id == chat_id, Case.progress_message_id == replied_to).limit(1)
+        )
+        found = res.scalar_one_or_none()
+        if found is not None:
+            return found
+    if order_id:
+        res = await session.execute(
+            select(Case)
+            .where(
+                func.upper(Case.betex_pay_order_id) == order_id.upper(), Case.status == CaseStatus.ALREADY_SENT.value
+            )
+            .order_by(Case.id.desc())
+            .limit(1)
+        )
+        return res.scalar_one_or_none() or await get_case(session, order_id)
+    res = await session.execute(select(Case).where(Case.source_chat_id == chat_id).order_by(Case.id.desc()).limit(1))
+    return res.scalar_one_or_none()
+
+
 @router.message(Command("push"))
 async def cmd_push(message: Message, command: CommandObject):
-    """/push [ORDER-ID]: send an "ALREADY WITH BETIX" case to the Betix group anyway."""
-    q = (command.args or "").strip()
+    """/push: force send the CURRENT case when it is "ALREADY WITH BETIX" (or reply to a card / give the order id)."""
+    q = (command.args or "").strip() or None
+    replied = message.reply_to_message.message_id if message.reply_to_message else None
     async with session_scope() as session:
-        if q:
-            case = await get_case(session, q)
-            if case is None or case.status != CaseStatus.ALREADY_SENT.value:
-                # the order id belongs to two cases: the one that sent it and the one that was held back
-                res = await session.execute(
-                    select(Case)
-                    .where(
-                        func.upper(Case.betex_pay_order_id) == q.upper(), Case.status == CaseStatus.ALREADY_SENT.value
-                    )
-                    .order_by(Case.id.desc())
-                    .limit(1)
-                )
-                case = res.scalar_one_or_none() or case
-        else:
-            res = await session.execute(
-                select(Case)
-                .where(Case.source_chat_id == message.chat.id, Case.status == CaseStatus.ALREADY_SENT.value)
-                .order_by(Case.id.desc())
-                .limit(1)
-            )
-            case = res.scalar_one_or_none()
+        case = await pick_push_case(session, message.chat.id, q, replied)
         case_id = case.case_id if case else None
-    if not case_id:
+        pushable = bool(case and case.status == CaseStatus.ALREADY_SENT.value)
+        label = code(case_label(case)) if case else ""
+    if not pushable:
         await message.answer(
             para(
                 "\u2139\ufe0f " + b("NOTHING TO FORCE SEND"),
-                "No case is in \u201cAlready with Betix\u201d.",
-                i("Use /push ORDER-ID for a specific one."),
+                (f"\U0001f9fe Current case: {label}\n" if case_id else "")
+                + "It is not in \u201cAlready with Betix\u201d.",
+                i("Older cases are never pushed by /push alone: reply to their card, or use /push ORDER-ID."),
             ),
             parse_mode="HTML",
         )
@@ -211,6 +222,39 @@ async def on_push_button(query: CallbackQuery):
     )
     if outcome != "posted" and query.message:  # "posted" shows on the card itself
         await query.message.answer(text, parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("refund:"))
+async def on_refund_button(query: CallbackQuery):
+    """ "Refund now" under a BETIX REVERSED message: the operator's approval. The refund runs as a job and the
+    result (WITHDRAWAL REVERSED, or Manual Review) arrives as its own message."""
+    if query.from_user.id not in get_settings().admin_user_ids:
+        await query.answer("\u26d4 Not authorized", show_alert=True)
+        return
+    who = f"@{query.from_user.username}" if query.from_user.username else str(query.from_user.id)
+    async with session_scope() as session:
+        outcome = await manager.approve_refund(session, query.data.split(":", 1)[1], who)
+    await query.answer(
+        {
+            "queued": "\U0001f4b8 Refunding... I'll confirm once the panel shows Refunded.",
+            "already": "Already approved \u2014 the refund is running.",
+        }.get(outcome, "Nothing to refund: this case is already closed."),
+        show_alert=outcome != "queued",
+    )
+    if query.message:
+        try:  # the button has done its job: one approval per case
+            await query.message.edit_reply_markup(reply_markup=None)
+            if outcome == "queued":
+                await query.message.answer(
+                    para(
+                        "\u23f3 " + b("REFUND STARTED"),
+                        f"\U0001f464 Approved by: {esc(who)}",
+                        "Waiting for the panel to show Refunded...",
+                    ),
+                    parse_mode="HTML",
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("refund button cleanup failed", error=str(exc)[:160])
 
 
 @router.message(Command("restart"))
@@ -828,7 +872,7 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("status", "Where the current case stands (or /status ORDER-ID)"),
     ("cases", "All open cases"),
     ("summary", "All-time overview by stage (or /summary 7 for a week)"),
-    ("push", "Force send a case marked 'Already with Betix' (/push ORDER-ID)"),
+    ("push", "Force send the CURRENT case when it is 'Already with Betix'"),
     ("cancel", "Discard the case (or search) in progress"),
     ("restart", "Pull the latest code and restart the bot"),
     ("help", "How to use the bot"),
