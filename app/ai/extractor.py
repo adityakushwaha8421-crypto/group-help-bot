@@ -384,6 +384,22 @@ def parse_datetime_noyear(text: str | None, now=None):
     return parse_datetime_loose(when.strftime("%Y-%m-%d %H:%M:%S"))
 
 
+def fix_guessed_year(when, printed: str | None, now=None):
+    """`when` came from the model; `printed` is the text on the screenshot. When that text shows NO year, the year
+    in `when` is a guess: move it to the latest year that does not put the payment in the future."""
+    if when is None or re.search(r"\b(19|20)\d{2}\b", printed or ""):
+        return when  # the year is printed: keep it
+    now = now or utcnow()
+    fixed = when
+    try:
+        fixed = when.replace(year=now.year)
+        if fixed > now + timedelta(days=1):
+            fixed = when.replace(year=now.year - 1)
+    except ValueError:  # 29 Feb
+        return when
+    return fixed
+
+
 def extraction_from_ai(payload: dict, source: str) -> Extraction:
     """Convert the model's structured JSON (each field {value, confidence}) into an Extraction."""
     e = Extraction()
@@ -404,10 +420,12 @@ def extraction_from_ai(payload: dict, source: str) -> Extraction:
         if k == "amount":
             v = normalize_amount(v)
         elif k == "payment_time":
-            v = (
-                parse_datetime_loose(str(v))
-                or parse_datetime_noyear(str(v))
-                or parse_datetime_noyear(f.get("evidence_text"))
+            # The screenshot printed NO year ("20 Sep, 11:34 AM"): the year in the model's value is its own guess,
+            # and a model that was never told today's date guesses an old one - then Illunise is searched on the
+            # wrong day and no order is ever found. The year is ours to work out, from the printed text.
+            printed = parse_datetime_noyear(f.get("evidence_text"))
+            v = printed or fix_guessed_year(
+                parse_datetime_loose(str(v)) or parse_datetime_noyear(str(v)), f.get("evidence_text")
             )
         elif k == "registration_number":
             v = normalize_registration(v)

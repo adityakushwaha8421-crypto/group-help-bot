@@ -134,6 +134,14 @@ async def _structured_now(system: str, user_parts: list[dict], schema: dict) -> 
     return json.loads(text)
 
 
+def _today_india() -> str:
+    """The model has no clock: without this it fills a missing year with a guess."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    return datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+
+
 class Analyzer:
     """All AI calls go through here so they can be mocked in tests."""
 
@@ -141,7 +149,11 @@ class Analyzer:
         self, files: list[Path], *, doc_type_hint: str, context_hint: str = ""
     ) -> tuple[Extraction, dict]:
         parts: list[dict] = [
-            {"type": "input_text", "text": f"Document type hint: {doc_type_hint}. {context_hint}".strip()}
+            {
+                "type": "input_text",
+                "text": f"Today's date (India): {_today_india()}. Document type hint: {doc_type_hint}. "
+                f"{context_hint}".strip(),
+            }
         ]
         for f in files:
             suffix = f.suffix.lower()

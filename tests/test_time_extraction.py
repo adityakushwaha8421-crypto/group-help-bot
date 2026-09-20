@@ -79,3 +79,27 @@ async def test_a_statements_other_row_never_overrides_the_screenshot(db, fake_bo
         assert c.payment_time.astimezone(timezone.utc).strftime("%m-%d %H:%M") == "09-13 17:39"
         assert c.amount == 3949.52 and c.utr == "614053567568"
         assert c.betex_pay_order_id == order["betex_order_id"]
+
+
+# ------------------------------------------------------------------ the YEAR is never the model's guess
+def test_a_guessed_year_is_replaced_by_the_real_one():
+    """Live 2026-09-20 (Rs 199 at 11:34): the screenshot prints "20 Sep, 11:34 AM" - no year. A model that is not
+    told today's date writes 2025; Illunise was then searched on 20 Sep 2025 and "no order" was found, by mobile
+    and by amount alike, while the panel showed four Rs 200 orders at 11:33-11:34."""
+    from datetime import datetime, timezone
+
+    from app.ai.extractor import extraction_from_ai, fix_guessed_year
+
+    payload = {
+        "payment_time": {"value": "2025-09-20 11:34:00", "confidence": 0.95, "evidence_text": "20 Sep, 11:34 AM"}
+    }
+    got = extraction_from_ai(payload, "payment_screenshot").payment_time.value
+    assert got.year == datetime.now(timezone.utc).year and (got.month, got.day) == (9, 20)
+
+    now = datetime(2026, 9, 20, 7, 0, tzinfo=timezone.utc)
+    guessed = datetime(2025, 9, 20, 6, 4, tzinfo=timezone.utc)
+    # the printed text has the time BEFORE the date (our pattern does not read it): the year is still corrected
+    assert fix_guessed_year(guessed, "11:34 AM on 20 Sep", now).year == 2026
+    assert fix_guessed_year(guessed, "20 Sep 2025, 11:34 AM", now).year == 2025  # a PRINTED year is kept
+    late = datetime(2025, 12, 31, 18, 0, tzinfo=timezone.utc)
+    assert fix_guessed_year(late, "31 Dec, 11:30 PM", datetime(2026, 1, 2, tzinfo=timezone.utc)).year == 2025

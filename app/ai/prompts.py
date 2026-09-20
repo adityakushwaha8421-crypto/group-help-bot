@@ -59,7 +59,7 @@ Rules:
 - payment_time: the transaction date AND time exactly as printed, normalised to "YYYY-MM-DD HH:MM:SS" 24h
   when both date and time are visible; if only a date is visible give "YYYY-MM-DD"; assume Indian time.
   Payment apps often print the date WITHOUT a year ("13 Sept, 11:09 PM"): the payment is recent, so use the
-  current year (the previous year only if that date would be in the future). A missing year is never a reason
+  year of "Today's date" given in the message (the previous year only if that date would be in the future). A missing year is never a reason
   to return null. Always put the date/time text exactly as printed in evidence_text.
 - utr: 12-digit UPI reference / UTR / RRN when printed. transaction_reference: any other app-level reference id.
 - upi_id: the payee/receiver VPA if shown in full (e.g. name@bank); payer_name / receiver_name as printed.

@@ -687,7 +687,7 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
         if started:
             return "checking_upi"
     tz = s.timezone
-    when = fmt_local(case.payment_time, tz, "%d %b %H:%M") if case.payment_time else "?"
+    when = fmt_local(case.payment_time, tz, "%d %b %Y %H:%M") if case.payment_time else "?"
     if doubtful:
         # Orders DO sit right before the payment with the right amount: never "no order". Say which, and why none
         # of them could be confirmed (no receiver UPI on the screenshot, /pi not possible ...).
