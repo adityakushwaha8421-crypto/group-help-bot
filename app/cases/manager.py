@@ -525,6 +525,7 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
         sc.signals.get("time", {}).get("score", 0) >= 0.7 for sc in first.scored
     ):
         seen = {c.betex_order_id or c.illunise_order_id for c in candidates}
+        number_has_no_orders = not candidates  # then the number cannot be what identifies the order
         queries = []
         if case.utr:
             queries.append(("utr", case.utr))
@@ -533,9 +534,13 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
             # The panel lists the ORDER amount (Rs 2,879), the customer paid the padded one (Rs 2,878.99): the
             # padded figure finds nothing there. The whole-rupee amount does - and since the search is limited to
             # the payment day and the minutes before the payment, it stays a handful of orders.
-            whole = str(math.ceil(case.amount - 1e-9))
-            if float(whole) != case.amount:
-                queries.append(("order_amount", whole))
+            # The same goes one rupee either way (a Rs 199.00 payment for a Rs 200 order): every whole-rupee
+            # amount within the tolerance, nearest first, the higher one first on a tie (padding pays LESS).
+            tol = s.order_amount_tolerance
+            lo, hi = math.ceil(case.amount - tol - 1e-9), math.floor(case.amount + tol + 1e-9)
+            nearby = [n for n in range(lo, hi + 1) if n > 0 and abs(n - case.amount) > 0.005]
+            for n in sorted(nearby, key=lambda n: (round(abs(n - case.amount), 2), -n)):
+                queries.append(("order_amount", str(n)))
         for how, q in queries:
             fallbacks_tried.append(how)
             try:
@@ -547,6 +552,7 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
                 key = c.betex_order_id or c.illunise_order_id
                 if key not in seen:
                     c.found_by = how
+                    c.registration_waived = number_has_no_orders and how != "utr"
                     candidates.append(c)
                     seen.add(key)
             await audit(
@@ -708,7 +714,7 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
             + "Also searched by "
             + " and ".join(
                 {"utr": "UTR", "padded_amount": "padded amount", "order_amount": "order amount"}.get(x, x)
-                for x in fallbacks_tried
+                for x in dict.fromkeys(fallbacks_tried)
             )
             + ": no order for this payment."
         )

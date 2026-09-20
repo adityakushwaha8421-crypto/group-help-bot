@@ -19,6 +19,10 @@ class Candidate:
     amount: float | None = None  # order amount as created (₹14,000.00)
     padded_amount: float | None = None  # amount the customer actually paid, if the panel exposes it
     found_by: str = "mobile"  # which search produced it: mobile | utr | padded_amount
+    # The customer's number has NO order at all on the payment day, and this one was found by the amount: the
+    # number cannot be what identifies it. Amount (within the tolerance) and time (created before the payment,
+    # inside the window) have to - see score_candidate.
+    registration_waived: bool = False
     order_time: datetime | None = None  # order CREATED time
     status: str | None = None
     utr: str | None = None  # the panel's own UTR field: the payment the order was matched to
@@ -247,6 +251,22 @@ def score_candidate(
             "how": f"different registered number, but {why} - the stronger identifier wins",
         }
         parts = [(k, 1.0 if k == "registration" else v) for k, v in parts]
+
+    # FALLBACK BY AMOUNT + TIME: the mobile search found nothing, so the number given is simply not the registered
+    # one. It stops counting against the order ONLY when the amount fits and the order was created before the
+    # payment inside the window; it never counts FOR it either.
+    if (
+        signals["registration"]["score"] == 0.0
+        and cand.registration_waived
+        and signals["amount"]["score"] == 1.0
+        and (signals["time"]["score"] or 0) >= 0.7
+    ):
+        signals["registration"] = {
+            **signals["registration"],
+            "score": None,
+            "how": "the number given has no orders; found by amount and time, so the number is not compared",
+        }
+        parts = [(k, None if k == "registration" else v) for k, v in parts]
 
     p_ev, p_c = normalize_upi(ev.upi_id.value), normalize_upi(cand.upi_id)
     s = (1.0 if p_ev == p_c else 0.0) if (p_ev and p_c) else None
