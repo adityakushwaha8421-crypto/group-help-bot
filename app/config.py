@@ -135,6 +135,9 @@ class Settings(BaseSettings):
     # The input bot's own id is added automatically at startup.
     our_telegram_ids: str = ""
     our_telegram_usernames: str = ""
+    # Extra wordings Betix uses for a REVERSED withdrawal, as regexes separated by "||" (case-insensitive).
+    # Built in: "OrderStatus: Reversed", "STATUS: Reversed", "Reversed" / "Reversal".
+    betix_reversed_patterns: str = ""
     betix_system_bot_usernames: str = "betixpay_cs_bot"
     betix_system_bot_ids: str = ""
     # either  = the Betix system bot OR any human member of the Betix group confirms  (default)

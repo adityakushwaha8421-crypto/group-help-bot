@@ -184,3 +184,66 @@ async def test_not_solved_unless_the_panel_shows_refunded(
     alert = texts(fake_bot, "MANUAL REVIEW NEEDED")[-1]
     assert "NOT refunded" in alert and words in alert and "Do not pay the customer" in alert
     assert not texts(fake_bot, "WITHDRAWAL REVERSED")
+
+
+# ------------------------------------------------------------------ "OrderStatus: Reversed" from the Betix bot
+BOT_REVERSED = (
+    "Order's UPI: NA\n💵OrderAmount: 4854.5\n 💰PaidAmount: 0\n📄OrderStatus: Reversed\n🧾UTR: NA\n"
+    f"📌PlatOrderNo: PO26092065di5cvc6qo\n📌MerchantOrderNo: BX{WD}\n🕒CreatedTime: 2026-09-20 12:52:00 +05:30"
+)
+
+
+def test_order_status_reversed_is_a_reversal_not_failed_or_pending():
+    import re
+
+    from app.telegram.confirmation import classify_human_message, classify_system_message
+
+    bx, pl = re.compile(r"\bILLUN-\d{8,20}\b", re.I), re.compile(r"\bP[IO]\w{10,}\b")
+    c = classify_system_message(BOT_REVERSED, bx, pl)
+    assert c.outcome == "FAILED" and c.extra == {"reversed": True} and c.order_ids == [f"BX{WD}"]
+    assert classify_system_message("📄OrderStatus: Failed\n📌MerchantOrderNo: BXWD-1-2", bx, pl).extra == {}
+    assert classify_system_message("📄OrderStatus: Pending", bx, pl).outcome == "PENDING"
+    # a notice that merely mentions reversals is not one
+    assert classify_system_message("📢 Payout Notice: reversed payouts are refunded daily", bx, pl).extra == {}
+    h = classify_human_message(f"Reversed BX{WD}", bx, pl)
+    assert h.extra == {"reversed": True} and h.order_ids == [f"BX{WD}"]
+    assert classify_human_message("WD-84425-67115 reversal done", bx, pl).order_ids == [f"BX{WD}"]
+
+
+def test_more_reversed_wordings_come_from_the_config(monkeypatch, env):
+    import re
+
+    from app.config import reset_settings_cache
+    from app.telegram.confirmation import classify_system_message
+
+    bx, pl = re.compile(r"\bILLUN-\d{8,20}\b", re.I), re.compile(r"\bP[IO]\w{10,}\b")
+    text = f"📄OrderStatus: Returned to merchant\n📌MerchantOrderNo: BX{WD}"
+    assert classify_system_message(text, bx, pl).extra == {}
+    monkeypatch.setenv("BETIX_REVERSED_PATTERNS", r"OrderStatus\s*:\s*Returned||[broken(")
+    reset_settings_cache()
+    assert classify_system_message(text, bx, pl).extra == {"reversed": True}  # and the broken pattern is ignored
+
+
+async def test_the_bots_order_status_reversed_starts_the_same_flow(
+    db, fake_bot, no_download, fake_poster, jobs, refunder
+):
+    """Not a reply to our post: the case is found by the MerchantOrderNo (BXWD-...)."""
+    calls, _ = refunder
+    async with db.session_scope() as s:
+        cid = (await attach_message(s, make_input(1, "text", WD))).case.case_id
+        await attach_message(s, make_input(2, "document"))
+    async with db.session_scope() as s:
+        await manager.process_case(s, cid, force=True)
+        await manager.post_case_to_betix(s, cid, fake_poster)
+        r = await handle_group_message(
+            s, make_group_msg(610, BOT_REVERSED, sender_username="betixpay_cs_bot", is_bot=True)
+        )
+        assert r["action"] == "reversal_check_queued" and r["case_id"] == cid
+    assert ("reversal_check_job", cid) in jobs
+    assert await manager.reversal_check(cid) == "asked"  # payout is Success -> the operator is asked
+    assert len(texts(fake_bot, "REFUND NEEDED")) == 1 and calls == []
+    assert not texts(fake_bot, "MANUAL REVIEW") and not texts(fake_bot, "FAILED / not received")
+    async with db.session_scope() as s:
+        await manager.approve_refund(s, cid, "@me")
+    assert await manager.refund_approved_withdrawal(cid) == "reversed"
+    assert calls == [WD] and len(texts(fake_bot, "WITHDRAWAL REVERSED")) == 1

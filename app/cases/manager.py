@@ -1655,7 +1655,9 @@ async def apply_verification_signal(
         if "belong" in (cls.matched or "").lower():  # "❌ UPI Does not belong to us": manual review, no /upi
             await escalate_case(session, case, "Betix: UPI does not belong to us.", (cls.matched or "")[:200])
             return "escalated_failed"
-        if case.kind == KIND_WITHDRAWAL and "revers" in (cls.matched or "").lower():
+        if case.kind == KIND_WITHDRAWAL and (
+            (cls.extra or {}).get("reversed") or "revers" in (cls.matched or "").lower()
+        ):
             # "Reversed" on a withdrawal: the payout came back. The payout is looked at (read-only) and the
             # operator is asked to approve the refund - see reversal_check / refund_approved_withdrawal.
             return await start_reversal(

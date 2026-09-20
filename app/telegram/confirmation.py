@@ -26,6 +26,31 @@ SYS_FAILED = [
     re.compile(r"payment\s+has\s+not\s+been\s+received", re.I),
     re.compile(r"❌\s*UPI\s+Does\s+not\s+belong\s+to\s+us", re.I),
 ]
+# A WITHDRAWAL that came back. Not a failed payment and not a pending one: it starts the Withdrawal Reversed flow
+# (look the payout up, ask the operator to approve the refund). More wordings: BETIX_REVERSED_PATTERNS (config).
+REVERSED = [
+    re.compile(r"OrderStatus\s*:\s*Revers(?:ed|al)\b", re.I),
+    re.compile(r"STATUS\s*:\s*Revers(?:ed|al)\b", re.I),
+    re.compile(r"\brevers(?:ed|al)\b", re.I),
+]
+WITHDRAWAL_ID_RE = re.compile(r"\b(?:BX)?WD-\d{3,6}-\d{3,6}\b", re.I)
+
+
+def is_reversed(text: str, *, status_line_only: bool = False) -> re.Match | None:
+    """`status_line_only`: the system bot's long templates and notices may merely MENTION a reversal; for them only
+    a status line ("OrderStatus: Reversed") or a configured pattern counts. A person's short "Reversed" counts."""
+    from app.config import get_settings
+
+    extra = []
+    for raw in (get_settings().betix_reversed_patterns or "").split("||"):
+        if raw.strip():
+            try:
+                extra.append(re.compile(raw.strip(), re.I))
+            except re.error:
+                continue  # a broken pattern in the config never stops the bot
+    return _first([*(REVERSED[:2] if status_line_only else REVERSED), *extra], text or "")
+
+
 SYS_PENDING = [
     re.compile(r"📌\s*STATUS\s*:\s*Still\s+Pending", re.I),
     re.compile(r"OrderStatus\s*:\s*(Pending|Paying|Init|Processing)", re.I),
@@ -110,7 +135,12 @@ def _first(patterns, text):
 def extract_ids(
     text: str, betex_pattern: re.Pattern[str], plat_pattern: re.Pattern[str]
 ) -> tuple[list[str], list[str], list[str]]:
-    orders = sorted({m.group(0).upper() for m in betex_pattern.finditer(text or "")})
+    orders = {m.group(0).upper() for m in betex_pattern.finditer(text or "")}
+    # A withdrawal is known to Betix as "BXWD-4748-68114" (MerchantOrderNo): that is the case's order id here too
+    for m in WITHDRAWAL_ID_RE.finditer(text or ""):
+        wd = m.group(0).upper()
+        orders.add(wd if wd.startswith("BX") else "BX" + wd)
+    orders = sorted(orders)
     plats = sorted({m.group(0) for m in plat_pattern.finditer(text or "")})
     utrs = sorted({m.group(1) for m in re.finditer(r"(?:UTR\s*:?\s*(?:<code>)?\s*)(\d{12})", text or "", re.I)})
     return orders, plats, utrs
@@ -119,6 +149,9 @@ def extract_ids(
 def classify_system_message(text: str, betex_pattern: re.Pattern[str], plat_pattern: re.Pattern[str]) -> Classification:
     t = text or ""
     orders, plats, utrs = extract_ids(t, betex_pattern, plat_pattern)
+    rev = is_reversed(t, status_line_only=True)
+    if rev:  # before everything else: "OrderStatus: Reversed" is neither a failed nor a pending order
+        return Classification("FAILED", 0.97, "regex", rev.group(0)[:80], orders, plats, utrs, {"reversed": True})
     for outcome, pats, conf in (
         ("SUCCESS", SYS_SUCCESS, 0.99),
         ("FAILED", SYS_FAILED, 0.97),
@@ -159,7 +192,8 @@ def classify_human_message(
     if HUMAN_PENDING.search(t):
         return Classification("PENDING", 0.85, "regex", t[:60], orders, plats, utrs)
     if HUMAN_FAILED.search(t) and len(t) < 300:
-        return Classification("FAILED", 0.75, "regex", t[:60], orders, plats, utrs)
+        extra = {"reversed": True} if is_reversed(t) else {}
+        return Classification("FAILED", 0.75, "regex", t[:60], orders, plats, utrs, extra)
     if re.search(r"^\s*(?:success|confirmed|done|paid)\b", t, re.I):
         return Classification("SUCCESS", 0.7, "regex", t[:60], orders, plats, utrs)
     return Classification("UNKNOWN", 0.0, "regex", None, orders, plats, utrs)
