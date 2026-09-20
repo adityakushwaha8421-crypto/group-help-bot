@@ -659,7 +659,7 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
         )
         close = close_candidates(result)
         note = ""
-        if s.betix_pi_check and len(close) >= 2:
+        if s.betix_pi_check and close:  # even one: a doubt is settled by its UPI, not by a manual review
             started, note = await start_pi_check(session, case, close, result.reason)
             if started:
                 return "checking_upi"
@@ -855,7 +855,9 @@ def doubt_candidates(result: MatchResult) -> list:
         for sc in result.scored
         if sc.candidate.betex_order_id
         and (sc.signals.get("amount") or {}).get("score") == 1.0
-        and ((sc.signals.get("time") or {}).get("score") or 0) >= 0.7
+        # created BEFORE the payment: inside the window, or up to twice the window before it (paid late). An order
+        # created after the payment, or far too long before it, is not a reasonable candidate.
+        and ((sc.signals.get("time") or {}).get("score") or 0) > 0.0
         and (sc.signals.get("gateway") or {}).get("score") != 0.0
     ]
     return sorted(fit, key=lambda sc: (lead(sc), -sc.score))[: s.pi_check_max_orders]
@@ -1018,26 +1020,25 @@ async def resolve_pi_check(session: AsyncSession, case_id: str, *, timed_out: st
                 out.append(f"- {oid}: (no answer from Betix)")
         return out
 
-    if current not in answers:
+    unanswered = current not in answers
+    if unanswered:
         if timed_out is None or timed_out != current:
             return "waiting" if timed_out is None else "stale"
-        reason = f"Several close orders; UPI check (/pi): no answer from Betix for {current}"
-        await transition(session, case, CaseStatus.ORDER_MATCH_AMBIGUOUS, reason=reason)
-        await alert_ambiguous(
-            session, case, reason, f"Screenshot UPI (OCR): {shot or '-'}\n" + "\n".join(checked_lines())
-        )
-        return "ambiguous"
-    if timed_out is not None:
+        # No answer for THIS order: that is not a reason to give up on the others. Move on to the next candidate;
+        # manual review only when every one of them has been asked.
+        ok, why = False, "no answer from Betix"
+        await audit(session, "PI_CHECK_RESULT", case_id=case.case_id, result=f"{current}: no answer")
+    elif timed_out is not None:
         return "stale"  # that order was answered in time; the answer already moved the check on
-
-    ok, why = upi_ending_match(shot, answers[current], min_chars=s.upi_ending_min_chars)
-    await audit(
-        session,
-        "PI_CHECK_RESULT",
-        case_id=case.case_id,
-        result=f"{current}: {'match' if ok else 'no match'}",
-        details={"order": current, "order_upi": answers[current], "screenshot_upi": shot, "why": why},
-    )
+    else:
+        ok, why = upi_ending_match(shot, answers[current], min_chars=s.upi_ending_min_chars)
+        await audit(
+            session,
+            "PI_CHECK_RESULT",
+            case_id=case.case_id,
+            result=f"{current}: {'match' if ok else 'no match'}",
+            details={"order": current, "order_upi": answers[current], "screenshot_upi": shot, "why": why},
+        )
     if ok:
         row = await latest_candidate(session, case.case_id, current)
         if row is not None:
@@ -1066,7 +1067,10 @@ async def resolve_pi_check(session: AsyncSession, case_id: str, *, timed_out: st
             log.exception("pi query failed", case_id=case.case_id)
             reason = f"Several close orders; could not send /pi for {remaining[0]}: {str(exc)[:80]}"
     else:
-        reason = "Several close orders; UPI check (/pi): no order's UPI fits the screenshot UPI"
+        silent = [oid for oid in asked if oid not in answers]
+        reason = f"UPI check (/pi): all {len(asked)} close order(s) checked, none fits the screenshot UPI" + (
+            f" ({len(silent)} got no answer from Betix)" if silent else ""
+        )
     await transition(session, case, CaseStatus.ORDER_MATCH_AMBIGUOUS, reason=reason)
     await alert_ambiguous(
         session,

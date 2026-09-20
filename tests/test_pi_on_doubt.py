@@ -79,3 +79,23 @@ async def test_nearby_orders_are_named_never_no_order(
     assert "2 order(s)" in alert and "created just before the payment" in alert and "No order" not in alert
     assert alert.index(B) < alert.index(A)  # closest first
     assert "no payee UPI printed on the screenshot" in alert
+
+
+async def test_an_order_paid_late_is_still_a_reasonable_candidate(
+    db, fake_bot, order_search, no_download, fake_poster, setup
+):
+    """Created 45 min before the payment (outside the 30-min window, inside twice the window): too weak to be
+    selected on its own, but it is ASKED about instead of going straight to Manual Review."""
+    late = [{**GOOD[0], "order_time": "2026-09-10 18:47:00"}]
+    case_id, outcome = await run_until_ready(db, order_search, late)
+    assert outcome == "checking_upi" and list(pi_queries(fake_poster)) == [f"/pi {A}"]
+    qid = (await query_ids(db, case_id))[A]
+    assert (await answer(db, 900, pi_answer(A, "shoriful-5011@ptyes"), qid))["action"] == "pi_ready"
+
+
+async def test_an_order_created_after_the_payment_is_never_asked(
+    db, fake_bot, order_search, no_download, fake_poster, setup
+):
+    after = [{**GOOD[0], "order_time": "2026-09-10 19:50:00"}]
+    _, outcome = await run_until_ready(db, order_search, after)
+    assert outcome == "escalated" and pi_queries(fake_poster) == {}

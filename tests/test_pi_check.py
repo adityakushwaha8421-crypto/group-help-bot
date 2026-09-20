@@ -151,18 +151,35 @@ async def test_no_order_fits_goes_to_manual_review(
     async with db.session_scope() as s:
         c = await get_case(s, case_id)
         assert c.status == CaseStatus.ORDER_MATCH_AMBIGUOUS.value and c.betex_pay_order_id is None
-    alert = [t for _, t in fake_bot.sent if "no order's UPI fits the screenshot UPI" in t][-1]
+    alert = [t for _, t in fake_bot.sent if "all 2 close order(s) checked, none fits the screenshot UPI" in t][-1]
     assert "rahul-7788@ptyes" in alert and "amit-1234@ptyes" in alert and "5011@ptyes" in alert
     assert fake_poster.media == []
 
 
-async def test_no_answer_goes_to_manual_review_without_asking_more(
+async def test_no_answer_for_one_order_moves_on_to_the_next(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, setup
+):
+    """Betix does not answer /pi for A: not Manual Review yet - B is asked, and B's UPI fits."""
+    case_id, _ = await run_until_ready(db, order_search, TWINS)
+    assert await tasks.pi_check_timeout_job({}, case_id, A) == "next"
+    assert sent_pi(fake_poster) == [f"/pi {A}", f"/pi {B}"]
+    assert not any("MANUAL REVIEW" in t for _, t in fake_bot.sent)
+    q = await query_ids(db, case_id)
+    r = await answer(db, 701, pi_answer(B, "shoriful-5011@ptyes"), q[B])
+    assert r["action"] == "pi_ready"
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).betex_pay_order_id == B
+
+
+async def test_manual_review_only_after_every_candidate_was_asked(
     db, fake_bot, fake_ai, order_search, no_download, fake_poster, setup
 ):
     case_id, _ = await run_until_ready(db, order_search, TWINS)
-    assert await tasks.pi_check_timeout_job({}, case_id, A) == "ambiguous"
-    assert sent_pi(fake_poster) == [f"/pi {A}"]
-    assert any(f"no answer from Betix for {A}" in t for _, t in fake_bot.sent)
+    assert await tasks.pi_check_timeout_job({}, case_id, A) == "next"
+    assert await tasks.pi_check_timeout_job({}, case_id, B) == "ambiguous"
+    alert = [t for _, t in fake_bot.sent if "MANUAL REVIEW" in t][-1]
+    assert "all 2 close order(s) checked" in alert and "2 got no answer from Betix" in alert
+    assert f"{A}: (no answer from Betix)" in alert and f"{B}: (no answer from Betix)" in alert
 
 
 async def test_an_old_timeout_after_moving_on_is_ignored(
@@ -174,9 +191,9 @@ async def test_an_old_timeout_after_moving_on_is_ignored(
     assert await tasks.pi_check_timeout_job({}, case_id, A) == "stale"
     async with db.session_scope() as s:
         assert (await get_case(s, case_id)).status == CaseStatus.CHECKING_ORDER_UPI.value
-    # the restart-recovery form (no order id) times out the CURRENT query: B
+    # the restart-recovery form (no order id) times out the CURRENT query: B, the last one -> manual review
     assert await tasks.pi_check_timeout_job({}, case_id) == "ambiguous"
-    assert any(f"no answer from Betix for {B}" in t for _, t in fake_bot.sent)
+    assert any("1 got no answer from Betix" in t for _, t in fake_bot.sent)
 
 
 def test_the_order_closest_to_the_payment_is_asked_first():
