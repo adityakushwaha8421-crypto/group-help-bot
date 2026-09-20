@@ -179,17 +179,25 @@ async def test_an_old_timeout_after_moving_on_is_ignored(
     assert any(f"no answer from Betix for {B}" in t for _, t in fake_bot.sent)
 
 
-def test_best_candidate_is_asked_first():
+def test_the_order_closest_to_the_payment_is_asked_first():
+    """Live 2026-09-20, Rs 199 at 11:34: other customers' PAID Rs 200 orders from 11:28 outscored the customer's own
+    expired 11:34 order by a hair and would have been asked first. Closest order time first; the score only
+    breaks ties; an order holding the payment's UTR leads whatever its time."""
     from app.admin.matcher import Candidate, MatchResult, Scored
 
-    def sc(oid, score, lead):
-        return Scored(
-            Candidate(oid, oid), score, {"amount": {"score": 1.0}, "time": {"score": 0.98, "lead_minutes": lead}}
-        )
+    def sc(oid, score, lead, utr=None):
+        sig = {"amount": {"score": 1.0}, "time": {"score": 0.98, "lead_minutes": lead}, "utr": {"score": utr}}
+        return Scored(Candidate(oid, oid), score, sig)
 
     far, near, best = sc("FAR", 0.95, 4.0), sc("NEAR", 0.95, 1.0), sc("BEST", 0.97, 6.0)
     r = MatchResult("AMBIGUOUS", best, near, [far, best, near], "x")
-    assert [c.candidate.betex_order_id for c in manager.close_candidates(r)] == ["BEST", "NEAR", "FAR"]
+    assert [c.candidate.betex_order_id for c in manager.close_candidates(r)] == ["NEAR", "FAR", "BEST"]
+    tie = sc("TIE", 0.97, 1.0)
+    r = MatchResult("AMBIGUOUS", best, near, [far, best, near, tie], "x")
+    assert [c.candidate.betex_order_id for c in manager.close_candidates(r)][:2] == ["TIE", "NEAR"]
+    held = sc("HOLDS-UTR", 0.96, 9.0, utr=1.0)
+    r = MatchResult("AMBIGUOUS", best, near, [far, best, near, held], "x")
+    assert manager.close_candidates(r)[0].candidate.betex_order_id == "HOLDS-UTR"
 
 
 async def test_unreadable_screenshot_upi_skips_pi_and_alerts(

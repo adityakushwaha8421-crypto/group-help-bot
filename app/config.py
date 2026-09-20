@@ -144,7 +144,7 @@ class Settings(BaseSettings):
     betix_screenshot_caption_template: str = "{betex_order_id}"
     betix_pi_check: bool = True
     betix_pi_command_template: str = "/pi {order_id}"
-    pi_check_max_orders: int = 4
+    pi_check_max_orders: int = 6
     pi_check_timeout_seconds: int = 120
     # After a UPI match settles the order, delete from the Betix group: "matched" = that order's /pi message and the
     # Betix bot's direct reply to it | "all" = every /pi query of the case and their bot replies | "off".

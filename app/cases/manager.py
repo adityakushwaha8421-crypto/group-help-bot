@@ -682,7 +682,11 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
     tz = s.timezone
     when = fmt_local(case.payment_time, tz, "%d %b %H:%M") if case.payment_time else "?"
     if result.decision == "NO_CANDIDATES":
-        reason = f"No Illunise order exists for this number (payment {when}, ₹{case.amount:,.2f})."
+        tol = s.order_amount_tolerance
+        reason = (
+            f"No order of ₹{case.amount:,.2f} (±₹{tol:,.0f}) was created before the payment ({when}) - "
+            "searched by the mobile number and by the amount."
+        )
     else:
         best = result.best
         sig = best.signals
@@ -831,7 +835,7 @@ def doubt_candidates(result: MatchResult) -> list:
 
 
 def close_candidates(result: MatchResult) -> list:
-    """The orders the matcher could not separate, BEST FIRST: within the ambiguity gap of the best, and each one
+    """The orders the matcher could not separate, CLOSEST TO THE PAYMENT FIRST: within the ambiguity gap of the best, and each one
     already a match on AMOUNT and on TIME (created before the payment, inside the window). The correct order =
     amount match + order time close to the payment + UPI match. Ties: the order created closest to the payment."""
     s = get_settings()
@@ -856,7 +860,14 @@ def close_candidates(result: MatchResult) -> list:
         and top - sc.score < s.order_match_ambiguity_gap + 1e-9
         and plausible(sc)
     ]
-    close.sort(key=lambda sc: (-sc.score, lead(sc)))
+
+    # CLOSEST ORDER TIME FIRST. The score cannot separate these orders (that is why they are here), and a paid
+    # order of somebody else easily outscores the customer's own expired one by a hair. The order created nearest
+    # before the payment is the likeliest, so it is asked first; an order holding the payment's UTR leads anyway.
+    def holds_utr(sc) -> int:
+        return 0 if (sc.signals.get("utr") or {}).get("score") == 1.0 else 1
+
+    close.sort(key=lambda sc: (holds_utr(sc), lead(sc), -sc.score))
     return close[: s.pi_check_max_orders]
 
 

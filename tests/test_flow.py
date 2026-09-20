@@ -220,7 +220,10 @@ async def test_no_candidates_escalates(db, fake_bot, fake_ai, order_search, no_d
     assert outcome == "escalated"
     async with db.session_scope() as s:
         assert (await get_case(s, case_id)).status == CaseStatus.ESCALATED.value
-    assert any("No Illunise order exists" in t for _, t in fake_bot.sent)
+    assert any(
+        "was created before the payment" in t and "searched by the mobile number and by the amount" in t
+        for _, t in fake_bot.sent
+    )
 
 
 async def test_login_failure_escalates(db, fake_bot, fake_ai, no_download, fake_poster):
