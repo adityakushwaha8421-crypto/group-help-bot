@@ -955,21 +955,33 @@ async def pi_answers(session: AsyncSession, case: Case) -> tuple[list[str], dict
 
 
 async def cleanup_pi_messages(session: AsyncSession, case: Case, order_id: str) -> dict:
-    """The order is confirmed by its UPI: delete the `/pi <ORDER-ID>` request and the Betix bot's DIRECT reply to it
-    from the Betix group (PI_CLEANUP=matched; "all" = every /pi of the case; "off" = keep). Never blocks the flow."""
+    """Delete from the Betix group the `/pi <ORDER-ID>` request WE sent for this order and the Betix system bot's
+    DIRECT reply to it - nothing else, ever (PI_CLEANUP: each | matched | all | off). What was asked and answered
+    stays in our database. Never blocks the flow."""
     s = get_settings()
     if s.pi_cleanup == "off":
         return {}
     msgs = await list_case_betix_messages(session, case.case_id)
+
+    def asks_about(m) -> bool:
+        found = s.betex_order_id_pattern.search(m.text or "")
+        return bool(found) and found.group(0).upper() == order_id.upper()  # the exact id, not a look-alike
+
+    def from_system_bot(m) -> bool:
+        names, ids = s.system_bot_usernames, s.system_bot_ids
+        if not names and not ids:
+            return bool(m.sender_is_bot)
+        return (m.sender_username or "").lstrip("@").lower() in names or (m.sender_id in ids)
+
     queries = [
-        m
-        for m in msgs
-        if m.direction == "out"
-        and m.kind == "pi_query"
-        and (s.pi_cleanup == "all" or order_id.upper() in (m.text or "").upper())
+        m for m in msgs if m.direction == "out" and m.kind == "pi_query" and (s.pi_cleanup == "all" or asks_about(m))
     ]
     qids = {m.message_id for m in queries}
-    replies = [m for m in msgs if m.direction == "in" and m.sender_is_bot and m.reply_to_message_id in qids]
+    replies = [
+        m
+        for m in msgs
+        if m.direction == "in" and m.sender_is_bot and from_system_bot(m) and m.reply_to_message_id in qids
+    ]
     poster = get_poster()
     deleted, failed = [], {}
     for m in [*queries, *replies]:
@@ -1039,11 +1051,14 @@ async def resolve_pi_check(session: AsyncSession, case_id: str, *, timed_out: st
             result=f"{current}: {'match' if ok else 'no match'}",
             details={"order": current, "order_upi": answers[current], "screenshot_upi": shot, "why": why},
         )
+    if s.pi_cleanup == "each":
+        await cleanup_pi_messages(session, case, current)  # this order's check is finished: tidy its /pi exchange
     if ok:
         row = await latest_candidate(session, case.case_id, current)
         if row is not None:
             reason = f"UPI check (/pi): {current}'s UPI {answers[current]} fits the screenshot UPI {shot}"
-            await cleanup_pi_messages(session, case, current)  # the order is confirmed: remove the /pi exchange
+            if s.pi_cleanup != "each":
+                await cleanup_pi_messages(session, case, current)  # the order is confirmed: remove the /pi exchange
             session.add(
                 OrderMatch(
                     case_id=case.case_id,

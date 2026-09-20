@@ -257,9 +257,55 @@ async def test_matched_pi_and_its_bot_reply_are_deleted_before_posting(
     assert fake_poster.media[0] == ("payment_screenshot", A)
 
 
-async def test_only_the_matched_pi_exchange_is_deleted(
+async def test_each_pi_exchange_is_deleted_as_soon_as_its_check_is_done(
     db, fake_bot, fake_ai, order_search, no_download, fake_poster, setup
 ):
+    """After EACH check: our `/pi <ORDER-ID>` and the Betix bot's direct reply to it - and nothing else."""
+    case_id, _ = await run_until_ready(db, order_search, TWINS)
+    q = await query_ids(db, case_id)
+    await answer(db, 700, pi_answer(A, "rahul-7788@ptyes"), q[A])  # no match -> cleaned up, B asked
+    assert fake_poster.deleted == [q[A], 700]
+    q = await query_ids(db, case_id)
+    await answer(db, 701, pi_answer(B, "shoriful-5011@ptyes"), q[B])  # match -> cleaned up too
+    assert fake_poster.deleted == [q[A], 700, q[B], 701]
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).betex_pay_order_id == B  # what was asked and answered is kept by us
+
+
+async def test_only_our_pi_and_the_system_bots_direct_reply_are_deleted(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, setup
+):
+    case_id, _ = await run_until_ready(db, order_search, TWINS)
+    q = await query_ids(db, case_id)
+    await answer(db, 650, "please wait sir", q[A], bot=False)  # a PERSON replies to our /pi: never touched
+    async with db.session_scope() as s:  # another bot replies to it as well: never touched either
+        await handle_group_message(
+            s, make_group_msg(651, "hello", sender_username="some_other_bot", is_bot=True, reply_to=q[A])
+        )
+        await handle_group_message(
+            s, make_group_msg(652, "unrelated notice", sender_username="betixpay_cs_bot", is_bot=True)
+        )
+    await answer(db, 700, pi_answer(A, "shoriful-5011@ptyes"), q[A])
+    assert fake_poster.deleted == [q[A], 700]
+    assert not {650, 651, 652} & set(fake_poster.deleted)
+
+
+async def test_an_unanswered_pi_is_removed_when_the_check_moves_on(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, setup
+):
+    case_id, _ = await run_until_ready(db, order_search, TWINS)
+    q = await query_ids(db, case_id)
+    assert await tasks.pi_check_timeout_job({}, case_id, A) == "next"
+    assert fake_poster.deleted == [q[A]]  # our own message; there was no reply to delete
+
+
+async def test_matched_mode_keeps_the_old_behaviour(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, setup, monkeypatch
+):
+    from app.config import reset_settings_cache
+
+    monkeypatch.setenv("PI_CLEANUP", "matched")
+    reset_settings_cache()
     case_id, _ = await run_until_ready(db, order_search, TWINS)
     q = await query_ids(db, case_id)
     await answer(db, 700, pi_answer(A, "rahul-7788@ptyes"), q[A])  # no match -> B asked
@@ -291,19 +337,6 @@ async def test_cleanup_off_keeps_everything(
     case_id, _ = await run_until_ready(db, order_search, TWINS)
     q = await query_ids(db, case_id)
     assert (await answer(db, 700, pi_answer(A, "shoriful-5011@ptyes"), q[A]))["action"] == "pi_ready"
-    assert fake_poster.deleted == []
-
-
-async def test_nothing_is_deleted_without_a_confirmed_order(
-    db, fake_bot, fake_ai, order_search, no_download, fake_poster, setup
-):
-    case_id, _ = await run_until_ready(db, order_search, TWINS)
-    q = await query_ids(db, case_id)
-    await answer(db, 700, pi_answer(A, "rahul-7788@ptyes"), q[A])
-    q = await query_ids(db, case_id)
-    assert (await answer(db, 701, pi_answer(B, "amit-1234@ptyes"), q[B]))["action"] == "pi_ambiguous"
-    assert fake_poster.deleted == []
-    assert await tasks.pi_check_timeout_job({}, case_id, B) in ("stale", "not_checking")
     assert fake_poster.deleted == []
 
 

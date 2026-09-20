@@ -146,9 +146,11 @@ class Settings(BaseSettings):
     betix_pi_command_template: str = "/pi {order_id}"
     pi_check_max_orders: int = 6
     pi_check_timeout_seconds: int = 120
-    # After a UPI match settles the order, delete from the Betix group: "matched" = that order's /pi message and the
-    # Betix bot's direct reply to it | "all" = every /pi query of the case and their bot replies | "off".
-    pi_cleanup: Literal["matched", "all", "off"] = "matched"
+    # /pi housekeeping in the Betix group. Only ever OUR `/pi <ORDER-ID>` message and the Betix system bot's DIRECT
+    # reply to it - never any other message.
+    #   "each"    = as soon as one order's check is finished (match, no match or no answer)   <- default
+    #   "matched" = only the order that matched | "all" = every /pi of the case, once an order matched | "off"
+    pi_cleanup: Literal["each", "matched", "all", "off"] = "each"
     upi_ending_min_chars: int = 3
     betix_followup_text: str = "Any update?"  # both follow-ups, sent as replies to the screenshot post
     # Bank statement / payment video in the Betix group. They are only ever sent as REPLIES to the screenshot post:
