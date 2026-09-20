@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -50,6 +51,35 @@ def pop_notice(max_age: float = 300) -> int | None:
     except (OSError, ValueError):
         return None
     return int(data["chat_id"]) if time.time() - float(data.get("at", 0)) <= max_age else None
+
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+async def _git(*args: str, timeout: float = 60) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        "git", *args, cwd=ROOT, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except TimeoutError:
+        proc.kill()
+        return 1, "timed out"
+    return proc.returncode or 0, out.decode(errors="replace").strip()
+
+
+async def pull_latest() -> tuple[bool, str]:
+    """Fast-forward to GitHub's main before restarting. (updated?, one line for the operator.) Local changes or
+    local commits are never overwritten: then nothing is pulled and the line says so."""
+    if not (ROOT / ".git").exists():
+        return False, "not a git checkout - code unchanged"
+    before = (await _git("rev-parse", "--short", "HEAD"))[1]
+    code, out = await _git("pull", "--ff-only", "origin", "main")
+    if code != 0:
+        last = out.splitlines()[-1][:120] if out else "unknown error"
+        return False, f"could not update ({last}) - code unchanged"
+    after = (await _git("rev-parse", "--short", "HEAD"))[1]
+    return (False, f"already up to date ({after})") if before == after else (True, f"updated {before} -> {after}")
 
 
 def reexec() -> None:

@@ -118,7 +118,7 @@ def help_text() -> str:
         f"{code('/cases')} — all open cases\n"
         f"{code('/summary [DAYS]')} — overview by stage\n"
         f"{code('/cancel')} — discard what's in progress\n"
-        f"{code('/restart')} — restart the bot",
+        f"{code('/restart')} — pull the latest code and restart",
     )
 
 
@@ -134,9 +134,12 @@ async def cmd_restart(message: Message):
 
     if restart.is_stale(message.date.timestamp()):
         return  # the /restart that started this very process, delivered again
+    _, code_line = await restart.pull_latest()  # the newest code from GitHub, when it can be fast-forwarded
     await message.answer(
         para(
-            "\U0001f504 " + b("RESTARTING"), "\u23f3 Back in a few seconds...", i("Open cases and follow-ups are kept.")
+            "\U0001f504 " + b("RESTARTING"),
+            ["\U0001f4e6 Code: " + esc(code_line), "\u23f3 Back in a few seconds..."],
+            i("Open cases and follow-ups are kept."),
         ),
         parse_mode="HTML",
     )
@@ -740,7 +743,7 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("cases", "All open cases"),
     ("summary", "All-time overview by stage (or /summary 7 for a week)"),
     ("cancel", "Discard the case (or search) in progress"),
-    ("restart", "Restart the bot (cases and follow-ups are kept)"),
+    ("restart", "Pull the latest code and restart the bot"),
     ("help", "How to use the bot"),
 ]
 
