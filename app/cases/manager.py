@@ -91,12 +91,16 @@ async def _check_statement(path, account: str, password: str | None):
     from app.evidence.statement_account import UNKNOWN, AccountCheck, check_statement
 
     if not path:
-        return AccountCheck(UNKNOWN, "none")
+        return AccountCheck(UNKNOWN, "none", note="the statement file could not be downloaded")
     view = pdf_view(path) or Path(path)
     if pdf_is_encrypted(view):
         view = decrypt_pdf(path, password) if password else None
         if view is None:
-            return AccountCheck(UNKNOWN, "none")
+            return AccountCheck(
+                UNKNOWN,
+                "none",
+                note="the statement is password-protected and could not be opened with the password given",
+            )
     return await check_statement(Path(view), account)
 
 
@@ -304,7 +308,11 @@ async def process_withdrawal(session: AsyncSession, case: Case, evidence, *, for
     if payout.amount is not None and case.amount is None:
         case.amount = payout.amount
     details = {"payout": {**payout.as_dict(), "account": mask_account(payout.account)}}
-    details["check"] = {"result": check.result, "how": check.how, "seen": mask_account(check.seen)} if check else None
+    details["check"] = (
+        {"result": check.result, "how": check.how, "seen": mask_account(check.seen), "note": check.note}
+        if check
+        else None
+    )
     await audit(
         session,
         "WITHDRAWAL_ACCOUNT_CHECK",
@@ -326,10 +334,11 @@ async def process_withdrawal(session: AsyncSession, case: Case, evidence, *, for
             f"{paid_to}\nNot sent to Betix. Ask for the statement of the account the withdrawal was paid to.",
         )
         return "escalated"
+    why = (check.note if check is not None else "") or "no account number could be read from it"
     await escalate_case(
         session,
         case,
-        "The statement's account number could not be verified against the withdrawal.",
+        f"The statement's account number could not be verified against the withdrawal: {why}.",
         f"{paid_to}\nNot sent to Betix. Please check the statement by hand.",
     )
     return "escalated"

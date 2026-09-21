@@ -134,3 +134,51 @@ def test_a_number_of_zeros_matches_nothing():
     """Stripping leading zeros must never leave an empty pattern that 'matches' every statement."""
     assert compare_account("00000000000000", "Account No: 273501000021809").result == MISMATCH
     assert compare_account("00000000000000", "Name: A B").result == UNKNOWN
+
+
+# ------------------------------------------------------------------ the account field is not always "at the top"
+SBI_RECENT = "\n".join(
+    ["Txn Date Value Date Description Ref No. Debit Credit Balance"]
+    + [
+        f"{d:02d} Sep 2026 {d:02d} Sep 2026 TO TRANSFER-UPI/DR/62631234{d:04d}/RAHUL 500.00 1,000.00"
+        for d in range(1, 56)
+    ]
+    + ["Account Name : MR. SOURAV CHATTERJEE", "Account No : 00000031234567835 OTHER", "Branch : KOLKATA MAIN"]
+)
+
+
+def test_an_account_field_printed_after_the_rows_is_still_found():
+    """Live 2026-09-21 (SBI, a/c ...7835): pypdf yields SBI's "Recent Transactions" header AFTER the rows, so the
+    top of the text holds no account number at all -> "could not be verified" although the statement is right."""
+    from app.evidence.statement_account import compare_statement_text
+
+    assert compare_account("31234567835", header_of(SBI_RECENT)).result == UNKNOWN  # the old, header-only check
+    r = compare_statement_text("31234567835", SBI_RECENT)
+    assert r.result == MATCH and r.how == "full"  # 17 digits with leading zeros on the statement, 11 in the panel
+    assert compare_statement_text("39999999999", SBI_RECENT).result == MISMATCH  # and another account is still seen
+
+
+def test_the_value_on_the_next_line_and_a_masked_field_are_read():
+    from app.evidence.statement_account import compare_statement_text
+
+    assert compare_statement_text("31234567835", "rows...\n" * 50 + "Account Number :\n31234567835\n").result == MATCH
+    assert compare_statement_text("31234567835", "rows...\n" * 50 + "A/c No. XXXXXXX7835\n").result == MATCH
+
+
+def test_a_bare_number_in_the_rows_is_never_the_holders_account():
+    """The customer's number inside someone ELSE's statement (a transfer to him) must not make it his statement."""
+    from app.evidence.statement_account import compare_statement_text
+
+    text = (
+        "Account No : 99887766554\nDate Narration Withdrawal Deposit Balance\n"
+        + "01/09 NEFT TO 31234567835 SOURAV 500.00\n" * 50
+    )
+    assert compare_statement_text("31234567835", text).result == MISMATCH
+
+
+def test_unknown_says_why():
+    from app.evidence.statement_account import compare_statement_text
+
+    assert "no readable text" in compare_statement_text("31234567835", "").note
+    assert "shows no account number" in compare_statement_text("31234567835", "PhonePe statement\nPaid to X 500").note
+    assert "too few digits" in compare_statement_text("31234567835", "Account No: XXXXXXXX835").note

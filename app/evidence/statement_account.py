@@ -31,6 +31,7 @@ class AccountCheck:
     result: str  # match | mismatch | unknown
     how: str  # full | masked | labelled | ai | none
     seen: str | None = None  # the account number the statement shows (masked for display by the caller)
+    note: str = ""  # what was looked at, for the manual-review message
 
     @property
     def ok(self) -> bool:
@@ -86,7 +87,7 @@ def compare_masked(acct: str, token: str) -> tuple[str, int]:
     return ("agree" if ok else "differ"), len(head) + len(end)
 
 
-def compare_account(account: str, text: str) -> AccountCheck:
+def compare_account(account: str, text: str, *, bare_full_numbers: bool = True) -> AccountCheck:
     """Look for `account` (the payout's account number) in a statement's text.
 
     match    - printed in full (any grouping, leading zeros aside), or partly hidden with every visible digit
@@ -101,7 +102,10 @@ def compare_account(account: str, text: str) -> AccountCheck:
     if len(core) < 6:  # an all-zero / near-zero number: nothing is left to compare without its zeros
         core = acct
     spaced = r"[\s\-]?".join(core)  # "5012 3456 1231" and "5012-3456-1231" are the same number
-    if re.search(rf"(?<![1-9])0*{spaced}(?!\d)", text):
+    # `bare_full_numbers=False`: the text may hold transaction rows, where the very same digits are the OTHER
+    # party of a transfer. Then a full number counts only inside an "Account No: ..." field.
+    where = text if bare_full_numbers else labelled_accounts(text)
+    if re.search(rf"(?<![1-9])0*{spaced}(?!\d)", where):
         return AccountCheck(MATCH, "full", acct)
 
     tokens = masked_tokens(text)
@@ -133,14 +137,19 @@ TABLE_HEAD_RE = re.compile(
 )
 
 
-def header_of(text: str, fallback_lines: int = 45) -> str:
-    """The part of page one ABOVE the transaction table: whose statement this is. The rows below name other
-    people's accounts (transfers in and out) and must never decide whose statement it is."""
+def split_header(text: str, fallback_lines: int = 45) -> tuple[str, bool]:
+    """(the part of the text ABOVE the transaction table, whether that table was actually found).
+    The rows below name other people's accounts (transfers in and out) and must never decide whose statement it
+    is. When no table heading is found the first lines are returned, and they may well BE rows."""
     lines = (text or "").splitlines()
     for n, line in enumerate(lines):
-        if n >= 3 and TABLE_HEAD_RE.search(line):
-            return "\n".join(lines[:n])
-    return "\n".join(lines[:fallback_lines])
+        if TABLE_HEAD_RE.search(line) and ":" not in line:
+            return "\n".join(lines[:n]), True
+    return "\n".join(lines[:fallback_lines]), False
+
+
+def header_of(text: str, fallback_lines: int = 45) -> str:
+    return split_header(text, fallback_lines)[0]
 
 
 def pdf_text(path: Path, max_pages: int = 1) -> str:
@@ -156,19 +165,67 @@ def pdf_text(path: Path, max_pages: int = 1) -> str:
         return ""
 
 
+# "Account No : 12345", "Account Number\n12345", "A/c No. XXXX1809", "Acc No-123": a number that SAYS it is the account
+ACCOUNT_FIELD_RE = re.compile(
+    r"(?:a/?c|acc(?:oun)?t)\.?\s*(?:no\b\.?|number|num\b\.?|#)\s*[:\-.]?\s*([0-9Xx*\u2022# \-]{4,40})", re.I
+)
+
+
+def labelled_accounts(text: str) -> str:
+    """Every "Account No: ..." field found ANYWHERE in the text, one per line. PDF text extraction does not keep
+    the page order - SBI's "Recent Transactions" statement yields its header AFTER the rows - so the holder's
+    account number cannot be looked for "at the top" only. A field that names itself the account number can be
+    trusted wherever it lands; bare numbers in the rows cannot, and are not looked at here."""
+    found = [f"Account No: {m.group(1).strip()}" for m in ACCOUNT_FIELD_RE.finditer(text or "")]
+    return "\n".join(dict.fromkeys(found))
+
+
+def compare_statement_text(account: str, text: str) -> AccountCheck:
+    """The header first, then every labelled account field of the pages read. A match anywhere wins; "another
+    account" is only said when nothing matched."""
+    top, is_header = split_header(text)
+    head = compare_account(account, top, bare_full_numbers=is_header)
+    if head.result == MATCH:
+        return head
+    fields = labelled_accounts(text)
+    anywhere = compare_account(account, fields) if fields else AccountCheck(UNKNOWN, "none")
+    if anywhere.result == MATCH:
+        return anywhere
+    for check in (head, anywhere):
+        if check.result == MISMATCH:
+            return check
+    seen = head.seen or anywhere.seen
+    note = (
+        "the statement's text shows no account number"
+        if not fields
+        else "too few digits of the account number are visible"
+    )
+    return AccountCheck(
+        UNKNOWN, "none", seen, note if text.strip() else "the statement has no readable text (scanned?)"
+    )
+
+
 async def check_statement(path: Path, account: str) -> AccountCheck:
     """`path` is a readable (already decrypted) statement PDF."""
-    check = compare_account(account, header_of(pdf_text(path)))
+    check = compare_statement_text(account, pdf_text(path, max_pages=3))
     if check.result != UNKNOWN:
         return check
     from app.ai.analyzer import get_analyzer
 
     read = await get_analyzer().read_statement_account(path)  # may raise AIUnavailable: the caller holds the case
     value = (read or {}).get("value")
-    if not value or float((read or {}).get("confidence") or 0) < 0.6:
-        return AccountCheck(UNKNOWN, "ai")
+    conf = float((read or {}).get("confidence") or 0)
+    if not value:
+        return AccountCheck(UNKNOWN, "ai", check.seen, f"{check.note}; the AI found no account number either")
     again = compare_account(account, f"Account No: {value}")
-    return AccountCheck(again.result, "ai", again.seen or str(value))
+    if again.result == MATCH or conf >= 0.6:
+        note = (
+            ""
+            if again.result != UNKNOWN
+            else f"the AI read {mask_account(_digits(str(value)) or str(value))}: too few digits to decide"
+        )
+        return AccountCheck(again.result, "ai", again.seen or str(value), note)
+    return AccountCheck(UNKNOWN, "ai", str(value), f"the AI was not sure of the account number it read ({conf:.0%})")
 
 
 def mask_account(value: str | None) -> str:
