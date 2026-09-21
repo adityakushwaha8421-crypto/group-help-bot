@@ -171,8 +171,9 @@ STATEMENT_ACCOUNT_SCHEMA = {
             "holder_name": FIELD_SCHEMA,
             "ifsc": FIELD_SCHEMA,
             "bank_name": FIELD_SCHEMA,
+            "last_date": FIELD_SCHEMA,
         },
-        "required": ["account_number", "holder_name", "ifsc", "bank_name"],
+        "required": ["account_number", "holder_name", "ifsc", "bank_name", "last_date"],
         "additionalProperties": False,
     },
 }
@@ -191,4 +192,7 @@ Rules:
   never a name from a transaction row). ifsc: the branch IFSC printed in the header. null when not printed.
 - bank_name: the bank that issued the statement, from its logo / letterhead / header ("Canara Bank",
   "State Bank of India"); null when the document does not show which bank it is.
+- last_date: the LAST date this statement covers, as "YYYY-MM-DD": the end of the printed statement period
+  ("01 Sep 2026 to 21 Sep 2026" -> 2026-09-21), or the date of the newest transaction row when no period is
+  printed. Indian day-first dates (05/09/2026 = 5 September). null when no date can be read.
 evidence_text = the header line the value came from."""

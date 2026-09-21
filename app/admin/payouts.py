@@ -26,6 +26,7 @@ LABELS = {
     "UTR": "utr",
     "AMOUNT": "amount",
     "STATUS": "status",
+    "CREATED": "created",
 }
 
 
@@ -39,6 +40,19 @@ class Payout:
     utr: str | None = None
     amount: float | None = None
     status: str | None = None
+    created: str | None = None  # TIMELINE / CREATED as printed, panel-local (IST): "20 Sep 2026 12:52"
+
+    @property
+    def created_date(self):
+        """The withdrawal's DATE (the statement has to reach it)."""
+        from datetime import datetime
+
+        for fmt in ("%d %b %Y %H:%M", "%d %b %Y"):
+            try:
+                return datetime.strptime((self.created or "").strip(), fmt).date()
+            except ValueError:
+                continue
+        return None
 
     def as_dict(self) -> dict:
         return asdict(self)

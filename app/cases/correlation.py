@@ -436,8 +436,11 @@ def missing_items(case: Case, evidence: list[Evidence], require_all: bool | None
         # mobile or video is ever asked for, and nothing is force-sent without the statement.
         if not case.withdrawal_id:
             missing.append("withdrawal id")
-        if EvidenceType.bank_statement.value not in types:
+        statements = [e for e in evidence if e.type == EvidenceType.bank_statement.value]
+        if not statements:
             missing.append("bank statement")
+        elif all((e.analysis or {}).get("outdated") for e in statements):
+            missing.append("newer bank statement")  # every statement sent ends before the withdrawal date
         elif statement_needs_password(case, evidence):
             missing.append("statement password")
         return missing

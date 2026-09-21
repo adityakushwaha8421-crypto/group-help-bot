@@ -247,3 +247,35 @@ async def test_the_bots_order_status_reversed_starts_the_same_flow(
         await manager.approve_refund(s, cid, "@me")
     assert await manager.refund_approved_withdrawal(cid) == "reversed"
     assert calls == [WD] and len(texts(fake_bot, "WITHDRAWAL REVERSED")) == 1
+
+
+# ------------------------------------------------------------------ asked once, button gone everywhere
+async def test_a_second_reversed_from_betix_does_not_ask_again(db, fake_bot, no_download, fake_poster, jobs, refunder):
+    """A member writes "Reversed", then the Betix bot posts "OrderStatus: Reversed" for the same withdrawal."""
+    cid = await reversed_case(db, fake_poster)
+    assert await manager.reversal_check(cid) == "asked"
+    async with db.session_scope() as s:
+        r = await handle_group_message(
+            s, make_group_msg(611, BOT_REVERSED, sender_username="betixpay_cs_bot", is_bot=True)
+        )
+        assert r["action"] == "reversal_already_known"
+    assert [j for j in jobs if j[0] == "reversal_check_job"] == [("reversal_check_job", cid)]
+    assert await manager.reversal_check(cid) == "asked"  # even if the check runs again ...
+    assert len(texts(fake_bot, "REFUND NEEDED")) == 1  # ... the operator was asked ONCE
+
+
+async def test_the_button_goes_from_every_admins_copy(
+    db, fake_bot, no_download, fake_poster, jobs, refunder, monkeypatch
+):
+    from app.config import reset_settings_cache
+    from app.telegram import notifications
+
+    monkeypatch.setenv("ADMIN_NOTIFY_CHAT_ID", "8412466614,7996741359")
+    reset_settings_cache()
+    cid = await reversed_case(db, fake_poster)
+    assert await manager.reversal_check(cid) == "asked"
+    asked = [(chat, t) for chat, t in fake_bot.sent if "REFUND NEEDED" in t]
+    assert {chat for chat, _ in asked} == {8412466614, 7996741359}  # each admin got a copy with the button
+    async with db.session_scope() as s:
+        assert await notifications.remove_buttons(s, cid, "refund_request") == 2
+    assert {(c, markup) for c, _, markup in fake_bot.markup_edits} == {(8412466614, None), (7996741359, None)}

@@ -37,6 +37,7 @@ class AccountCheck:
     seen: str | None = None  # the account number the statement shows (masked for display by the caller)
     note: str = ""  # what was looked at, for the manual-review message
     weak: int = 0  # visible digits that agree when they are too few to decide on their own
+    ai_read: dict | None = None  # the AI's header read, when one was made (reused for the statement's dates)
 
     @property
     def ok(self) -> bool:
@@ -364,7 +365,7 @@ async def check_statement(
             if again.result == UNKNOWN
             else ""
         )
-        return AccountCheck(again.result, "ai", again.seen or str(value), note, again.weak)
+        return AccountCheck(again.result, "ai", again.seen or str(value), note, again.weak, ai_read=read)
     return AccountCheck(UNKNOWN, "ai", str(value), f"the AI was not sure of the account number it read ({conf:.0%})")
 
 

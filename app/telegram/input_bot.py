@@ -232,8 +232,12 @@ async def on_refund_button(query: CallbackQuery):
         await query.answer("\u26d4 Not authorized", show_alert=True)
         return
     who = f"@{query.from_user.username}" if query.from_user.username else str(query.from_user.id)
+    case_id = query.data.split(":", 1)[1]
     async with session_scope() as session:
-        outcome = await manager.approve_refund(session, query.data.split(":", 1)[1], who)
+        outcome = await manager.approve_refund(session, case_id, who)
+    # The button has done its job: it goes from EVERY admin's copy at once, so nobody can press it again.
+    async with session_scope() as session:
+        removed = await notifications.remove_buttons(session, case_id, "refund_request")
     await query.answer(
         {
             "queued": "\U0001f4b8 Refunding... I'll confirm once the panel shows Refunded.",
@@ -242,8 +246,9 @@ async def on_refund_button(query: CallbackQuery):
         show_alert=outcome != "queued",
     )
     if query.message:
-        try:  # the button has done its job: one approval per case
-            await query.message.edit_reply_markup(reply_markup=None)
+        try:
+            if not removed:  # an older message without a record of its copies: at least this one
+                await query.message.edit_reply_markup(reply_markup=None)
             if outcome == "queued":
                 await query.message.answer(
                     para(

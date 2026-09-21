@@ -84,6 +84,11 @@ class FakeBot:
         self.sent.append((chat_id, text))
         return type("M", (), {"message_id": self._n})()
 
+    async def edit_message_reply_markup(self, *, chat_id, message_id, reply_markup=None):
+        self.markup_edits = getattr(self, "markup_edits", [])
+        self.markup_edits.append((chat_id, message_id, reply_markup))
+        return True
+
     async def edit_message_text(self, text, *, chat_id, message_id, **kw):
         self.edits.append((chat_id, message_id, text))
         return True
@@ -257,6 +262,8 @@ def payout(env):
         "seen": "99887766554433",
         "lookups": 0,
         "status": "Success",
+        "created": "20 Sep 2026 12:52",
+        "statement_ends": "2026-09-21",  # None: the dates cannot be read
     }
 
     async def _lookup(wd):
@@ -265,7 +272,7 @@ def payout(env):
             return None
         return Payout(
             withdraw_id=wd, account=holder["account"], ifsc="KKBK0001770", beneficiary="Test User",
-            bank="Kotak Mahindra Bank", amount=926.25, status=holder["status"],
+            bank="Kotak Mahindra Bank", amount=926.25, status=holder["status"], created=holder["created"],
         )  # fmt: skip
 
     async def _check(path, account):
@@ -276,11 +283,18 @@ def payout(env):
         holder.update(kw)
         return holder
 
+    async def _dates(path):
+        from datetime import date
+
+        return date.fromisoformat(holder["statement_ends"]) if holder["statement_ends"] else None
+
     manager.set_payout_lookup(_lookup)
     manager.set_statement_checker(_check)
+    manager.set_statement_dater(_dates)
     yield set_
     manager.set_payout_lookup(None)
     manager.set_statement_checker(None)
+    manager.set_statement_dater(None)
 
 
 @pytest.fixture

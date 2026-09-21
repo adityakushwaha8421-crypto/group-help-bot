@@ -81,30 +81,57 @@ async def _find_payout(withdraw_id: str):
     return await find_payout(withdraw_id)
 
 
+_statement_dater = None
+
+
+def set_statement_dater(fn) -> None:
+    global _statement_dater
+    _statement_dater = fn
+
+
+def _readable_statement(path, password: str | None):
+    """The statement as a PDF that can be read (decrypted with the password when protected); None when it cannot."""
+    from pathlib import Path
+
+    from app.evidence.pdf import decrypt_pdf, pdf_is_encrypted, pdf_view
+
+    if not path:
+        return None
+    view = pdf_view(path) or Path(path)
+    if pdf_is_encrypted(view):
+        view = decrypt_pdf(path, password) if password else None
+    return Path(view) if view else None
+
+
 async def _check_statement(path, payout, password: str | None):
     """Open the statement (with the password when it is protected) and compare its account with the payout's."""
     account = payout.account
     if _statement_checker is not None:
         return await _statement_checker(path, account)
-    from pathlib import Path
-
-    from app.evidence.pdf import decrypt_pdf, pdf_is_encrypted, pdf_view
     from app.evidence.statement_account import UNKNOWN, AccountCheck, check_statement
 
     if not path:
         return AccountCheck(UNKNOWN, "none", note="the statement file could not be downloaded")
-    view = pdf_view(path) or Path(path)
-    if pdf_is_encrypted(view):
-        view = decrypt_pdf(path, password) if password else None
-        if view is None:
-            return AccountCheck(
-                UNKNOWN,
-                "none",
-                note="the statement is password-protected and could not be opened with the password given",
-            )
-    return await check_statement(
-        Path(view), account, beneficiary=payout.beneficiary, ifsc=payout.ifsc, bank=payout.bank
-    )
+    view = _readable_statement(path, password)
+    if view is None:
+        return AccountCheck(
+            UNKNOWN,
+            "none",
+            note="the statement is password-protected and could not be opened with the password given",
+        )
+    return await check_statement(view, account, beneficiary=payout.beneficiary, ifsc=payout.ifsc, bank=payout.bank)
+
+
+async def _statement_last_date(path, password: str | None, ai_read: dict | None):
+    """The last date the statement covers (None: it could not be read)."""
+    if _statement_dater is not None:
+        return await _statement_dater(path)
+    from app.evidence.statement_dates import statement_last_date
+
+    view = _readable_statement(path, password)
+    if view is None:
+        return None
+    return (await statement_last_date(view, ai_read))[0]
 
 
 def _get_order_search() -> OrderSearch:
@@ -241,6 +268,45 @@ async def ask_for_a_readable_screenshot(session: AsyncSession, case: Case) -> st
     return "utr_missing"
 
 
+STATEMENT_OUTDATED = "NEWER STATEMENT NEEDED"
+
+
+def statement_outdated_text(wd_date, ends: str) -> str:
+    from datetime import date as _date
+
+    end = _date.fromisoformat(ends)
+    return (
+        f"{STATEMENT_OUTDATED} \u274c\n\n"
+        f"\U0001f4c5 Withdrawal date: {wd_date:%d %b %Y}\n"
+        f"\U0001f4c4 The statement ends: {end:%d %b %Y}\n\n"
+        f"Please send a bank statement that includes {wd_date:%d %b %Y} or a later date."
+    )
+
+
+async def ask_for_a_newer_statement(session: AsyncSession, case: Case, wd_date, ends: str) -> str:
+    """The statement stops before the withdrawal date: it cannot show the withdrawal. Nothing is sent to Betix;
+    the case waits for a newer statement and carries on by itself when one arrives."""
+    case.failure_reason = statement_outdated_text(wd_date, ends)
+    await transition(
+        session,
+        case,
+        CaseStatus.WAITING_FOR_INPUT,
+        reason="the statement ends before the withdrawal date",
+        strict=False,
+    )
+    await audit(
+        session,
+        "STATEMENT_OUTDATED",
+        case_id=case.case_id,
+        result=ends,
+        details={"withdrawal_date": wd_date.isoformat(), "statement_ends": ends},
+    )
+    await notify_admin(
+        session, kind="statement_outdated", case=case, text=case.failure_reason, dedupe_suffix=ends, parse_mode=None
+    )
+    return "statement_outdated"
+
+
 async def ready_withdrawal(session: AsyncSession, case: Case) -> str:
     """WITHDRAWAL: nothing to read or match - the withdrawal id and the statement are all Betix needs. The case
     is labelled by the id the group will see ("BXWD-..."), which also makes the one-post-per-id guard, /status
@@ -287,11 +353,29 @@ async def process_withdrawal(session: AsyncSession, case: Case, evidence, *, for
     except Exception as exc:  # noqa: BLE001
         log.exception("payout lookup crashed", case_id=case.case_id)
         problem = (f"Payout lookup error: {exc!r}", "")
+    wd_date = payout.created_date if payout is not None else None
+    too_old: dict[int, str] = {}  # evidence id -> the last date that statement reaches (it ends before the withdrawal)
+    undated = False
+    accepted = None
     if problem is None and payout is not None and payout.account:
         try:
             for ev in statements:  # any one of the statements sent may be the right one
-                check = await _check_statement(await _download(ev), payout, password)
-                if check.ok:
+                if (ev.analysis or {}).get("outdated"):
+                    continue  # already turned down: the operator was asked for a newer one
+                path = await _download(ev)
+                check = await _check_statement(path, payout, password)
+                if not check.ok:
+                    continue
+                if wd_date is None:  # the panel shows no creation date: nothing to hold the statement against
+                    accepted = ev
+                    break
+                last = await _statement_last_date(path, password, getattr(check, "ai_read", None))
+                if last is None:
+                    undated = True
+                elif last < wd_date:
+                    too_old[ev.id] = last.isoformat()
+                else:
+                    accepted = ev
                     break
         except AIUnavailable as exc:
             ai_down = str(exc)
@@ -326,6 +410,22 @@ async def process_withdrawal(session: AsyncSession, case: Case, evidence, *, for
     paid_to = f"Paid to: {payout.bank or 'bank'} a/c {mask_account(payout.account)}"
     if payout.beneficiary:
         paid_to += f" ({payout.beneficiary})"
+    for ev in statements:  # remember which statements end too early: they are not looked at again
+        if ev.id in too_old:
+            ev.analysis = {**(ev.analysis or {}), "outdated": {"ends": too_old[ev.id], "needed": wd_date.isoformat()}}
+    if accepted is not None:
+        return await ready_withdrawal(session, case)
+    if too_old:
+        return await ask_for_a_newer_statement(session, case, wd_date, max(too_old.values()))
+    if undated:
+        await escalate_case(
+            session,
+            case,
+            f"The statement's dates could not be read, so it cannot be checked against the withdrawal date "
+            f"({wd_date:%d %b %Y}).",
+            f"{paid_to}\nNot sent to Betix. Please check that the statement reaches {wd_date:%d %b %Y}.",
+        )
+        return "escalated"
     if check is not None and check.result == MATCH:
         return await ready_withdrawal(session, case)
     if check is not None and check.result == MISMATCH:
@@ -1337,7 +1437,10 @@ async def _refund(withdraw_id: str):
 async def start_reversal(
     session: AsyncSession, case: Case, *, actor: str, betix_message_id, sender_id, sender_username, quote: str
 ) -> str:
-    """Betix said "Reversed". Remember who said it (the audit row survives a restart); the check runs as a job."""
+    """Betix said "Reversed". Remember who said it (the audit row survives a restart); the check runs as a job.
+    A second "Reversed" for the same case (the bot's status line after a member's message, a repeated /live) is
+    recorded and changes nothing: the operator is asked once."""
+    already = await _reversal_info(session, case.case_id) is not None
     await cancel_case_followups(session, case, "Betix reversed the withdrawal")  # Betix has answered
     await audit(
         session,
@@ -1353,7 +1456,9 @@ async def start_reversal(
             "quote": quote,
         },
     )
-    await enqueue("reversal_check_job", case.case_id, job_id=f"reversal-{case.case_id}-{betix_message_id}")
+    if already:
+        return "reversal_already_known"
+    await enqueue("reversal_check_job", case.case_id, job_id=f"reversal-{case.case_id}")
     return "reversal_check_queued"
 
 
@@ -1436,8 +1541,7 @@ async def reversal_check(case_id: str) -> str:
             await notify_admin(
                 session,
                 kind="refund_request",
-                case=case,
-                dedupe_suffix=str(info.get("betix_message_id") or ""),
+                case=case,  # ONE request per case, however many times Betix says "Reversed" (member + bot, /live ...)
                 text=format_refund_request(case, actor, payout),
                 reply_markup=refund_button(case),
             )

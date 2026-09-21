@@ -219,6 +219,7 @@ async def notify_admin(
         log.warning("ADMIN_NOTIFY_CHAT_ID not configured; notification stored only", kind=kind)
         return row
     errors = []
+    copies: dict[str, int] = {}  # chat -> message id of that admin's copy (to take a button off all of them)
     markup = {"reply_markup": reply_markup} if reply_markup is not None else {}
     for chat in chats:  # one failure never stops the others: each admin gets their own copy
         try:
@@ -227,11 +228,43 @@ async def notify_admin(
             )
             row.sent = True
             row.telegram_message_id = row.telegram_message_id or msg.message_id
+            copies[str(chat)] = msg.message_id
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{chat}: {str(exc)[:160]}")
             log.error("notification send failed", kind=kind, chat=chat, error=str(exc))
     if row.sent:
-        await audit(session, "ADMIN_NOTIFIED", case_id=case.case_id if case else None, result=kind)
+        await audit(
+            session, "ADMIN_NOTIFIED", case_id=case.case_id if case else None, result=kind, details={"copies": copies}
+        )
     if errors:
         row.error = "; ".join(errors)[:500]
     return row
+
+
+async def remove_buttons(session: AsyncSession, case_id: str, kind: str) -> int:
+    """Take the inline button off EVERY admin's copy of a notification (each admin has their own message).
+    Best effort; returns how many copies were edited."""
+    from sqlalchemy import select
+
+    from app.db.models import AuditLog
+
+    rows = await session.execute(
+        select(AuditLog).where(
+            AuditLog.case_id == case_id, AuditLog.action == "ADMIN_NOTIFIED", AuditLog.result == kind
+        )
+    )
+    done = 0
+    for row in rows.scalars():
+        for chat, mid in ((row.details or {}).get("copies") or {}).items():
+            try:
+                await get_throttle().run(
+                    int(chat),
+                    lambda c=int(chat), m=mid: get_bot().edit_message_reply_markup(
+                        chat_id=c, message_id=m, reply_markup=None
+                    ),
+                )
+                done += 1
+            except Exception as exc:  # noqa: BLE001
+                if "not modified" not in str(exc):
+                    log.warning("could not remove a button", chat=chat, error=str(exc)[:160])
+    return done

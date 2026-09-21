@@ -35,6 +35,8 @@ def progress_card(case: Case) -> str:
         reason_text = case.failure_reason or ""
         if reason_text == UTR_NOT_FOUND:
             return UTR_NOT_FOUND
+        if reason_text.startswith("NEWER STATEMENT NEEDED"):
+            return esc(reason_text)  # the withdrawal date, where the statement ends, what to send
         if reason_text.startswith(AI_UNAVAILABLE):  # on hold: the AI service is down, the bot retries by itself
             return _card("\u23f8 ON HOLD", [ident], esc(reason_text))
         return _card("\u23f3 WAITING FOR EVIDENCE", [ident], "\U0001f4e9 Send the remaining files and I'll continue.")
