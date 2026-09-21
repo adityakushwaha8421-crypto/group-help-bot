@@ -166,8 +166,8 @@ STATEMENT_ACCOUNT_SCHEMA = {
     "strict": True,
     "schema": {
         "type": "object",
-        "properties": {"account_number": FIELD_SCHEMA},
-        "required": ["account_number"],
+        "properties": {"account_number": FIELD_SCHEMA, "holder_name": FIELD_SCHEMA, "ifsc": FIELD_SCHEMA},
+        "required": ["account_number", "holder_name", "ifsc"],
         "additionalProperties": False,
     },
 }
@@ -182,4 +182,6 @@ Rules:
 - Never return an account number that appears only inside a transaction row / narration (the other party of a
   transfer), a customer id, CIF, IFSC, MICR, mobile number or card number.
 - If the header shows no account number, return value=null with confidence=0.
+- holder_name: the ACCOUNT HOLDER's name exactly as printed in the header (not the bank, not a branch manager,
+  never a name from a transaction row). ifsc: the branch IFSC printed in the header. null when not printed.
 evidence_text = the header line the value came from."""

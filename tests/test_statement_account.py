@@ -182,3 +182,72 @@ def test_unknown_says_why():
     assert "no readable text" in compare_statement_text("31234567835", "").note
     assert "shows no account number" in compare_statement_text("31234567835", "PhonePe statement\nPaid to X 500").note
     assert "too few digits" in compare_statement_text("31234567835", "Account No: XXXXXXXX835").note
+
+
+# ------------------------------------------------------------------ only the last THREE digits are visible (SBI)
+SBI_ACCT = "31234567835"
+
+
+class _FakeReader:
+    def __init__(self, account, name=None, ifsc=None, conf=0.9):
+        self.payload = {
+            "account_number": {"value": account, "confidence": conf, "evidence_text": None},
+            "holder_name": {"value": name, "confidence": 0.9, "evidence_text": None},
+            "ifsc": {"value": ifsc, "confidence": 0.9, "evidence_text": None},
+        }
+
+    async def read_statement_account(self, path):
+        return self.payload
+
+
+async def _check(monkeypatch, tmp_path, text, reader, **payout):
+    from app.ai.analyzer import set_analyzer
+    from app.evidence import statement_account as sa
+
+    monkeypatch.setattr(sa, "pdf_text", lambda path, max_pages=1: text)
+    set_analyzer(reader)
+    try:
+        return await sa.check_statement(tmp_path / "s.pdf", SBI_ACCT, **payout)
+    finally:
+        set_analyzer(None)
+
+
+async def test_three_digits_plus_the_holders_name_is_a_match(monkeypatch, tmp_path):
+    """Live 2026-09-21 (SBI a/c ...7835, SOURAV CHATTERJEE): "the AI read 835: too few digits to decide"."""
+    r = await _check(
+        monkeypatch, tmp_path, "", _FakeReader("XXXXXXXX835", name="Mr. SOURAV CHATTERJEE"),
+        beneficiary="SOURAV CHATTERJEE", ifsc="SBIN0001234",
+    )  # fmt: skip
+    assert r.result == MATCH and "last 3 digits agree" in r.note and "holder's name" in r.note
+
+
+async def test_three_digits_plus_the_ifsc_is_a_match(monkeypatch, tmp_path):
+    text = "STATE BANK OF INDIA\nAccount No : XXXXXXXX835\nIFSC : SBIN0001234\nBranch : KOLKATA"
+    r = await _check(
+        monkeypatch, tmp_path, text, _FakeReader(None), beneficiary="SOURAV CHATTERJEE", ifsc="SBIN0001234"
+    )
+    assert r.result == MATCH and "IFSC SBIN0001234" in r.note
+
+
+async def test_three_digits_alone_are_still_not_enough(monkeypatch, tmp_path):
+    r = await _check(
+        monkeypatch, tmp_path, "", _FakeReader("XXXXXXXX835", name="RAHUL SHARMA", ifsc="HDFC0000001"),
+        beneficiary="SOURAV CHATTERJEE", ifsc="SBIN0001234",
+    )  # fmt: skip
+    assert r.result == UNKNOWN and "only the last 3 digits are visible" in r.note and "SOURAV CHATTERJEE" in r.note
+
+
+async def test_three_wrong_digits_are_another_account_whatever_the_name(monkeypatch, tmp_path):
+    r = await _check(
+        monkeypatch, tmp_path, "", _FakeReader("XXXXXXXX999", name="SOURAV CHATTERJEE"),
+        beneficiary="SOURAV CHATTERJEE", ifsc="SBIN0001234",
+    )  # fmt: skip
+    assert r.result == MISMATCH
+
+
+def test_names_are_compared_part_by_part():
+    from app.evidence.statement_account import same_person
+
+    assert same_person("SOURAV CHATTERJEE", "Account Name : Mr. Chatterjee Sourav Kumar")
+    assert not same_person("SOURAV CHATTERJEE", "Account Name : SOURAV DAS")
+    assert not same_person("", "SOURAV") and not same_person(None, "x")

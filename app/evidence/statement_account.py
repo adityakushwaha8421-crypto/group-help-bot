@@ -24,6 +24,9 @@ LABELLED_RE = re.compile(
     r"(?:a/?c|acc(?:oun)?t)\.?\s*(?:no\.?|number|num|#)?\s*[:\-]?\s*((?:\d[\s\-]?){8,20})(?!\d)", re.I
 )
 MIN_VISIBLE = 4  # digits that must be visible AND agree before a hidden number counts as the same account
+# SBI hides all but the last THREE digits ("XXXXXXXX835"). Three agreeing digits alone are a 1-in-1000 coincidence,
+# so they count only TOGETHER with a second proof from the payout: the holder's name or the branch IFSC.
+MIN_VISIBLE_WITH_PROOF = 3
 
 
 @dataclass
@@ -32,6 +35,7 @@ class AccountCheck:
     how: str  # full | masked | labelled | ai | none
     seen: str | None = None  # the account number the statement shows (masked for display by the caller)
     note: str = ""  # what was looked at, for the manual-review message
+    weak: int = 0  # visible digits that agree when they are too few to decide on their own
 
     @property
     def ok(self) -> bool:
@@ -113,13 +117,14 @@ def compare_account(account: str, text: str, *, bare_full_numbers: bool = True) 
         digits = m.group(1) or m.group(2)
         before = text[max(0, m.start() - 30) : m.start()]
         tokens.append(("XXXX" + digits, bool(ACCOUNT_LABEL_RE.search(before)) or bool(m.group(1))))
-    weak, differing = None, []
+    weak, weak_digits, differing = None, 0, []
     for tok, labelled in tokens:
         verdict, seen_digits = compare_masked(acct, tok)
         if verdict == "agree" and seen_digits >= MIN_VISIBLE:
             return AccountCheck(MATCH, "masked", tok)
         if verdict == "agree":
-            weak = weak or tok
+            if weak is None or seen_digits > weak_digits:
+                weak, weak_digits = tok, seen_digits
         elif labelled:
             differing.append(tok)  # only a number that IS the account can prove another account
 
@@ -129,7 +134,24 @@ def compare_account(account: str, text: str, *, bare_full_numbers: bool = True) 
         return AccountCheck(MISMATCH, "labelled", labelled_full[0])
     if differing and not weak:
         return AccountCheck(MISMATCH, "masked", differing[0])
-    return AccountCheck(UNKNOWN, "none", weak)
+    return AccountCheck(UNKNOWN, "none", weak, weak=weak_digits if weak else 0)
+
+
+def same_person(payout_name: str | None, text: str | None) -> bool:
+    """Is the payout's beneficiary named in `text`? Every part of the name (3+ letters) must be there, in any
+    order ("CHATTERJEE SOURAV", "Mr. Sourav Kumar Chatterjee"); a one-word name needs that word."""
+    parts = [w for w in re.findall(r"[A-Za-z]{3,}", (payout_name or "").upper()) if w not in {"MRS", "SHRI", "SMT"}]
+    words = set(re.findall(r"[A-Za-z]{3,}", (text or "").upper()))
+    return bool(parts) and all(w in words for w in parts)
+
+
+def second_proof(text: str, *, beneficiary: str | None, ifsc: str | None) -> str | None:
+    """What else in the statement ties it to the payout: the branch IFSC, or the holder's name."""
+    if ifsc and re.search(rf"\b{re.escape(ifsc.strip())}\b", text or "", re.I):
+        return f"IFSC {ifsc.strip().upper()}"
+    if same_person(beneficiary, text):
+        return "the account holder's name"
+    return None
 
 
 TABLE_HEAD_RE = re.compile(
@@ -194,37 +216,64 @@ def compare_statement_text(account: str, text: str) -> AccountCheck:
     for check in (head, anywhere):
         if check.result == MISMATCH:
             return check
-    seen = head.seen or anywhere.seen
+    best = head if head.weak >= anywhere.weak else anywhere
+    if not text.strip():
+        note = "the statement has no readable text (scanned?)"
+    elif best.weak:
+        note = "too few digits of the account number are visible"
+    else:
+        note = "the statement's text shows no account number"
+    return AccountCheck(UNKNOWN, "none", best.seen or head.seen or anywhere.seen, note, best.weak)
+
+
+def with_proof(check: AccountCheck, proof_text: str, *, beneficiary: str | None, ifsc: str | None) -> AccountCheck:
+    """Too few visible digits agree (3): a match after all when the statement ALSO carries the payout's IFSC or
+    the beneficiary's name."""
+    if check.result != UNKNOWN or check.weak < MIN_VISIBLE_WITH_PROOF:
+        return check
+    proof = second_proof(proof_text, beneficiary=beneficiary, ifsc=ifsc)
+    if proof:
+        return AccountCheck(MATCH, "masked+proof", check.seen, f"last {check.weak} digits agree, and so does {proof}")
+    who = f" ({beneficiary})" if beneficiary else ""
     note = (
-        "the statement's text shows no account number"
-        if not fields
-        else "too few digits of the account number are visible"
+        f"only the last {check.weak} digits are visible and they agree, but neither the holder's name{who} nor the "
+        "IFSC of the payout is on the statement"
     )
-    return AccountCheck(
-        UNKNOWN, "none", seen, note if text.strip() else "the statement has no readable text (scanned?)"
-    )
+    return AccountCheck(UNKNOWN, check.how, check.seen, note, check.weak)
 
 
-async def check_statement(path: Path, account: str) -> AccountCheck:
-    """`path` is a readable (already decrypted) statement PDF."""
-    check = compare_statement_text(account, pdf_text(path, max_pages=3))
+async def check_statement(
+    path: Path, account: str, *, beneficiary: str | None = None, ifsc: str | None = None
+) -> AccountCheck:
+    """`path` is a readable (already decrypted) statement PDF. `beneficiary` / `ifsc`: the payout's, used as the
+    second proof when the statement hides all but three digits of the account."""
+    text = pdf_text(path, max_pages=3)
+    check = with_proof(compare_statement_text(account, text), text, beneficiary=beneficiary, ifsc=ifsc)
     if check.result != UNKNOWN:
         return check
     from app.ai.analyzer import get_analyzer
 
     read = await get_analyzer().read_statement_account(path)  # may raise AIUnavailable: the caller holds the case
-    value = (read or {}).get("value")
-    conf = float((read or {}).get("confidence") or 0)
+    read = read or {}
+    if "account_number" not in read and "value" in read:  # the older, account-only shape
+        read = {"account_number": read}
+    field = read.get("account_number") or {}
+    value, conf = field.get("value"), float(field.get("confidence") or 0)
     if not value:
-        return AccountCheck(UNKNOWN, "ai", check.seen, f"{check.note}; the AI found no account number either")
-    again = compare_account(account, f"Account No: {value}")
-    if again.result == MATCH or conf >= 0.6:
-        note = (
-            ""
-            if again.result != UNKNOWN
-            else f"the AI read {mask_account(_digits(str(value)) or str(value))}: too few digits to decide"
+        return AccountCheck(
+            UNKNOWN, "ai", check.seen, f"{check.note}; the AI found no account number either", check.weak
         )
-        return AccountCheck(again.result, "ai", again.seen or str(value), note)
+    again = compare_account(account, f"Account No: {value}")
+    if again.result == UNKNOWN and again.weak:
+        seen_by_ai = " ".join(str((read.get(k) or {}).get("value") or "") for k in ("holder_name", "ifsc"))
+        again = with_proof(again, f"{text}\n{seen_by_ai}", beneficiary=beneficiary, ifsc=ifsc)
+    if again.result == MATCH or conf >= 0.6:
+        note = again.note or (
+            f"the AI read {mask_account(_digits(str(value)) or str(value))}: too few digits to decide"
+            if again.result == UNKNOWN
+            else ""
+        )
+        return AccountCheck(again.result, "ai", again.seen or str(value), note, again.weak)
     return AccountCheck(UNKNOWN, "ai", str(value), f"the AI was not sure of the account number it read ({conf:.0%})")
 
 

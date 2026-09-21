@@ -81,8 +81,9 @@ async def _find_payout(withdraw_id: str):
     return await find_payout(withdraw_id)
 
 
-async def _check_statement(path, account: str, password: str | None):
-    """Open the statement (with the password when it is protected) and compare its account with `account`."""
+async def _check_statement(path, payout, password: str | None):
+    """Open the statement (with the password when it is protected) and compare its account with the payout's."""
+    account = payout.account
     if _statement_checker is not None:
         return await _statement_checker(path, account)
     from pathlib import Path
@@ -101,7 +102,7 @@ async def _check_statement(path, account: str, password: str | None):
                 "none",
                 note="the statement is password-protected and could not be opened with the password given",
             )
-    return await check_statement(Path(view), account)
+    return await check_statement(Path(view), account, beneficiary=payout.beneficiary, ifsc=payout.ifsc)
 
 
 def _get_order_search() -> OrderSearch:
@@ -287,7 +288,7 @@ async def process_withdrawal(session: AsyncSession, case: Case, evidence, *, for
     if problem is None and payout is not None and payout.account:
         try:
             for ev in statements:  # any one of the statements sent may be the right one
-                check = await _check_statement(await _download(ev), payout.account, password)
+                check = await _check_statement(await _download(ev), payout, password)
                 if check.ok:
                     break
         except AIUnavailable as exc:

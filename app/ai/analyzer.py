@@ -177,9 +177,10 @@ class Analyzer:
         return (await _structured(PASSWORD_SYSTEM, parts, PASSWORD_SCHEMA))["statement_password"]
 
     async def read_statement_account(self, statement: Path) -> dict:
-        """The account number printed in a statement's header: {"value", "confidence", "evidence_text"}."""
+        """What a statement's header says about its owner: {"account_number", "holder_name", "ifsc"}, each
+        {"value", "confidence", "evidence_text"}."""
         parts = [{"type": "input_text", "text": "Bank statement:"}, _pdf_part(statement)]
-        return (await _structured(STATEMENT_ACCOUNT_SYSTEM, parts, STATEMENT_ACCOUNT_SCHEMA))["account_number"]
+        return await _structured(STATEMENT_ACCOUNT_SYSTEM, parts, STATEMENT_ACCOUNT_SCHEMA)
 
     async def classify_betix_reply(self, text: str, *, context: str = "") -> dict:
         parts = [{"type": "input_text", "text": f"Context: {context}\n\nMessage:\n{text}"}]
