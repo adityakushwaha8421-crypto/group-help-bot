@@ -71,3 +71,66 @@ def test_the_payout_page_is_read_by_its_labels():
     assert (p.account, p.ifsc, p.bank, p.beneficiary) == (ACCT, "KKBK0001770", "Kotak Mahindra Bank", "Test User")
     assert p.amount == 926.25 and p.status == "Success" and p.utr == "626312340212"
     assert parse_payout_page("WD-11111-22222", PAGE) is None  # another withdrawal's page is never used
+
+
+# ------------------------------------------------------------------ partly hidden account numbers
+PAYOUT = "273501000021809"
+
+
+def test_the_last_four_digits_are_enough():
+    """The user's example: Illunise 273501000021809, statement XXXXXXXX1809."""
+    r = compare_account(PAYOUT, "Name: A B\nAccount No: XXXXXXXX1809\nIFSC: FDRL0007778")
+    assert r.result == MATCH and r.how == "masked" and r.seen == "XXXXXXXX1809"
+
+
+def test_every_visible_digit_is_used():
+    ok = [
+        "A/c No: XXXXXXXXXXX1809",  # last 4
+        "A/c No: XXXXXXXXX021809",  # last 6
+        "Account Number 2735XXXXXXX1809",  # first digits + last digits
+        "Account: 2735 XXXX XXXX 809",  # printed in groups
+        "A/c 27350100002XXXX",  # only the first digits are visible
+        "Account No. ********1809",
+        "Savings A/c ending 1809",
+        "Account ending with 021809",
+        "A/c ....1809",
+        "Account No: 00273501000021809",  # leading zeros are not another account
+        "A/c XXXX-XXXX-XXX-1809",
+    ]
+    for text in ok:
+        assert compare_account(PAYOUT, text).result == MATCH, text
+
+
+def test_one_wrong_visible_digit_is_another_account():
+    wrong = [
+        "Account No: XXXXXXXX1808",  # last 4 differ
+        "Account No: 2736XXXXXXX1809",  # same ending, another start
+        "Account No: XXXXXXXXX031809",  # last 6 differ
+        "Account No: 2735010XXXX1709",  # same length: a digit in the middle differs
+    ]
+    for text in wrong:
+        r = compare_account(PAYOUT, text)
+        assert r.result == MISMATCH and r.how == "masked", text
+
+
+def test_too_few_visible_digits_decide_nothing():
+    r = compare_account(PAYOUT, "Account No: XXXXXXXXXXXX809")  # 3 digits agree: neither match nor mismatch
+    assert r.result == UNKNOWN and r.seen == "XXXXXXXXXXXX809"
+
+
+def test_a_hidden_number_that_is_not_the_account_never_means_mismatch():
+    """A masked mobile / card / customer id in the header is not the account: not unmatched because of it."""
+    text = "Name: A B\nMobile: XXXXXX4321\nCard: XXXX XXXX XXXX 9911\nCustomer ID 55512345"
+    assert compare_account(PAYOUT, text).result == UNKNOWN
+    text += "\nAccount No: XXXXXXXX1809"
+    assert compare_account(PAYOUT, text).result == MATCH  # ... and the real account line still decides
+
+
+def test_the_full_number_of_another_account_still_wins_over_nothing():
+    assert compare_account(PAYOUT, "Account Number: 99887766554433").result == MISMATCH
+
+
+def test_a_number_of_zeros_matches_nothing():
+    """Stripping leading zeros must never leave an empty pattern that 'matches' every statement."""
+    assert compare_account("00000000000000", "Account No: 273501000021809").result == MISMATCH
+    assert compare_account("00000000000000", "Name: A B").result == UNKNOWN

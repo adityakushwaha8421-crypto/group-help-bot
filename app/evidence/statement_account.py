@@ -1,7 +1,8 @@
 """Does this bank statement belong to the account a withdrawal was paid to?
 
 Deterministic first: the statement's own text is searched for the account number (banks print it in full, in
-groups, or masked: "XXXXXX1231", "5012XXXX1231"). Only when the text settles nothing (a scanned statement) is
+groups, or partly hidden: "XXXXXXXX1809", "2735XXXXXXX1809", "XXXX XXXX 1809", "A/c ending 1809" - then every
+visible digit is compared: first digits, last 4 / last 6). Only when the text settles nothing (a scanned statement) is
 the AI asked to read the printed account number, and that reading goes through the very same comparison.
 Anything short of a match is NOT a match: the caller keeps the case for a person."""
 
@@ -13,11 +14,16 @@ from pathlib import Path
 
 MATCH, MISMATCH, UNKNOWN = "match", "mismatch", "unknown"
 
-MASK = r"[Xx*•#]"
-MASKED_RE = re.compile(rf"(?<![0-9A-Za-z])(\d{{0,8}}){MASK}{{2,}}(\d{{4,6}})(?!\d)")
+MASK_CHARS = "Xx*\u2022#"
+# A partly hidden number: digits and mask characters, possibly printed in groups ("XXXX XXXX 1809", "2735-XXXX-1809")
+MASKED_TOKEN_RE = re.compile(rf"(?<![0-9A-Za-z])(?:[0-9{MASK_CHARS}][ \-]?){{5,27}}[0-9{MASK_CHARS}]")
+# "A/c ending 1809", "account ending with 021809", "A/c ....1809"
+ENDING_RE = re.compile(r"(?:ending|ends)\s*(?:with|in)?\s*[:\-]?\s*(\d{3,8})(?!\d)|\.{3,}\s?(\d{3,8})(?!\d)", re.I)
+ACCOUNT_LABEL_RE = re.compile(r"(?:a/?c|acc(?:oun)?t)\b", re.I)
 LABELLED_RE = re.compile(
     r"(?:a/?c|acc(?:oun)?t)\.?\s*(?:no\.?|number|num|#)?\s*[:\-]?\s*((?:\d[\s\-]?){8,20})(?!\d)", re.I
 )
+MIN_VISIBLE = 4  # digits that must be visible AND agree before a hidden number counts as the same account
 
 
 @dataclass
@@ -35,26 +41,91 @@ def _digits(value: str | None) -> str:
     return re.sub(r"\D", "", value or "")
 
 
+def _same_number(a: str, b: str) -> bool:
+    """Banks and panels disagree about leading zeros: 00273501000021809 is 273501000021809."""
+    return bool(a) and a.lstrip("0") == b.lstrip("0")
+
+
+def masked_tokens(text: str) -> list[tuple[str, bool]]:
+    """Every partly hidden number in `text` as (token, labelled): the token with its groups joined
+    ("XXXXXXXX1809", "2735XXXXXXX1809"), and whether an account label stands right before it."""
+    out = []
+    for m in MASKED_TOKEN_RE.finditer(text or ""):
+        tok = re.sub(r"[ \-]", "", m.group(0))
+        hidden = sum(ch in MASK_CHARS for ch in tok)
+        if hidden < 2 or len(tok) - hidden < 3:
+            continue  # a plain number, or almost nothing visible
+        before = text[max(0, m.start() - 30) : m.start()]
+        out.append((tok, bool(ACCOUNT_LABEL_RE.search(before))))
+    return out
+
+
+def compare_masked(acct: str, token: str) -> tuple[str, int]:
+    """One partly hidden number against the payout's account. (verdict, visible digits that were compared)
+
+    Every VISIBLE digit is used: the leading digits, the trailing digits (last 4 / last 6 ...) and - when the
+    token is as long as the account, so the positions are known - the ones in between.
+    "agree" with >= MIN_VISIBLE digits is a match; "agree" with fewer is too little to decide; one wrong digit is
+    "differ"."""
+    is_mask = [ch in MASK_CHARS for ch in token]
+    lead = len(token) - len(token.lstrip("0123456789"))
+    tail = len(token) - len(token.rstrip("0123456789"))
+    visible = sum(not m for m in is_mask)
+    if len(token) == len(acct):  # positions are certain: compare digit by digit
+        ok = all(m or ch == acct[i] for i, (ch, m) in enumerate(zip(token, is_mask)))
+        return ("agree" if ok else "differ"), visible
+    head, end = token[:lead], (token[len(token) - tail :] if tail else "")
+    # The number of mask characters is not reliable (banks print "XXXX1809" for a 15-digit account) and leading
+    # zeros come and go: what can be compared is the visible START and the visible END.
+
+    def fits(number: str, start: str) -> bool:
+        return len(start) + len(end) <= len(number) and number.startswith(start) and number.endswith(end)
+
+    bare = acct.lstrip("0") if len(acct.lstrip("0")) >= 6 else acct
+    ok = fits(acct, head) or fits(bare, head) or fits(bare, head.lstrip("0"))
+    return ("agree" if ok else "differ"), len(head) + len(end)
+
+
 def compare_account(account: str, text: str) -> AccountCheck:
-    """Look for `account` (the payout's account number) in a statement's text."""
+    """Look for `account` (the payout's account number) in a statement's text.
+
+    match    - printed in full (any grouping, leading zeros aside), or partly hidden with every visible digit
+               agreeing and at least MIN_VISIBLE of them (last 4, last 6, first digits + last digits ...)
+    mismatch - the statement names ANOTHER account: a different full number, or a hidden account number whose
+               visible digits contradict the payout's
+    unknown  - nothing decisive is visible: the AI reads the header next, then a person"""
     acct = _digits(account)
     if len(acct) < 6 or not text:
         return AccountCheck(UNKNOWN, "none")
-    spaced = r"[\s\-]?".join(acct)  # "5012 3456 1231" and "5012-3456-1231" are the same number
-    if re.search(rf"(?<!\d){spaced}(?!\d)", text):
+    core = acct.lstrip("0")
+    if len(core) < 6:  # an all-zero / near-zero number: nothing is left to compare without its zeros
+        core = acct
+    spaced = r"[\s\-]?".join(core)  # "5012 3456 1231" and "5012-3456-1231" are the same number
+    if re.search(rf"(?<![1-9])0*{spaced}(?!\d)", text):
         return AccountCheck(MATCH, "full", acct)
-    masked = [(m.group(1), m.group(2)) for m in MASKED_RE.finditer(text)]
-    for head, tail in masked:
-        if acct.endswith(tail) and acct.startswith(head):
-            return AccountCheck(MATCH, "masked", f"{head}XXXX{tail}")
-    labelled = [_digits(m.group(1)) for m in LABELLED_RE.finditer(text)]
-    labelled = [x for x in labelled if x and x != acct]
-    if labelled:
-        return AccountCheck(MISMATCH, "labelled", labelled[0])
-    if masked:
-        head, tail = masked[0]
-        return AccountCheck(MISMATCH, "masked", f"{head}XXXX{tail}")
-    return AccountCheck(UNKNOWN, "none")
+
+    tokens = masked_tokens(text)
+    for m in ENDING_RE.finditer(text):  # "A/c ending 1809" is a hidden number too
+        digits = m.group(1) or m.group(2)
+        before = text[max(0, m.start() - 30) : m.start()]
+        tokens.append(("XXXX" + digits, bool(ACCOUNT_LABEL_RE.search(before)) or bool(m.group(1))))
+    weak, differing = None, []
+    for tok, labelled in tokens:
+        verdict, seen_digits = compare_masked(acct, tok)
+        if verdict == "agree" and seen_digits >= MIN_VISIBLE:
+            return AccountCheck(MATCH, "masked", tok)
+        if verdict == "agree":
+            weak = weak or tok
+        elif labelled:
+            differing.append(tok)  # only a number that IS the account can prove another account
+
+    labelled_full = [_digits(m.group(1)) for m in LABELLED_RE.finditer(text)]
+    labelled_full = [x for x in labelled_full if x and not _same_number(x, acct)]
+    if labelled_full:
+        return AccountCheck(MISMATCH, "labelled", labelled_full[0])
+    if differing and not weak:
+        return AccountCheck(MISMATCH, "masked", differing[0])
+    return AccountCheck(UNKNOWN, "none", weak)
 
 
 TABLE_HEAD_RE = re.compile(
