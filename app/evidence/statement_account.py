@@ -137,12 +137,38 @@ def compare_account(account: str, text: str, *, bare_full_numbers: bool = True) 
     return AccountCheck(UNKNOWN, "none", weak, weak=weak_digits if weak else 0)
 
 
+NAME_NOISE = {"MRS", "SHRI", "SMT", "KUMARI", "MISS", "MASTER"}
+
+
+def _same_word(part: str, word: str) -> bool:
+    """One part of a name against one word of the statement. Banks and panels spell Indian names differently:
+    RANGANATHA / RANGANATH, CHATTERJEE / CHATERJEE, MOHAMMED / MOHAMMAD - the same person."""
+    if part == word:
+        return True
+    short, long_ = sorted((part, word), key=len)
+    if len(short) >= 5 and long_.startswith(short) and len(long_) - len(short) <= 2:
+        return True  # a dropped or added ending
+    from difflib import SequenceMatcher
+
+    return len(short) >= 5 and SequenceMatcher(None, part, word).ratio() >= 0.84
+
+
 def same_person(payout_name: str | None, text: str | None) -> bool:
-    """Is the payout's beneficiary named in `text`? Every part of the name (3+ letters) must be there, in any
-    order ("CHATTERJEE SOURAV", "Mr. Sourav Kumar Chatterjee"); a one-word name needs that word."""
-    parts = [w for w in re.findall(r"[A-Za-z]{3,}", (payout_name or "").upper()) if w not in {"MRS", "SHRI", "SMT"}]
-    words = set(re.findall(r"[A-Za-z]{3,}", (text or "").upper()))
-    return bool(parts) and all(w in words for w in parts)
+    """Is the payout's beneficiary named in `text`? Every real part of the name (3+ letters - initials such as the
+    "C" of "RANGANATHA C" are not compared) must be there, in any order, spelling variants allowed
+    ("CHATTERJEE SOURAV", "Mr. Sourav Kumar Chatterjee", "RANGANATH C"). A name printed in pieces
+    ("RANGA NATHA") counts too."""
+    parts = [w for w in re.findall(r"[A-Za-z]{3,}", (payout_name or "").upper()) if w not in NAME_NOISE]
+    if not parts:
+        return False
+    upper = (text or "").upper()
+    words = set(re.findall(r"[A-Za-z]{3,}", upper))
+    glued = re.sub(r"[^A-Z]", "", upper)  # "RANGA NATHA" / "R A N G A ..." -> one string
+
+    def found(part: str) -> bool:
+        return any(_same_word(part, w) for w in words) or (len(part) >= 6 and part in glued)
+
+    return all(found(p) for p in parts)
 
 
 def second_proof(text: str, *, beneficiary: str | None, ifsc: str | None) -> str | None:
@@ -226,7 +252,9 @@ def compare_statement_text(account: str, text: str) -> AccountCheck:
     return AccountCheck(UNKNOWN, "none", best.seen or head.seen or anywhere.seen, note, best.weak)
 
 
-def with_proof(check: AccountCheck, proof_text: str, *, beneficiary: str | None, ifsc: str | None) -> AccountCheck:
+def with_proof(
+    check: AccountCheck, proof_text: str, *, beneficiary: str | None, ifsc: str | None, shown: str = ""
+) -> AccountCheck:
     """Too few visible digits agree (3): a match after all when the statement ALSO carries the payout's IFSC or
     the beneficiary's name."""
     if check.result != UNKNOWN or check.weak < MIN_VISIBLE_WITH_PROOF:
@@ -237,8 +265,10 @@ def with_proof(check: AccountCheck, proof_text: str, *, beneficiary: str | None,
     who = f" ({beneficiary})" if beneficiary else ""
     note = (
         f"only the last {check.weak} digits are visible and they agree, but neither the holder's name{who} nor the "
-        "IFSC of the payout is on the statement"
+        f"IFSC of the payout{f' ({ifsc})' if ifsc else ''} is on the statement"
     )
+    if shown:
+        note += f" - the statement shows: {shown}"
     return AccountCheck(UNKNOWN, check.how, check.seen, note, check.weak)
 
 
@@ -265,8 +295,12 @@ async def check_statement(
         )
     again = compare_account(account, f"Account No: {value}")
     if again.result == UNKNOWN and again.weak:
-        seen_by_ai = " ".join(str((read.get(k) or {}).get("value") or "") for k in ("holder_name", "ifsc"))
-        again = with_proof(again, f"{text}\n{seen_by_ai}", beneficiary=beneficiary, ifsc=ifsc)
+        ai_name = str((read.get("holder_name") or {}).get("value") or "").strip()
+        ai_ifsc = str((read.get("ifsc") or {}).get("value") or "").strip()
+        shown = ", ".join(
+            x for x in (f"name {ai_name!r}" if ai_name else "no name", f"IFSC {ai_ifsc}" if ai_ifsc else "no IFSC")
+        )
+        again = with_proof(again, f"{text}\n{ai_name}\n{ai_ifsc}", beneficiary=beneficiary, ifsc=ifsc, shown=shown)
     if again.result == MATCH or conf >= 0.6:
         note = again.note or (
             f"the AI read {mask_account(_digits(str(value)) or str(value))}: too few digits to decide"

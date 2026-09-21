@@ -251,3 +251,25 @@ def test_names_are_compared_part_by_part():
     assert same_person("SOURAV CHATTERJEE", "Account Name : Mr. Chatterjee Sourav Kumar")
     assert not same_person("SOURAV CHATTERJEE", "Account Name : SOURAV DAS")
     assert not same_person("", "SOURAV") and not same_person(None, "x")
+
+
+def test_spelling_variants_and_initials_are_the_same_person():
+    """Live 2026-09-21 (Canara, RANGANATHA C): the statement spells it differently / prints the initial apart."""
+    from app.evidence.statement_account import same_person
+
+    for printed in ("RANGANATHA C", "RANGANATH C", "C RANGANATHA", "Mr. C. Ranganatha", "RANGA NATHA C", "RANGANATHAA"):
+        assert same_person("RANGANATHA C", f"Customer Name : {printed}"), printed
+    assert same_person("MOHAMMED IRFAN", "Name: MOHAMMAD IRFAN") and same_person(
+        "SOURAV CHATTERJEE", "SOURAV CHATERJEE"
+    )
+    for other in ("RANGASWAMY C", "RAGHUNATH C", "RAMA C", "NATHA"):
+        assert not same_person("RANGANATHA C", f"Customer Name : {other}"), other
+    assert not same_person("SOURAV CHATTERJEE", "SOURAV DAS")
+
+
+async def test_the_alert_says_what_the_statement_showed(monkeypatch, tmp_path):
+    r = await _check(
+        monkeypatch, tmp_path, "", _FakeReader("XXXXXXXX835", name="RAHUL SHARMA", ifsc="HDFC0000001"),
+        beneficiary="SOURAV CHATTERJEE", ifsc="SBIN0001234",
+    )  # fmt: skip
+    assert "the statement shows: name 'RAHUL SHARMA', IFSC HDFC0000001" in r.note and "SBIN0001234" in r.note
