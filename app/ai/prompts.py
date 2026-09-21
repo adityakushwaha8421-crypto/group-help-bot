@@ -166,8 +166,13 @@ STATEMENT_ACCOUNT_SCHEMA = {
     "strict": True,
     "schema": {
         "type": "object",
-        "properties": {"account_number": FIELD_SCHEMA, "holder_name": FIELD_SCHEMA, "ifsc": FIELD_SCHEMA},
-        "required": ["account_number", "holder_name", "ifsc"],
+        "properties": {
+            "account_number": FIELD_SCHEMA,
+            "holder_name": FIELD_SCHEMA,
+            "ifsc": FIELD_SCHEMA,
+            "bank_name": FIELD_SCHEMA,
+        },
+        "required": ["account_number", "holder_name", "ifsc", "bank_name"],
         "additionalProperties": False,
     },
 }
@@ -184,4 +189,6 @@ Rules:
 - If the header shows no account number, return value=null with confidence=0.
 - holder_name: the ACCOUNT HOLDER's name exactly as printed in the header (not the bank, not a branch manager,
   never a name from a transaction row). ifsc: the branch IFSC printed in the header. null when not printed.
+- bank_name: the bank that issued the statement, from its logo / letterhead / header ("Canara Bank",
+  "State Bank of India"); null when the document does not show which bank it is.
 evidence_text = the header line the value came from."""

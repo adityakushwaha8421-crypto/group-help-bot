@@ -18,15 +18,16 @@ MASK_CHARS = "Xx*\u2022#"
 # A partly hidden number: digits and mask characters, possibly printed in groups ("XXXX XXXX 1809", "2735-XXXX-1809")
 MASKED_TOKEN_RE = re.compile(rf"(?<![0-9A-Za-z])(?:[0-9{MASK_CHARS}][ \-]?){{5,27}}[0-9{MASK_CHARS}]")
 # "A/c ending 1809", "account ending with 021809", "A/c ....1809"
-ENDING_RE = re.compile(r"(?:ending|ends)\s*(?:with|in)?\s*[:\-]?\s*(\d{3,8})(?!\d)|\.{3,}\s?(\d{3,8})(?!\d)", re.I)
+ENDING_RE = re.compile(r"(?:ending|ends)\s*(?:with|in)?\s*[:\-]?\s*(\d{2,8})(?!\d)|\.{3,}\s?(\d{2,8})(?!\d)", re.I)
 ACCOUNT_LABEL_RE = re.compile(r"(?:a/?c|acc(?:oun)?t)\b", re.I)
 LABELLED_RE = re.compile(
     r"(?:a/?c|acc(?:oun)?t)\.?\s*(?:no\.?|number|num|#)?\s*[:\-]?\s*((?:\d[\s\-]?){8,20})(?!\d)", re.I
 )
 MIN_VISIBLE = 4  # digits that must be visible AND agree before a hidden number counts as the same account
-# SBI hides all but the last THREE digits ("XXXXXXXX835"). Three agreeing digits alone are a 1-in-1000 coincidence,
-# so they count only TOGETHER with a second proof from the payout: the holder's name or the branch IFSC.
-MIN_VISIBLE_WITH_PROOF = 3
+# SBI / Canara hide all but the last two or three digits ("XXXXXXXX835"). So few digits alone are a coincidence
+# waiting to happen, so they count only TOGETHER with a second proof from the payout: the statement is from the
+# SAME BANK (its name, or its IFSC prefix), or carries the branch IFSC or the holder's name.
+MIN_VISIBLE_WITH_PROOF = 2  # operator's rule 2026-09-21: the last 2-3 digits + the bank are enough
 
 
 @dataclass
@@ -58,7 +59,7 @@ def masked_tokens(text: str) -> list[tuple[str, bool]]:
     for m in MASKED_TOKEN_RE.finditer(text or ""):
         tok = re.sub(r"[ \-]", "", m.group(0))
         hidden = sum(ch in MASK_CHARS for ch in tok)
-        if hidden < 2 or len(tok) - hidden < 3:
+        if hidden < 2 or len(tok) - hidden < 2:
             continue  # a plain number, or almost nothing visible
         before = text[max(0, m.start() - 30) : m.start()]
         out.append((tok, bool(ACCOUNT_LABEL_RE.search(before))))
@@ -123,7 +124,8 @@ def compare_account(account: str, text: str, *, bare_full_numbers: bool = True) 
         if verdict == "agree" and seen_digits >= MIN_VISIBLE:
             return AccountCheck(MATCH, "masked", tok)
         if verdict == "agree":
-            if weak is None or seen_digits > weak_digits:
+            # two or three agreeing digits mean something only on a number that IS the account
+            if labelled and (weak is None or seen_digits > weak_digits):
                 weak, weak_digits = tok, seen_digits
         elif labelled:
             differing.append(tok)  # only a number that IS the account can prove another account
@@ -171,10 +173,47 @@ def same_person(payout_name: str | None, text: str | None) -> bool:
     return all(found(p) for p in parts)
 
 
-def second_proof(text: str, *, beneficiary: str | None, ifsc: str | None) -> str | None:
-    """What else in the statement ties it to the payout: the branch IFSC, or the holder's name."""
+BANK_GENERIC = {"BANK", "THE", "LTD", "LIMITED", "AND", "INDIA", "NATIONAL", "STATE", "UNION", "CENTRAL", "INDIAN"}
+BANK_SHORT = {
+    "STATEBANKOFINDIA": ["SBI"],
+    "PUNJABNATIONALBANK": ["PNB"],
+    "BANKOFBARODA": ["BOB"],
+    "BANKOFINDIA": ["BOI"],
+    "UNIONBANKOFINDIA": ["UBI"],
+    "INDIANOVERSEASBANK": ["IOB"],
+    "KOTAKMAHINDRABANK": ["KOTAK"],
+    "HDFCBANK": ["HDFC"],
+    "ICICIBANK": ["ICICI"],
+    "AXISBANK": ["AXIS"],
+    "IDFCFIRSTBANK": ["IDFC"],
+    "BANKOFMAHARASHTRA": ["MAHABANK"],
+}
+
+
+def same_bank(payout_bank: str | None, ifsc: str | None, text: str | None) -> bool:
+    """Is the statement from the bank the withdrawal was paid to? By the bank's name as printed (in full, by its
+    distinctive word - CANARA, FEDERAL, KOTAK - or its usual short form), or by an IFSC of that bank."""
+    upper = (text or "").upper()
+    glued = re.sub(r"[^A-Z]", "", upper)
+    words = set(re.findall(r"[A-Z]{3,}", upper))
+    name = re.sub(r"[^A-Z ]", " ", (payout_bank or "").upper())
+    full = name.replace(" ", "")
+    if len(full) >= 6 and full in glued:
+        return True
+    if any(short in words for short in BANK_SHORT.get(full, [])):
+        return True
+    if any(len(w) >= 4 and w not in BANK_GENERIC and w != "BANK" and w in words for w in name.split()):
+        return True  # the distinctive word of the name
+    prefix = (ifsc or "").strip().upper()[:4]
+    return len(prefix) == 4 and bool(re.search(rf"\b{prefix}0[A-Z0-9]{{6}}\b", upper))
+
+
+def second_proof(text: str, *, beneficiary: str | None, ifsc: str | None, bank: str | None = None) -> str | None:
+    """What else in the statement ties it to the payout: the branch IFSC, the holder's name, or the same bank."""
     if ifsc and re.search(rf"\b{re.escape(ifsc.strip())}\b", text or "", re.I):
         return f"IFSC {ifsc.strip().upper()}"
+    if same_bank(bank, ifsc, text):
+        return f"the bank ({bank or (ifsc or '')[:4]})"
     if same_person(beneficiary, text):
         return "the account holder's name"
     return None
@@ -253,19 +292,25 @@ def compare_statement_text(account: str, text: str) -> AccountCheck:
 
 
 def with_proof(
-    check: AccountCheck, proof_text: str, *, beneficiary: str | None, ifsc: str | None, shown: str = ""
+    check: AccountCheck,
+    proof_text: str,
+    *,
+    beneficiary: str | None,
+    ifsc: str | None,
+    bank: str | None = None,
+    shown: str = "",
 ) -> AccountCheck:
     """Too few visible digits agree (3): a match after all when the statement ALSO carries the payout's IFSC or
     the beneficiary's name."""
     if check.result != UNKNOWN or check.weak < MIN_VISIBLE_WITH_PROOF:
         return check
-    proof = second_proof(proof_text, beneficiary=beneficiary, ifsc=ifsc)
+    proof = second_proof(proof_text, beneficiary=beneficiary, ifsc=ifsc, bank=bank)
     if proof:
         return AccountCheck(MATCH, "masked+proof", check.seen, f"last {check.weak} digits agree, and so does {proof}")
     who = f" ({beneficiary})" if beneficiary else ""
     note = (
-        f"only the last {check.weak} digits are visible and they agree, but neither the holder's name{who} nor the "
-        f"IFSC of the payout{f' ({ifsc})' if ifsc else ''} is on the statement"
+        f"only the last {check.weak} digits are visible and they agree, but the statement shows neither the bank"
+        f"{f' ({bank})' if bank else ''}, nor the holder's name{who}, nor the IFSC{f' ({ifsc})' if ifsc else ''}"
     )
     if shown:
         note += f" - the statement shows: {shown}"
@@ -273,12 +318,12 @@ def with_proof(
 
 
 async def check_statement(
-    path: Path, account: str, *, beneficiary: str | None = None, ifsc: str | None = None
+    path: Path, account: str, *, beneficiary: str | None = None, ifsc: str | None = None, bank: str | None = None
 ) -> AccountCheck:
     """`path` is a readable (already decrypted) statement PDF. `beneficiary` / `ifsc`: the payout's, used as the
     second proof when the statement hides all but three digits of the account."""
     text = pdf_text(path, max_pages=3)
-    check = with_proof(compare_statement_text(account, text), text, beneficiary=beneficiary, ifsc=ifsc)
+    check = with_proof(compare_statement_text(account, text), text, beneficiary=beneficiary, ifsc=ifsc, bank=bank)
     if check.result != UNKNOWN:
         return check
     from app.ai.analyzer import get_analyzer
@@ -297,10 +342,22 @@ async def check_statement(
     if again.result == UNKNOWN and again.weak:
         ai_name = str((read.get("holder_name") or {}).get("value") or "").strip()
         ai_ifsc = str((read.get("ifsc") or {}).get("value") or "").strip()
+        ai_bank = str((read.get("bank_name") or {}).get("value") or "").strip()
         shown = ", ".join(
-            x for x in (f"name {ai_name!r}" if ai_name else "no name", f"IFSC {ai_ifsc}" if ai_ifsc else "no IFSC")
+            (
+                f"bank {ai_bank!r}" if ai_bank else "no bank name",
+                f"name {ai_name!r}" if ai_name else "no name",
+                f"IFSC {ai_ifsc}" if ai_ifsc else "no IFSC",
+            )
         )
-        again = with_proof(again, f"{text}\n{ai_name}\n{ai_ifsc}", beneficiary=beneficiary, ifsc=ifsc, shown=shown)
+        again = with_proof(
+            again,
+            f"{text}\n{ai_bank}\n{ai_name}\n{ai_ifsc}",
+            beneficiary=beneficiary,
+            ifsc=ifsc,
+            bank=bank,
+            shown=shown,
+        )
     if again.result == MATCH or conf >= 0.6:
         note = again.note or (
             f"the AI read {mask_account(_digits(str(value)) or str(value))}: too few digits to decide"

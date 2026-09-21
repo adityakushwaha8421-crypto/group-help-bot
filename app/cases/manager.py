@@ -102,7 +102,9 @@ async def _check_statement(path, payout, password: str | None):
                 "none",
                 note="the statement is password-protected and could not be opened with the password given",
             )
-    return await check_statement(Path(view), account, beneficiary=payout.beneficiary, ifsc=payout.ifsc)
+    return await check_statement(
+        Path(view), account, beneficiary=payout.beneficiary, ifsc=payout.ifsc, bank=payout.bank
+    )
 
 
 def _get_order_search() -> OrderSearch:

@@ -272,4 +272,68 @@ async def test_the_alert_says_what_the_statement_showed(monkeypatch, tmp_path):
         monkeypatch, tmp_path, "", _FakeReader("XXXXXXXX835", name="RAHUL SHARMA", ifsc="HDFC0000001"),
         beneficiary="SOURAV CHATTERJEE", ifsc="SBIN0001234",
     )  # fmt: skip
-    assert "the statement shows: name 'RAHUL SHARMA', IFSC HDFC0000001" in r.note and "SBIN0001234" in r.note
+    assert "the statement shows: no bank name, name 'RAHUL SHARMA', IFSC HDFC0000001" in r.note
+    assert "SBIN0001234" in r.note
+
+
+# ------------------------------------------------------------------ last 2-3 digits + the SAME BANK (operator's rule)
+class _BankReader(_FakeReader):
+    def __init__(self, account, bank=None, **kw):
+        super().__init__(account, **kw)
+        self.payload["bank_name"] = {"value": bank, "confidence": 0.9, "evidence_text": None}
+
+
+CANARA = dict(beneficiary="RANGANATHA C", ifsc="CNRB0000497", bank="Canara Bank")
+
+
+async def _check_canara(monkeypatch, tmp_path, text, reader):
+    from app.ai.analyzer import set_analyzer
+    from app.evidence import statement_account as sa
+
+    monkeypatch.setattr(sa, "pdf_text", lambda path, max_pages=1: text)
+    set_analyzer(reader)
+    try:
+        return await sa.check_statement(tmp_path / "s.pdf", "04972010000136", **CANARA)
+    finally:
+        set_analyzer(None)
+
+
+async def test_three_digits_and_the_bank_are_enough(monkeypatch, tmp_path):
+    """Live 2026-09-21 (Canara a/c ...0136): a scanned statement - no name, no IFSC readable. The operator's rule:
+    verify the last 2-3 digits of the account and the bank, nothing else."""
+    r = await _check_canara(monkeypatch, tmp_path, "", _BankReader("XXXXXXXXXXX136", bank="Canara Bank"))
+    assert r.result == MATCH and "last 3 digits agree" in r.note and "the bank (Canara Bank)" in r.note
+
+
+async def test_two_digits_and_the_bank_are_enough_too(monkeypatch, tmp_path):
+    r = await _check_canara(monkeypatch, tmp_path, "CANARA BANK\nA/c No : XXXXXXXXXXXX36\n", _BankReader(None))
+    assert r.result == MATCH and "last 2 digits agree" in r.note
+
+
+async def test_the_digits_without_the_bank_are_not_enough(monkeypatch, tmp_path):
+    r = await _check_canara(monkeypatch, tmp_path, "", _BankReader("XXXXXXXXXXX136", bank="HDFC Bank"))
+    assert r.result == UNKNOWN and "neither the bank (Canara Bank)" in r.note and "bank 'HDFC Bank'" in r.note
+
+
+async def test_wrong_digits_are_another_account_even_at_the_same_bank(monkeypatch, tmp_path):
+    r = await _check_canara(monkeypatch, tmp_path, "", _BankReader("XXXXXXXXXXX137", bank="Canara Bank"))
+    assert r.result == MISMATCH
+
+
+def test_the_bank_is_recognised_as_printed():
+    from app.evidence.statement_account import same_bank
+
+    assert same_bank("Canara Bank", None, "CANARA BANK  e-Passbook")
+    assert same_bank("Canara Bank", "CNRB0000497", "Branch IFSC : CNRB0001234")  # any IFSC of that bank
+    assert same_bank("State Bank of India", None, "SBI YONO - Account Statement")
+    assert same_bank("Kotak Mahindra Bank", None, "kotak 811 statement")
+    assert same_bank("State Bank of India", None, "STATE BANK OF INDIA")
+    assert not same_bank("Canara Bank", "CNRB0000497", "HDFC BANK LTD  IFSC HDFC0000123")
+    assert not same_bank("State Bank of India", "SBIN0001234", "CENTRAL BANK OF INDIA")
+    assert not same_bank("Bank of India", None, "UNION BANK")
+    assert not same_bank(None, None, "CANARA BANK")
+
+
+def test_a_few_agreeing_digits_on_a_number_that_is_not_the_account_mean_nothing():
+    r = compare_account("04972010000136", "Name: A B\nMobile: XXXXXXXX36")
+    assert r.result == UNKNOWN and r.weak == 0
