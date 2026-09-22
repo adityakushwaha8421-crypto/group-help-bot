@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.utils.timeutil import parse_datetime_loose, utcnow
@@ -135,12 +135,16 @@ class Field:
     value: Any = None
     confidence: float = 0.0
     source: str = "none"
+    precision: str = "datetime"  # payment_time only: "date" when the screenshot shows the day but no time
 
     def as_dict(self) -> dict:
         v = self.value
         if isinstance(v, datetime):
             v = v.isoformat()
-        return {"value": v, "confidence": round(float(self.confidence), 3), "source": self.source}
+        d = {"value": v, "confidence": round(float(self.confidence), 3), "source": self.source}
+        if self.precision != "datetime":
+            d["precision"] = self.precision
+        return d
 
 
 def normalize_mobile(value: Any) -> str | None:
@@ -230,7 +234,11 @@ class Extraction:
             v = f.get("value")
             if k == "payment_time" and isinstance(v, str):
                 v = parse_datetime_loose(v)
-            setattr(e, k, Field(v, float(f.get("confidence") or 0), f.get("source") or "none"))
+            setattr(
+                e,
+                k,
+                Field(v, float(f.get("confidence") or 0), f.get("source") or "none", f.get("precision") or "datetime"),
+            )
         return e
 
 
@@ -389,6 +397,9 @@ def parse_datetime_noyear(text: str | None, now=None):
     return parse_datetime_loose(when.strftime("%Y-%m-%d %H:%M:%S"))
 
 
+DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:[T ]00:00(?::00)?)?$")
+
+
 def fix_guessed_year(when, printed: str | None, now=None):
     """`when` came from the model; `printed` is the text on the screenshot. When that text shows NO year, the year
     in `when` is a guess: move it to the latest year that does not put the payment in the future."""
@@ -424,6 +435,18 @@ def extraction_from_ai(payload: dict, source: str) -> Extraction:
         conf = float(f.get("confidence") or 0)
         if k == "amount":
             v = normalize_amount(v)
+        elif k == "payment_time" and DATE_ONLY_RE.match(str(v).strip()):
+            # The screenshot shows the DAY but no time. The day is what matters: the payment is placed at the end
+            # of it so every order created that day is "before" it, and the matcher is told the time is unknown.
+            day = parse_datetime_loose(str(v).strip()[:10])
+            day = fix_guessed_year(day, f.get("evidence_text"))
+            if day is None:
+                continue
+            from zoneinfo import ZoneInfo
+
+            local = day.astimezone(ZoneInfo("Asia/Kolkata")).replace(hour=23, minute=59, second=59)
+            e.payment_time = Field(local.astimezone(timezone.utc), conf, source, "date")
+            continue
         elif k == "payment_time":
             # The screenshot printed NO year ("20 Sep, 11:34 AM"): the year in the model's value is its own guess,
             # and a model that was never told today's date guesses an old one - then Illunise is searched on the

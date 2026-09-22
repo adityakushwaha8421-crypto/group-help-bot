@@ -70,7 +70,7 @@ def row_to_candidate(
         betex_order_id=betex.upper() if betex else None,
         registration_number=get("registration_number"),
         amount=normalize_amount(get("amount")),
-        order_time=parse_datetime_loose(get("created_at") or get("paid_at"), tz),
+        order_time=parse_datetime_loose(get("created_at") or get("paid_at"), tz) or id_time(get("illunise_order_id")),
         status=get("status"),
         utr=get("utr"),
         upi_id=get("upi_id"),
@@ -81,6 +81,18 @@ def row_to_candidate(
 
 
 _EMPTY = {"", "—", "-", "–", "n/a", "na", "null", "none"}
+
+
+def id_time(order_id: str | None):
+    """The creation time carried inside an ILLUN id: "ILLUN-178930744386451" starts with the creation unix time
+    in milliseconds (1789307443864 = 13 Sep 2026 19:20 IST) - a fallback when the list shows no date."""
+    from datetime import datetime, timezone
+
+    m = re.search(r"(\d{13})", order_id or "")
+    if not m:
+        return None
+    when = datetime.fromtimestamp(int(m.group(1)) / 1000, tz=timezone.utc)
+    return when if 2020 <= when.year <= 2100 else None
 
 
 def clean_cell(value: str | None) -> str | None:
@@ -291,6 +303,7 @@ async def enrich_candidates(
     evidence_time=None,
     max_pages: int | None = None,
     query: str = "",
+    window_minutes: int | None = None,
 ) -> list[Candidate]:
     """Read the View page of the most promising candidates: amount matches (within the padded-amount tolerance)
     first, closest to the payment time next, newest otherwise."""
@@ -313,7 +326,9 @@ async def enrich_candidates(
         except Exception as exc:  # noqa: BLE001
             log.warning("view page read failed", order_id=oid, error=str(exc)[:120])
             continue
-        if is_clear_match(c, query, evidence_time, evidence_amount, tol, s.order_search_window_minutes):
+        if is_clear_match(
+            c, query, evidence_time, evidence_amount, tol, window_minutes or s.order_search_window_minutes
+        ):
             log.info("clear match; no further orders read", order_id=oid, read=n, of=len(ordered))
             break
     return candidates
@@ -336,15 +351,22 @@ async def _read_table(browser: AdminBrowser) -> tuple[list[str], list[list[str]]
 
 
 async def search_orders(
-    browser: AdminBrowser, query: str, *, evidence_amount: float | None = None, evidence_time=None, enrich: bool = True
+    browser: AdminBrowser,
+    query: str,
+    *,
+    evidence_amount: float | None = None,
+    evidence_time=None,
+    enrich: bool = True,
+    window_minutes: int | None = None,
 ) -> list[Candidate]:
-    """Search the orders page and return ALL candidates (all pages up to max_pages), enriched from their View pages."""
+    """Search the orders page and return ALL candidates (all pages up to max_pages), enriched from their View pages.
+    `window_minutes`: how far before the payment an order may be created (default ORDER_SEARCH_WINDOW_MINUTES;
+    a whole day when the screenshot shows the date but no time)."""
     s = get_settings()
+    window = window_minutes or s.order_search_window_minutes
     sel = browser.selectors["orders"]
     page = browser.page
-    dates = (
-        search_dates(evidence_time, s.order_search_window_minutes, s.timezone) if sel.get("date_query_param") else None
-    )
+    dates = search_dates(evidence_time, window, s.timezone) if sel.get("date_query_param") else None
     by_url = bool(sel.get("search_query_param"))
     if by_url:
         await page.goto(search_url(sel, browser.url(sel["path"]), query, dates), wait_until="domcontentloaded")
@@ -391,7 +413,7 @@ async def search_orders(
     candidates = narrow_candidates(
         candidates,
         evidence_time,
-        window_minutes=s.order_search_window_minutes,
+        window_minutes=window,
         keep_closest=s.order_search_keep_closest,
         dates=dates,
         tz=s.timezone,
@@ -401,19 +423,28 @@ async def search_orders(
     # The View page (enrichment below) supplies the mobile; the matcher then verifies it exactly.
     if enrich:
         candidates = await enrich_candidates(
-            browser, candidates, evidence_amount=evidence_amount, evidence_time=evidence_time, query=query
+            browser,
+            candidates,
+            evidence_amount=evidence_amount,
+            evidence_time=evidence_time,
+            query=query,
+            window_minutes=window,
         )
     return candidates
 
 
-async def find_candidates(query: str, evidence_amount: float | None = None, evidence_time=None) -> list[Candidate]:
+async def find_candidates(
+    query: str, evidence_amount: float | None = None, evidence_time=None, *, window_minutes: int | None = None
+) -> list[Candidate]:
     """Search with a tab borrowed from the shared browser pool (see app.admin.pool): no browser launch, no fresh
     login per search, and a cap on how many searches run at the same time."""
     from app.admin.pool import get_pool
 
     async with get_pool().page() as browser:
         await ensure_logged_in(browser)
-        return await search_orders(browser, query, evidence_amount=evidence_amount, evidence_time=evidence_time)
+        return await search_orders(
+            browser, query, evidence_amount=evidence_amount, evidence_time=evidence_time, window_minutes=window_minutes
+        )
 
 
 def main() -> None:

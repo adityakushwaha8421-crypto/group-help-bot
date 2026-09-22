@@ -179,7 +179,8 @@ async def test_manual_review_only_after_every_candidate_was_asked(
     assert await tasks.pi_check_timeout_job({}, case_id, B) == "ambiguous"
     alert = [t for _, t in fake_bot.sent if "MANUAL REVIEW" in t][-1]
     assert "all 2 close order(s) checked" in alert and "2 got no answer from Betix" in alert
-    assert f"{A}: (no answer from Betix)" in alert and f"{B}: (no answer from Betix)" in alert
+    assert f"{A} · created 10 Sep 19:30: (no answer from Betix)" in alert  # the CREATED time, for the operator
+    assert f"{B} · created 10 Sep 19:30: (no answer from Betix)" in alert
 
 
 async def test_an_old_timeout_after_moving_on_is_ignored(

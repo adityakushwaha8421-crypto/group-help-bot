@@ -611,8 +611,13 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
     await session.commit()  # unlocked while the browser works: the slowest stage must not block anyone else
     search_error: tuple[str, str | None] | None = None
     candidates: list[Candidate] = []
+    # The screenshot shows the payment's day but no time: the whole day is searched and every order created
+    # that day is "before" the payment (the matcher is told so through the time rule).
+    date_only = Extraction.from_dict(case.extraction).payment_time.precision == "date"
+    search_kw = {"window_minutes": 24 * 60} if date_only else {}
+    time_rule = {**s.time_rule, "date_only": True, "tz": s.timezone} if date_only else s.time_rule
     try:
-        candidates = await _get_order_search()(case.mobile, case.amount, case.payment_time)
+        candidates = await _get_order_search()(case.mobile, case.amount, case.payment_time, **search_kw)
     except ManualAuthRequired as exc:
         search_error = (f"Admin login needs manual authentication: {exc}", "Run: python -m app.admin.login --manual")
     except LoginFailed as exc:
@@ -641,7 +646,7 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
             ambiguity_gap=s.order_match_ambiguity_gap,
             time_window_minutes=s.payment_time_window_minutes,
             amount_tolerance=s.order_amount_tolerance,
-            time_rule=s.time_rule,
+            time_rule=time_rule,
             gateway_name=s.betix_gateway_name,
             compatible_statuses=s.compatible_statuses,
             expired_statuses=s.expired_statuses,
@@ -680,7 +685,7 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
         for how, q in queries:
             fallbacks_tried.append(how)
             try:
-                extra = await _get_order_search()(q, case.amount, case.payment_time)
+                extra = await _get_order_search()(q, case.amount, case.payment_time, **search_kw)
             except Exception as exc:  # noqa: BLE001
                 log.warning("fallback search failed", case_id=case.case_id, by=how, error=str(exc)[:160])
                 continue
@@ -714,7 +719,7 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
         ambiguity_gap=s.order_match_ambiguity_gap,
         time_window_minutes=s.payment_time_window_minutes,
         amount_tolerance=s.order_amount_tolerance,
-        time_rule=s.time_rule,
+        time_rule=time_rule,
         gateway_name=s.betix_gateway_name,
         compatible_statuses=s.compatible_statuses,
         expired_statuses=s.expired_statuses,
@@ -793,10 +798,7 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
             started, note = await start_pi_check(session, case, close, result.reason)
             if started:
                 return "checking_upi"
-        lines = [
-            f"- {sc.candidate.betex_order_id or sc.candidate.illunise_order_id}: score {sc.score:.2f}"
-            for sc in result.scored[:5]
-        ]
+        lines = [candidate_line(sc, s.timezone) for sc in result.scored[:5]]
         await transition(session, case, CaseStatus.ORDER_MATCH_AMBIGUOUS, reason=result.reason)
         await alert_ambiguous(
             session,
@@ -993,6 +995,17 @@ def doubt_candidates(result: MatchResult) -> list:
     return sorted(fit, key=lambda sc: (lead(sc), -sc.score))[: s.pi_check_max_orders]
 
 
+def candidate_line(sc, tz: str) -> str:
+    """One order for an operator message: id, score, amount, CREATED time (never the panel's "updated" date),
+    status. Live 2026-09-22: orders created 13 Sep looked like 18 Sep to the operator - the panel's Updated date."""
+    c = sc.candidate
+    when = fmt_local(c.order_time, tz, "%d %b %H:%M") if c.order_time else "?"
+    return (
+        f"- {c.betex_order_id or c.illunise_order_id}: score {sc.score:.2f} · ₹{(c.amount or 0):,.2f} · "
+        f"created {when} · {c.status or '-'}"
+    )
+
+
 def close_candidates(result: MatchResult) -> list:
     """The orders the matcher could not separate, CLOSEST TO THE PAYMENT FIRST: within the ambiguity gap of the best, and each one
     already a match on AMOUNT and on TIME (created before the payment, inside the window). The correct order =
@@ -1150,16 +1163,22 @@ async def resolve_pi_check(session: AsyncSession, case_id: str, *, timed_out: st
     current = asked[-1]
     shot, _ = await read_screenshot_upi(session, case)
 
+    rows = {r.betex_order_id: r for r in await list_candidates(session, case.case_id)}
+
     def checked_lines() -> list[str]:
         out = []
         for oid in asked:
+            row = rows.get(oid)
+            when = (
+                f" · created {fmt_local(row.order_time, s.timezone, '%d %b %H:%M')}" if row and row.order_time else ""
+            )
             if oid in answers:
                 out.append(
-                    f"- {oid}: Order's UPI {answers[oid] or '-'} - "
+                    f"- {oid}{when}: Order's UPI {answers[oid] or '-'} - "
                     f"{upi_ending_match(shot, answers[oid], min_chars=s.upi_ending_min_chars)[1]}"
                 )
             else:
-                out.append(f"- {oid}: (no answer from Betix)")
+                out.append(f"- {oid}{when}: (no answer from Betix)")
         return out
 
     unanswered = current not in answers

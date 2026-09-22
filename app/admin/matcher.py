@@ -78,6 +78,15 @@ def _time_score(
     from app.utils.timeutil import ensure_utc
 
     lead = (ensure_utc(payment_time) - ensure_utc(order_created)).total_seconds() / 60.0
+    if rule.get("date_only"):
+        # The screenshot shows the payment's DAY but no time: every order created that day fits; no other day does
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(rule.get("tz") or "Asia/Kolkata")
+        same_day = ensure_utc(payment_time).astimezone(tz).date() == ensure_utc(order_created).astimezone(tz).date()
+        if same_day:
+            return 1.0, lead, "created on the payment day (the screenshot shows no time)"
+        return 0.0, lead, "created on another day than the payment"
     lo, hi, tol = rule["min_before"], rule["max_before"], rule["tolerance"]
     if lead < lo:
         return 0.0, lead, "created AFTER the payment: not this order"
