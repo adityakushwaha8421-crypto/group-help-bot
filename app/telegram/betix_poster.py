@@ -142,9 +142,10 @@ class BetixPoster:
 
     # ---- high level ----
     async def post_case(self, session: AsyncSession, case: Case, evidence: list[Evidence]) -> None:
-        """POLICY: the Betix group receives exactly ONE message per case — the payment screenshot with the plain
-        Illunise order id as its caption. No details, no statement, no video, no URL, no Betix-side id.
-        That message is the anchor every follow-up replies to. Idempotent."""
+        """POLICY: the Betix group receives the payment screenshot with the plain Illunise order id as its caption.
+        No details, no statement, no video, no URL, no Betix-side id. That message is the anchor every follow-up
+        replies to. A payment shown on SEVERAL screenshots (the receipt and its details page) is sent whole: the
+        other screenshots follow as replies to the first, each with the same order id. Idempotent."""
         self.bind(case)
         if not case.betex_pay_order_id:
             raise BetixPostError("case has no Illunise order id; refusing to post")
@@ -168,6 +169,23 @@ class BetixPoster:
             case.betix_chat_id = self.chat if isinstance(self.chat, int) else None
             await audit(
                 session, "BETIX_EVIDENCE_POSTED", case_id=case.case_id, result="screenshot", details={"message_id": mid}
+            )
+            await session.commit()
+        root_id = root.message_id if hasattr(root, "message_id") else case.betix_root_message_id
+        for shot in shots[1:]:  # the same payment's other screens, under the first one, same order id
+            if shot.posted_to_betix_message_id:
+                continue
+            mid = await self._send_media(shot, caption, reply_to=root_id)
+            await self._record(
+                session, case, mid, "evidence_screenshot_extra", caption, reply_to=root_id, has_media=True
+            )
+            shot.posted_to_betix_message_id = mid
+            await audit(
+                session,
+                "BETIX_EVIDENCE_POSTED",
+                case_id=case.case_id,
+                result="screenshot_extra",
+                details={"message_id": mid, "reply_to": root_id},
             )
             await session.commit()
         case.betix_posted_at = case.betix_posted_at or utcnow()

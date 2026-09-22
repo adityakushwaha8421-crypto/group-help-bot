@@ -122,3 +122,29 @@ async def test_two_different_payments_sent_together_are_split(db, fake_bot, fake
 async def test_a_screenshot_sent_later_is_still_a_new_case(db, fake_bot, fake_ai, order_search, no_download):
     a, b = await _two_screens(db, second_delay_seconds=120)
     assert a != b
+
+
+async def test_both_screens_go_to_betix_under_the_same_order_id(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    fake_ai.screenshots = [dict(RECEIPT), dict(DETAILS)]
+    a, _ = await _two_screens(db)
+    order_search(ORDER)
+    async with db.session_scope() as s:
+        assert await manager.process_case(s, a, force=True) == "ready"
+        assert await manager.post_case_to_betix(s, a, fake_poster) == "posted"
+        c = await get_case(s, a)
+        shots = [e for e in await list_evidence(s, a) if e.type == "payment_screenshot"]
+        assert all(e.posted_to_betix_message_id for e in shots) and len(shots) == 2
+        root = c.betix_root_message_id
+    order = GOOD[0]["betex_order_id"]
+    assert [m for m in fake_poster.media if m[0] == "payment_screenshot"] == [("payment_screenshot", order)] * 2
+    assert fake_poster.media_replies[:2] == [
+        ("payment_screenshot", None),
+        ("payment_screenshot", root),
+    ]  # 2nd under 1st
+    # posting again sends nothing more
+    async with db.session_scope() as s:
+        c = await get_case(s, a)
+        await fake_poster.post_case(s, c, await list_evidence(s, a))
+    assert len([m for m in fake_poster.media if m[0] == "payment_screenshot"]) == 2
