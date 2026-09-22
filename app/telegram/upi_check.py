@@ -11,6 +11,8 @@ import re
 ORDER_UPI = re.compile(r"Order'?s\s+UPI\s*:[ \t]*([^\s<>\[\]]+@[A-Za-z0-9.\-_]+)", re.I)
 # Leading mask on a screenshot UPI: "XXXXXX1014-4", "******4913", "••4913".
 MASK = re.compile(r"^(?:[xX]{2,}|[*•·]+)")
+# A mask anywhere: "boim-0741XXXX7519", "mo**42@ptyes" - the visible pieces around it are what can be compared
+ANY_MASK = re.compile(r"(?:[xX]{2,}|[*•·]+)")
 
 
 MERCHANT_ORDER = re.compile(r"MerchantOrderNo\s*:\s*([A-Za-z]+-\d+)", re.I)
@@ -63,11 +65,17 @@ def upi_ending_match(screenshot_upi: str | None, order_upi: str | None, *, min_c
     (la, ha), (lb, hb) = a, b
     if ha != hb:
         return False, f"handle differs: @{ha} on the screenshot, @{hb} on the order"
-    la = MASK.sub("", la)
     if la == lb:
         return True, "same UPI"
-    if len(la) < min_chars:
-        return False, f"only {len(la)} visible character(s) on the screenshot ({la or '-'}@{ha})"
-    if lb.endswith(la):
-        return True, f"the order's UPI ends with {la}@{ha}"
-    return False, f"ending differs: {la}@{ha} on the screenshot, {lb}@{hb} on the order"
+    parts = [p for p in ANY_MASK.split(la) if p]  # the visible pieces around the hidden characters
+    head = parts[0] if parts and la.startswith(parts[0]) else ""
+    tail = parts[-1] if parts and la.endswith(parts[-1]) else ""
+    if len(parts) == 1 and not ANY_MASK.search(la):
+        head, tail = "", la  # a plain shortened form ("4913") is an ending
+    visible = len(head) + len(tail)
+    if visible < min_chars:
+        return False, f"only {visible} visible character(s) on the screenshot ({la or '-'}@{ha})"
+    if lb.startswith(head) and lb.endswith(tail) and len(head) + len(tail) <= len(lb):
+        shown = f"{head}…{tail}" if head else tail
+        return True, f"the order's UPI fits the visible part {shown}@{ha}"
+    return False, f"visible part differs: {la}@{ha} on the screenshot, {lb}@{hb} on the order"

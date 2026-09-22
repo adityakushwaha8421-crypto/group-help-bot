@@ -346,11 +346,16 @@ def extract_from_text(
 
 
 MONTHS = "jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec"
-NOYEAR_RE = re.compile(
-    rf"\b(?:(?P<d1>\d{{1,2}})\s+(?P<m1>{MONTHS})[a-z]*\.?|(?P<m2>{MONTHS})[a-z]*\.?\s+(?P<d2>\d{{1,2}}))"
-    r"(?!\s*,?\s*\d{4})\s*,?\s*(?:at\s+)?(?P<h>\d{1,2}):(?P<mi>\d{2})(?::(?P<s>\d{2}))?\s*(?P<ap>am|pm)?",
-    re.I,
+_DATE_PART = (
+    rf"(?:(?P<d1>\d{{1,2}})(?:st|nd|rd|th)?[\s\-/.,]*(?P<m1>{MONTHS})[a-z]*\.?"
+    rf"|(?P<m2>{MONTHS})[a-z]*\.?\s+(?P<d2>\d{{1,2}})(?:st|nd|rd|th)?)"
+    r"(?:\s*,?\s*'(?P<y2>\d{2}))?(?!\s*,?\s*\d{4})"
 )
+_TIME_PART = r"(?P<h>\d{1,2}):(?P<mi>\d{2})(?::(?P<s>\d{2}))?\s*(?P<ap>am|pm)?"
+# date then time ("13 Sept, 11:09 PM", "22nd sep'26, 09:02am") - or time then date ("09:02am, 22nd sep'26",
+# "11:09 PM on 13 Sept"): payment apps print both orders
+NOYEAR_RE = re.compile(rf"\b{_DATE_PART}\s*,?\s*(?:at\s+|on\s+)?{_TIME_PART}", re.I)
+NOYEAR_TIME_FIRST_RE = re.compile(rf"(?<![\d:]){_TIME_PART}\s*,?\s*(?:on\s+|at\s+|\|\s*|-\s*)?{_DATE_PART}", re.I)
 
 
 def parse_datetime_noyear(text: str | None, now=None):
@@ -359,7 +364,7 @@ def parse_datetime_noyear(text: str | None, now=None):
     in the future. None when the text carries a year (parse_datetime_loose handles it) or no time at all."""
     if not text:
         return None
-    m = NOYEAR_RE.search(str(text))
+    m = NOYEAR_RE.search(str(text)) or NOYEAR_TIME_FIRST_RE.search(str(text))
     if not m:
         return None
     day = int(m.group("d1") or m.group("d2"))
@@ -374,12 +379,12 @@ def parse_datetime_noyear(text: str | None, now=None):
     from zoneinfo import ZoneInfo
 
     local_now = (now or utcnow()).astimezone(ZoneInfo("Asia/Kolkata"))
-    year = local_now.year
+    year = 2000 + int(m.group("y2")) if m.group("y2") else local_now.year  # "sep'26": the year IS printed
     try:
         when = datetime(year, month, day, hour, minute, sec)
     except ValueError:
         return None
-    if when > local_now.replace(tzinfo=None) + timedelta(days=1):
+    if not m.group("y2") and when > local_now.replace(tzinfo=None) + timedelta(days=1):
         when = when.replace(year=year - 1)
     return parse_datetime_loose(when.strftime("%Y-%m-%d %H:%M:%S"))
 
@@ -387,8 +392,8 @@ def parse_datetime_noyear(text: str | None, now=None):
 def fix_guessed_year(when, printed: str | None, now=None):
     """`when` came from the model; `printed` is the text on the screenshot. When that text shows NO year, the year
     in `when` is a guess: move it to the latest year that does not put the payment in the future."""
-    if when is None or re.search(r"\b(19|20)\d{2}\b", printed or ""):
-        return when  # the year is printed: keep it
+    if when is None or re.search(r"\b(19|20)\d{2}\b|'\d{2}\b", printed or ""):
+        return when  # the year is printed ("2026", "'26"): keep it
     now = now or utcnow()
     fixed = when
     try:

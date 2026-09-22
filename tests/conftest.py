@@ -176,6 +176,9 @@ class FakeAnalyzer:
         self.receiver_upi = None  # what the focused screenshot OCR reads (None: no payee UPI printed)
         self.ocr_calls = 0
         self.by_type: dict = {}  # optional: payload per doc_type_hint (screenshot, bank_statement, payment_video)
+        self.screenshots: list | None = (
+            None  # optional: one payload per screenshot READ, in order (2 screens = 1 payment)
+        )
         self.password = None  # what the focused password pass reads out of a sentence (None: none stated)
         self.password_calls = 0
 
@@ -188,7 +191,9 @@ class FakeAnalyzer:
         from app.ai.extractor import extraction_from_ai
 
         self.calls += 1
-        if self.by_type:  # per document type payloads (statement / video rows), when a test sets them
+        if self.screenshots is not None and doc_type_hint == "payment_screenshot":
+            payload = self.screenshots.pop(0) if self.screenshots else {}
+        elif self.by_type:  # per document type payloads (statement / video rows), when a test sets them
             payload = self.by_type.get(doc_type_hint, {})
         else:
             payload = self.screenshot if doc_type_hint == "payment_screenshot" else {}

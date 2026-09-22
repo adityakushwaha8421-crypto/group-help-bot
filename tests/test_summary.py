@@ -102,9 +102,9 @@ async def test_evidence_auto_creates_cases_no_new_command(db):
     async with db.session_scope() as s:
         a = (await attach_message(s, make_input(1, "photo"))).case  # first message creates the case
         same = (await attach_message(s, make_input(2, "text", MOBILE))).case  # joins it
-        b = (await attach_message(s, make_input(3, "photo"))).case  # a NEW screenshot = a new case
+        b = (await attach_message(s, make_input(3, "photo"))).case  # sent together: the same payment's 2nd screen
         dup = await attach_message(s, make_input(4, "photo", file_unique_id="u3"))  # the same file again: no new case
-    assert a.case_id == same.case_id and b.case_id != a.case_id
+    assert a.case_id == same.case_id == b.case_id
     assert dup.duplicate and dup.case.case_id == b.case_id
 
 

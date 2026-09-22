@@ -63,10 +63,19 @@ Rules:
   to return null. Always put the date/time text exactly as printed in evidence_text.
 - utr: 12-digit UPI reference / UTR / RRN when printed. transaction_reference: any other app-level reference id.
 - upi_id: the payee/receiver VPA if shown in full (e.g. name@bank); payer_name / receiver_name as printed.
-- receiver_upi: the payee UPI printed next to "Paid to" / "To" / "Sent to" / "Banking name", copied character for
-  character EXACTLY as printed - keep masking and partial forms ("XXXXXX4913@pthdfc", "••4913@pthdfc",
-  "4913@pthdfc"). Never complete, unmask or guess a character. evidence_text must contain the value as printed.
-  null when no payee UPI is printed. Never the payer's own UPI.
+- receiver_upi: the UPI ID of the party that RECEIVED the money. Apps lay this out differently - work it out from
+  the meaning of the screen, not from one fixed label: "Paid to", "paid to UPI ID", "To", "Sent to", "Receiver",
+  "Beneficiary", "Banking name", "Payee", a name card at the top of a receipt with the UPI printed under or
+  beside it, or a UPI ID standing alone under the recipient's name. Copy it character for character EXACTLY as
+  printed - keep masking and partial forms ("XXXXXX4913@pthdfc", "••4913@pthdfc", "4913@pthdfc",
+  "boim-0741XXXX7519@boi"). Never complete, unmask or guess a character. evidence_text must contain the value as
+  printed. null when no receiver UPI is printed. NEVER the payer's side: "paid from", "From", "Debited from",
+  the wallet / bank account / UPI the money LEFT (e.g. a "CRED wallet WLYSYXXX85" line or "******7737@cred" under
+  "paid from UPI ID" is the payer, not the receiver).
+- utr: also printed as "UPI transaction ID", "UPI Ref No", "RRN", "UTR", "Transaction ID" (12 digits). A longer
+  app-level id with letters or dashes (a CRED / PhonePe transaction ID) is transaction_reference, never the utr.
+- One payment is often shown on TWO screenshots (the receipt, then its details page): read every image given and
+  take each field from whichever shows it.
 - payment_status: the status word as printed (e.g. "Successful", "Paid", "Pending", "Failed").
 - registration_number: a registration / order / reference number typed by the user or printed in the note field.
 - betex_order_id: an order id in the form ILLUN-<digits> if printed anywhere.
@@ -86,11 +95,15 @@ RECEIVER_UPI_SCHEMA = {
     },
 }
 
-RECEIVER_UPI_SYSTEM = """You are an OCR reader for Indian UPI payment screenshots (PhonePe, Paytm, Google Pay, BHIM,
-bank apps). Read ONE thing: the payee UPI ID shown with "Paid to" / "To" / "Sent to" / "Banking name".
-Copy it character for character EXACTLY as printed, keeping masking and partial forms ("XXXXXX4913@pthdfc",
-"••4913@pthdfc", "4913@pthdfc"). Never complete, unmask or guess a character. evidence_text = the printed line
-the value is on. If no payee UPI is printed, value=null, confidence=0, evidence_text=null. Never the payer's UPI."""
+RECEIVER_UPI_SYSTEM = """You are an OCR reader for Indian UPI payment screenshots (PhonePe, Paytm, Google Pay, BHIM, CRED,
+bank apps). Read ONE thing: the UPI ID of the party that RECEIVED the money.
+Understand the layout - it differs from app to app: "Paid to", "paid to UPI ID", "To", "Sent to", "Receiver",
+"Beneficiary", "Banking name", "Payee", a recipient name at the top with the UPI under it, or a UPI ID on its own
+under the recipient's name. Copy it character for character EXACTLY as printed, keeping masking and partial forms
+("XXXXXX4913@pthdfc", "••4913@pthdfc", "4913@pthdfc", "boim-0741XXXX7519@boi"). Never complete, unmask or guess a
+character. evidence_text = the printed line the value is on. If no receiver UPI is printed, value=null,
+confidence=0, evidence_text=null. NEVER the payer's side ("paid from", "From", "Debited from", the payer's wallet or
+bank line) - if the only UPI on the screen is the payer's, return null."""
 
 PASSWORD_SCHEMA = {
     "name": "statement_password",

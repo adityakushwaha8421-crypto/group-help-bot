@@ -30,6 +30,7 @@ from app.db.repository import (
     list_evidence,
     list_verification_events,
     lock_order_id,
+    next_case_id,
 )
 from app.evidence.manager import analyze_evidence, download_evidence
 from app.followups.service import cancel_case_followups, schedule_case_followups
@@ -555,6 +556,23 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
             )
     if await _relock(session, case, version0) is None:
         return "stale"
+    split = await split_other_payments(session, case, evidence)
+    if split:
+        evidence = [e for e in evidence if e.id not in split]
+        merged = Extraction.from_dict(case.extraction)
+        for m in await list_case_messages(session, case.case_id):
+            if m.text:
+                merged = merged.merge(
+                    extract_from_text(
+                        m.text, registration_pattern=s.registration_pattern, betex_pattern=s.betex_order_id_pattern
+                    )
+                )
+        for ev in evidence:
+            if ev.type == EvidenceType.payment_screenshot.value:
+                merged = merged.merge(Extraction.from_dict((ev.analysis or {}).get("extraction")))
+        for ev in evidence:  # the other files again, after the screenshots, as above
+            if ev.type != EvidenceType.payment_screenshot.value:
+                merged = merged.merge(Extraction.from_dict((ev.analysis or {}).get("extraction")))
     case.extraction = merged.as_dict()
     merge_case_extraction(case, merged)
     await audit(
@@ -1811,10 +1829,91 @@ async def apply_verification_signal(
     return "recorded"
 
 
+def _shot_facts(ev) -> tuple[str | None, float | None]:
+    ex = ((ev.analysis or {}).get("extraction")) or {}
+    utr = (ex.get("utr") or {}).get("value")
+    amount = (ex.get("amount") or {}).get("value")
+    return (str(utr).strip() if utr else None), (float(amount) if amount is not None else None)
+
+
+async def split_other_payments(session: AsyncSession, case: Case, evidence) -> set[int]:
+    """Screenshots sent together join one case (the receipt and its details page are one payment). Read, two
+    screenshots can turn out to be DIFFERENT payments: two different UTRs, or two amounts more than the tolerance
+    apart. Then every screenshot that is not the first payment moves to a case of its own, which is processed on
+    its own. Returns the evidence ids moved away."""
+    s = get_settings()
+    shots = [e for e in evidence if e.type == EvidenceType.payment_screenshot.value]
+    if len(shots) < 2:
+        return set()
+    first_utr, first_amount = _shot_facts(shots[0])
+    moved: set[int] = set()
+    new_case = None
+    for ev in shots[1:]:
+        utr, amount = _shot_facts(ev)
+        other_utr = bool(utr and first_utr and utr != first_utr)
+        other_amount = (
+            amount is not None
+            and first_amount is not None
+            and abs(amount - first_amount) > s.order_amount_tolerance + 1e-9
+        )
+        if not (other_utr or other_amount):
+            continue
+        if new_case is None:
+            new_case = Case(
+                case_id=await next_case_id(session),
+                status=CaseStatus.WAITING_FOR_INPUT.value,
+                source_chat_id=case.source_chat_id,
+                source_user_id=case.source_user_id,
+                source_username=case.source_username,
+                original_user_id=case.original_user_id,
+                original_username=case.original_username,
+                original_first_name=case.original_first_name,
+                original_last_name=case.original_last_name,
+                original_chat_id=case.original_chat_id,
+                original_message_id=case.original_message_id,
+                evidence_forwarded=case.evidence_forwarded,
+                mobile=case.mobile,
+                last_input_at=utcnow(),
+                extraction=Extraction().as_dict(),
+            )
+            session.add(new_case)
+            await session.flush()
+        ev.case_id = new_case.case_id
+        moved.add(ev.id)
+        why = f"UTR {utr} vs {first_utr}" if other_utr else f"Rs {amount:,.2f} vs Rs {first_amount:,.2f}"
+        await audit(
+            session,
+            "SCREENSHOT_SPLIT",
+            case_id=case.case_id,
+            result=new_case.case_id,
+            details={"evidence_id": ev.id, "why": why},
+        )
+    if new_case is not None:
+        await audit(session, "CASE_CREATED", case_id=new_case.case_id, actor="system", result="split")
+        await notify_admin(
+            session,
+            kind="screenshot_split",
+            case=case,
+            dedupe_suffix=new_case.case_id,
+            text=format_info(
+                case,
+                "Two payments in one submission",
+                f"The other screenshot is another payment: it now has its own case {new_case.case_id}.\n"
+                "Send that payment's mobile / statement / video with /add if they differ.",
+            ),
+        )
+        new_case.processing_version += 1
+        await enqueue(
+            "process_case_job", new_case.case_id, new_case.processing_version, True, job_id=f"split-{new_case.case_id}"
+        )
+    return moved
+
+
 async def read_screenshot_upi(session: AsyncSession, case: Case) -> tuple[str | None, str]:
-    """The payee ("Paid to") UPI OCR'd from the payment screenshot - the screenshot we posted to Betix. The ONLY
-    source: never the video, the statement, or what the Betix bot says it recognised. Returns (upi, how) or
-    (None, why)."""
+    """The receiver ("Paid to") UPI OCR'd from the case's payment screenshots - the ONLY source: never the video,
+    the statement, or what the Betix bot says it recognised. One payment often comes as two screenshots (the
+    receipt and its details page): every screenshot is looked at, the one posted to Betix first, and the first
+    reading that is a UPI wins. Returns (upi, how) or (None, why)."""
     from pathlib import Path
 
     from app.ai.analyzer import get_analyzer
@@ -1823,21 +1922,39 @@ async def read_screenshot_upi(session: AsyncSession, case: Case) -> tuple[str | 
     if not shots:
         return None, "no payment screenshot on the case"
     root = case.betix_root_message_id
-    shot = next((e for e in shots if root and e.posted_to_betix_message_id == root), shots[0])
-    analysis = dict(shot.analysis or {})
-    reading = analysis.get("receiver_upi_ocr") or (analysis.get("payload") or {}).get("receiver_upi")
-    if not (isinstance(reading, dict) and reading.get("value")) and "receiver_upi_ocr" not in analysis:
-        # Read before the field existed, or the full read found none: one focused OCR pass on the image.
+    shots.sort(key=lambda e: 0 if root and e.posted_to_betix_message_id == root else 1)
+    why = "no payee UPI printed on the screenshot"
+
+    def stored(shot) -> dict | None:
+        analysis = shot.analysis or {}
+        return analysis.get("receiver_upi_ocr") or (analysis.get("payload") or {}).get("receiver_upi")
+
+    for shot in shots:  # first: what the full read already found on ANY screen - no extra call
+        reading = stored(shot)
+        if isinstance(reading, dict) and reading.get("value"):
+            upi, how = ocr_upi(reading)
+            if upi:
+                return upi, how
+            why = how
+    for shot in shots:  # then one focused OCR pass per screen that has not had one
+        if "receiver_upi_ocr" in (shot.analysis or {}):
+            continue
         path = Path(shot.local_path) if shot.local_path else None
         if path is None or not path.exists():
-            return None, "screenshot file not available for OCR"
+            why = "screenshot file not available for OCR"
+            continue
         try:
             reading = await get_analyzer().read_receiver_upi(path)
         except Exception as exc:  # noqa: BLE001
             log.warning("receiver UPI OCR failed", case_id=case.case_id, error=repr(exc)[:160])
-            return None, "screenshot OCR failed"
-        shot.analysis = {**analysis, "receiver_upi_ocr": reading}
-    return ocr_upi(reading)
+            why = "screenshot OCR failed"
+            continue
+        shot.analysis = {**(shot.analysis or {}), "receiver_upi_ocr": reading}
+        upi, how = ocr_upi(reading)
+        if upi:
+            return upi, how
+        why = how
+    return None, why
 
 
 async def summary_lines(session: AsyncSession, case: Case) -> str:

@@ -249,11 +249,25 @@ async def attach_message(session: AsyncSession, inp: IncomingInput, *, force_new
         from app.cases.manager import AI_UNAVAILABLE, UTR_NOT_FOUND
 
         reason_text = case.failure_reason or ""
+        in_batch = bool(case.last_input_at and (utcnow() - case.last_input_at).total_seconds() <= s.batch_join_seconds)
+        # ... and from the SAME customer: another customer's screenshot is always another case
+        if inp.forward is not None and not _is_self_forward(inp.user_id, inp):
+            if fwd_user is not None:
+                in_batch = in_batch and case.original_user_id in (None, fwd_user)
+            else:
+                hidden = (inp.forward.hidden_name or "").strip().lower()
+                known = (case.original_first_name or "").strip().lower()
+                in_batch = in_batch and case.original_user_id is None and (not known or known == hidden)
         if reason_text == UTR_NOT_FOUND or reason_text.startswith(AI_UNAVAILABLE):
             # The case is waiting for a READABLE screenshot (or for the reader to come back): this one replaces
             # the earlier one, same case - the operator is not opening a second submission.
             log.info("clearer screenshot for a case with no visible UTR; same case", case_id=case.case_id)
             case.failure_reason = None
+        elif in_batch:
+            # Sent together with the first one: the same payment on two screens (the receipt and its details
+            # page). They are read together; should they turn out to be two payments after all, the reader
+            # splits them (manager.split_other_payments).
+            log.info("second screenshot in the same batch; same case", case_id=case.case_id)
         else:
             log.info("second screenshot while collecting; starting new case", case_id=case.case_id)
             case = None
