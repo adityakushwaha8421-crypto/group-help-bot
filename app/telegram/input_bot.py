@@ -120,6 +120,7 @@ def help_text() -> str:
         f"{code('/cases')} — all open cases\n"
         f"{code('/summary [DAYS]')} — overview by stage\n"
         f"{code('/push')} — force send the current case when it is “Already with Betix”\n"
+        f"{code('/stopr ORDER-ID')} — stop the reminders of a case, keep everything else\n"
         f"{code('/cancel')} — discard what's in progress\n"
         f"{code('/restart')} — pull the latest code and restart",
     )
@@ -342,6 +343,30 @@ async def cmd_cancel(message: Message):
             return
         await manager.fail_case(session, case, "cancelled by operator", actor=f"@{message.from_user.username}")
         await message.answer(f"🗑 Discarded case {code(case_label(case))}.", parse_mode="HTML")
+
+
+@router.message(Command("stopr"))
+async def cmd_stopr(message: Message, command: CommandObject):
+    """/stopr ORDER-ID: stop every pending reminder / follow-up of that case. The case, its messages and its
+    evidence stay exactly as they are; Betix's confirmation is still watched."""
+    q = (command.args or "").strip()
+    async with session_scope() as session:
+        if q:
+            case = await get_case(session, q) or await find_case_by_order_id(session, q)
+        else:
+            case = await latest_case_for_user(session, message.chat.id, message.from_user.id)
+        if case is None:
+            await message.answer("\U0001f914 I couldn't find that case.", parse_mode="HTML")
+            return
+        from app.followups.service import cancel_case_followups
+
+        who = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
+        n = await cancel_case_followups(session, case, f"stopped by {who} (/stopr)")
+        label = case_label(case)
+    await message.answer(
+        f"\U0001f6d1 Reminders stopped for {code(label)}" + ("" if n else "\n" + i("There was no reminder pending.")),
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("status"))
@@ -878,6 +903,7 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("cases", "All open cases"),
     ("summary", "All-time overview by stage (or /summary 7 for a week)"),
     ("push", "Force send the CURRENT case when it is 'Already with Betix'"),
+    ("stopr", "Stop all reminders / follow-ups of a case (/stopr ORDER-ID)"),
     ("cancel", "Discard the case (or search) in progress"),
     ("restart", "Pull the latest code and restart the bot"),
     ("help", "How to use the bot"),
