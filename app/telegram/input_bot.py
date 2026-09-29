@@ -47,6 +47,7 @@ from app.telegram.betix_monitor import build_router as build_betix_router
 from app.telegram.throttle import get_throttle
 from app.telegram.ui import b, card, case_label, code, esc, i, join_and, kv, para, title
 from app.utils.logging import get_logger
+from app.utils.timeutil import utcnow
 from app.workers.queue import enqueue
 
 log = get_logger("input_bot")
@@ -90,6 +91,7 @@ async def allowlist_middleware(
 
 def help_text() -> str:
     q = get_settings().collection_seconds
+    add_limit = get_settings().add_session_seconds
     secs = get_settings().force_send_seconds
     return para(
         f"👋 {b('Payment Verification Bot')}",
@@ -114,7 +116,7 @@ def help_text() -> str:
         + "\n"
         + i(f"\u2795 Add the rest later with {code('/add')}."),
         f"⚙️ {b('Commands')}\n"
-        f"{code('/add MOBILE')} — add evidence to a case already in Betix\n"
+        f"{code('/add MOBILE')} — add evidence to a case already in Betix (send the file within {add_limit}s)\n"
         f"{code('/search [MOBILE]')} — find the order id for a screenshot, nothing is posted\n"
         f"{code('/status [ORDER-ID]')} — where a case stands\n"
         f"{code('/cases')} — all open cases\n"
@@ -311,21 +313,59 @@ async def cmd_add(message: Message, command: CommandObject):
             return
         ev = await list_evidence(session, case.case_id)
         have = {e.type for e in ev}
-        add_evidence.start(message.chat.id, message.from_user.id, case, q)
+        sess = add_evidence.start(message.chat.id, message.from_user.id, case, q)
         pending = [t.replace("_", " ") for t in ("bank_statement", "payment_video") if t not in have]
         where = "already with Betix" if case.betix_root_message_id else "not with Betix yet"
         need = f"Still missing the {join_and(pending)}." if pending else "It already has everything."
+        limit = get_settings().add_session_seconds
         await message.answer(
             para(
                 f"🗂 Found case {code(case_label(case))} for mobile {code(case.mobile or '-')} — {where}.",
                 ("⏳ " if pending else "✅ ") + need + " 📎 Send the file now and I'll add it to this case.",
+                f"⏱ You have {b(f'{limit} seconds')} — after that this {code('/add')} is discarded.",
             ),
             parse_mode="HTML",
         )
+    watch_add_limit(message, sess)
+
+
+_add_timers: dict[int, asyncio.Task] = {}
+
+
+def watch_add_limit(message: Message, sess) -> None:
+    """Discard the /add on the dot when its time limit passes with nothing added, and say so."""
+    old = _add_timers.get(message.chat.id)
+    if old is not None and not old.done():
+        old.cancel()
+    _add_timers[message.chat.id] = asyncio.create_task(_discard_add_later(message, sess))
+
+
+async def _discard_add_later(message: Message, sess) -> None:
+    try:
+        await asyncio.sleep(get_settings().add_session_seconds + 0.2)
+        if add_evidence._sessions.get(message.chat.id) is not sess:
+            return  # finished, cancelled or replaced: nothing to discard
+        if add_evidence.active(message.chat.id) is sess:
+            return  # not over yet (the clock was moved) - the next file decides
+        await message.answer(discarded_text(sess), parse_mode="HTML")
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        log.exception("/add time-limit watcher failed", case_id=sess.case_id)
+
+
+def discarded_text(sess) -> str:
+    return para(
+        f"🗑 {b('/add DISCARDED')} — no {'further ' if sess.added else ''}evidence arrived within "
+        f"{get_settings().add_session_seconds} seconds.",
+        f"🗂 Case {code(sess.case_id)} keeps what it has. Nothing more was sent to Betix and no new case was created.",
+        f"🔁 To add the file, send {code('/add ' + sess.query)} again and then the file right away.",
+    )
 
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message):
+    add_evidence.forget_discarded(message.chat.id)
     if add_evidence.finish(message.chat.id) is not None:
         await message.answer("🗑 Stopped adding evidence.", parse_mode="HTML")
         return
@@ -768,6 +808,21 @@ async def on_evidence(message: Message):
         else:
             await add_to_case(message, inp, adding)
             return
+    late = add_evidence.recently_discarded(message.chat.id)
+    if late is not None and inp.file_id and not add_evidence.belongs_elsewhere(late, inp):
+        # the file the discarded /add was waiting for came too late: it is neither added nor a new case
+        add_evidence.forget_discarded(message.chat.id)
+        log.info("late file after a discarded /add refused", case_id=late.case_id, message_id=inp.message_id)
+        await message.answer(
+            para(
+                f"⌛ {b('Too late')} — the {code('/add')} for {code(late.case_id)} was discarded "
+                f"after {get_settings().add_session_seconds} seconds without evidence.",
+                "🚫 This file was not added, nothing went to Betix and no new case was created.",
+                f"🔁 Send {code('/add ' + late.query)} again and then the file right away.",
+            ),
+            parse_mode="HTML",
+        )
+        return
     sess = order_search.active(message.chat.id)
     if sess is not None:
         # /search mode: this message feeds the lookup, never a case.
@@ -802,6 +857,7 @@ async def add_to_case(message: Message, inp: IncomingInput, sess) -> None:
         await message.answer(f"↩️ Not added to {code(label)} — {esc(note)}.", parse_mode="HTML")
         return
     sess.added.append(note)
+    sess.started_at = utcnow()  # each file that gets in restarts the time limit for the next one
     if posted:
         await enqueue("added_evidence_job", case_id, job_id=f"added-{case_id}-{inp.message_id}")
         tail = "📤 Sending it to Betix now, as a reply to the original screenshot."
@@ -810,6 +866,8 @@ async def add_to_case(message: Message, inp: IncomingInput, sess) -> None:
     if done:
         add_evidence.finish(message.chat.id)  # everything is on the case: the /add closes itself
         tail += f"\n✅ The case has everything now — {code('/add')} closed."
+    else:
+        watch_add_limit(message, sess)
     await message.answer(para(f"✅ Added the {esc(note)} to case {code(label)}.", tail), parse_mode="HTML")
 
 

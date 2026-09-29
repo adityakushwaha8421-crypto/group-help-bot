@@ -43,8 +43,13 @@ def add_setup(fake_poster, monkeypatch):
     monkeypatch.setattr(input_bot, "enqueue", fake_enqueue)
     manager.set_poster_factory(lambda: fake_poster)
     add_evidence._sessions.clear()
+    add_evidence._discarded.clear()
     yield jobs
+    for t in input_bot._add_timers.values():  # no time-limit watcher may outlive its test
+        t.cancel()
+    input_bot._add_timers.clear()
     add_evidence._sessions.clear()
+    add_evidence._discarded.clear()
     manager.set_poster_factory(None)
 
 
@@ -227,5 +232,143 @@ async def test_add_expires(db, fake_bot, fake_ai, order_search, no_download, fak
     await posted_without_statement(db, order_search, fake_poster)
     await run_add(sink, 111, 111, MOBILE)
     sess = add_evidence.active(111)
-    sess.started_at = sess.started_at - timedelta(minutes=11)
-    assert add_evidence.active(111) is None  # ten minutes is plenty; after that files are normal submissions
+    sess.started_at = sess.started_at - timedelta(seconds=21)
+    assert add_evidence.active(111) is None  # 20 seconds, then the /add is discarded
+    assert add_evidence.recently_discarded(111) is sess and sess.discarded_at is not None
+
+
+# ---------------------------------------------------------------- /add TIME LIMIT (2026-09-29)
+# `/add <mobile>` keeps the case open for 20 seconds only. No evidence in time -> the /add is DISCARDED: nothing
+# goes to Betix and no new case is created. Evidence in time -> added to the case, posted as a reply to the
+# original screenshot, normal flow continues.
+
+
+async def test_add_tells_the_operator_about_the_time_limit(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, add_setup
+):
+    sink = []
+    await posted_without_statement(db, order_search, fake_poster)
+    await run_add(sink, 111, 111, MOBILE)
+    assert "20 seconds" in sink[-1] and "discarded" in sink[-1]
+
+
+async def test_evidence_within_the_limit_is_added_and_replies_to_the_screenshot(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, add_setup, monkeypatch
+):
+    from datetime import timedelta
+
+    sink = []
+    case_id = await posted_without_statement(db, order_search, fake_poster)
+    await run_add(sink, 111, 111, MOBILE)
+    sess = add_evidence.active(111)
+    sess.started_at = sess.started_at - timedelta(seconds=15)  # 15 s in: still open
+    mine = make_input(30, "document")
+    monkeypatch.setattr(input_bot, "_incoming_from_message", lambda message: mine)
+    await input_bot.on_evidence(Msg(mine, sink))
+    assert add_setup[-1] == ("added_evidence_job", (case_id,))
+    assert await tasks.added_evidence_job({}, case_id) == 1
+    assert fake_poster.media_replies[-1] == ("bank_statement", ROOT)
+    assert add_evidence.active(111) is not None  # the video is still missing: the /add goes on
+
+
+async def test_no_evidence_in_time_discards_the_add_and_refuses_the_late_file(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, add_setup, monkeypatch
+):
+    from datetime import timedelta
+
+    sink, held = [], []
+    case_id = await posted_without_statement(db, order_search, fake_poster)
+    await run_add(sink, 111, 111, MOBILE)
+    sess = add_evidence.active(111)
+    sess.started_at = sess.started_at - timedelta(seconds=25)  # the 20 s passed with nothing sent
+    monkeypatch.setattr(input_bot, "hold", lambda message, inp: held.append(inp.message_id) or True)
+    late = make_input(30, "document")
+    monkeypatch.setattr(input_bot, "_incoming_from_message", lambda message: late)
+    await input_bot.on_evidence(Msg(late, sink))
+    assert "Too late" in sink[-1] and "no new case was created" in sink[-1]
+    assert held == []  # not a new case
+    assert add_setup == []  # nothing sent to Betix
+    assert add_evidence.active(111) is None and add_evidence.recently_discarded(111) is None
+    async with db.session_scope() as s:
+        assert len((await s.execute(select(Case))).scalars().all()) == 1
+        assert [e.type for e in await list_evidence(s, case_id)] == ["payment_screenshot"]
+    # the next file is a normal submission again
+    fresh = make_input(31, "photo")
+    monkeypatch.setattr(input_bot, "_incoming_from_message", lambda message: fresh)
+    await input_bot.on_evidence(Msg(fresh, sink))
+    assert held == [31]
+
+
+async def test_the_timer_announces_the_discard(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, add_setup, monkeypatch
+):
+    import asyncio
+
+    monkeypatch.setenv("ADD_SESSION_SECONDS", "0")
+    from app.config import reset_settings_cache
+
+    reset_settings_cache()
+    sink = []
+    case_id = await posted_without_statement(db, order_search, fake_poster)
+    await run_add(sink, 111, 111, MOBILE)
+    await asyncio.sleep(0.5)
+    assert "/add DISCARDED" in sink[-1] and "no new case was created" in sink[-1]
+    assert add_evidence.active(111) is None
+    async with db.session_scope() as s:
+        assert len((await s.execute(select(Case))).scalars().all()) == 1
+        assert [e.type for e in await list_evidence(s, case_id)] == ["payment_screenshot"]
+
+
+async def test_the_timer_stays_quiet_when_evidence_arrived_in_time(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, add_setup, monkeypatch
+):
+    import asyncio
+
+    monkeypatch.setenv("ADD_SESSION_SECONDS", "1")
+    from app.config import reset_settings_cache
+
+    reset_settings_cache()
+    sink = []
+    await posted_without_statement(db, order_search, fake_poster)
+    await run_add(sink, 111, 111, MOBILE)
+    await asyncio.sleep(0.6)
+    await send_file(sink, make_input(30, "document"))  # in time: the clock restarts for the video
+    await asyncio.sleep(0.9)
+    assert not any("DISCARDED" in t for t in sink)
+    await asyncio.sleep(1.0)  # ...and runs out without the video
+    assert "no further evidence" in sink[-1] and add_evidence.active(111) is None
+
+
+async def test_each_file_in_time_restarts_the_clock(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, add_setup
+):
+    from datetime import timedelta
+
+    sink = []
+    await posted_without_statement(db, order_search, fake_poster)
+    await run_add(sink, 111, 111, MOBILE)
+    sess = add_evidence.active(111)
+    sess.started_at -= timedelta(seconds=15)
+    await send_file(sink, make_input(30, "document"))  # at 15 s
+    sess.started_at -= timedelta(seconds=15)  # the video comes 15 s after the statement (30 s after /add)
+    assert add_evidence.active(111) is sess
+    await send_file(sink, make_input(31, "video"))
+    assert "/add</code> closed" in sink[-1]
+
+
+async def test_a_late_forward_from_another_customer_still_opens_its_own_case(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, add_setup, monkeypatch
+):
+    from datetime import timedelta
+
+    sink, held = [], []
+    case_id = await posted_without_statement(db, order_search, fake_poster)
+    async with db.session_scope() as s:
+        (await get_case(s, case_id)).original_user_id = 555
+    await run_add(sink, 111, 111, MOBILE)
+    add_evidence.active(111).started_at -= timedelta(seconds=25)
+    monkeypatch.setattr(input_bot, "hold", lambda message, inp: held.append(inp.message_id) or True)
+    other = make_input(30, "photo", forward=SimpleNamespace(user_id=777, username="someone_else"))
+    monkeypatch.setattr(input_bot, "_incoming_from_message", lambda message: other)
+    await input_bot.on_evidence(Msg(other, sink))
+    assert held == [30]  # another customer's payment: the normal path, the discarded /add does not block it

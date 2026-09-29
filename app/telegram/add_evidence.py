@@ -31,22 +31,32 @@ class AddSession:
     customer_id: int | None = None  # the case's original customer: a forward from anyone else is not for it
     added: list[str] = field(default_factory=list)
     started_at: object = field(default_factory=utcnow)
+    discarded_at: object = None  # set once the time limit passed with nothing added
 
 
 _sessions: dict[int, AddSession] = {}
+_discarded: dict[int, AddSession] = {}
+
+
+def seconds_open(sess: AddSession) -> float:
+    return (utcnow() - sess.started_at).total_seconds()
+
+
+def expired(sess: AddSession) -> bool:
+    from app.config import get_settings
+
+    return seconds_open(sess) > get_settings().add_session_seconds
 
 
 def active(chat_id: int) -> AddSession | None:
-    """The open /add for this chat - none once it has expired. (Live 2026-09-15: an /add left open for an hour
-    swallowed the next customer's screenshot, statement and video and posted them under the wrong case.)"""
+    """The open /add for this chat - none once its time limit has passed (the /add is then DISCARDED).
+    (Live 2026-09-15: an /add left open for an hour swallowed the next customer's screenshot, statement and video
+    and posted them under the wrong case.)"""
     sess = _sessions.get(chat_id)
     if sess is None:
         return None
-    from app.config import get_settings
-
-    if (utcnow() - sess.started_at).total_seconds() > get_settings().add_session_seconds:
-        log.info("/add expired", case_id=sess.case_id)
-        _sessions.pop(chat_id, None)
+    if expired(sess):
+        discard(chat_id)
         return None
     return sess
 
@@ -54,7 +64,38 @@ def active(chat_id: int) -> AddSession | None:
 def start(chat_id: int, user_id: int, case: Case, query: str) -> AddSession:
     sess = AddSession(chat_id, user_id, case.case_id, query, customer_id=case.original_user_id)
     _sessions[chat_id] = sess
+    _discarded.pop(chat_id, None)
     return sess
+
+
+def discard(chat_id: int) -> AddSession | None:
+    """The time limit passed with no evidence: the /add is DISCARDED. Nothing goes to Betix and nothing new is
+    created; a file arriving shortly afterwards is refused (see `recently_discarded`)."""
+    sess = _sessions.pop(chat_id, None)
+    if sess is None:
+        return None
+    sess.discarded_at = utcnow()
+    _discarded[chat_id] = sess
+    log.info("/add discarded: time limit passed", case_id=sess.case_id, seconds=round(seconds_open(sess)))
+    return sess
+
+
+def recently_discarded(chat_id: int) -> AddSession | None:
+    """The /add this chat let run out a moment ago - the file arriving now was meant for it and must not open a
+    case of its own. Forgotten after `add_discard_grace_seconds`."""
+    sess = _discarded.get(chat_id)
+    if sess is None:
+        return None
+    from app.config import get_settings
+
+    if (utcnow() - sess.discarded_at).total_seconds() > get_settings().add_discard_grace_seconds:
+        _discarded.pop(chat_id, None)
+        return None
+    return sess
+
+
+def forget_discarded(chat_id: int) -> None:
+    _discarded.pop(chat_id, None)
 
 
 def belongs_elsewhere(sess: AddSession, inp: IncomingInput) -> bool:
@@ -75,6 +116,7 @@ def complete(case: Case, evidence: list[Evidence]) -> bool:
 
 
 def finish(chat_id: int) -> AddSession | None:
+    _discarded.pop(chat_id, None)
     return _sessions.pop(chat_id, None)
 
 
