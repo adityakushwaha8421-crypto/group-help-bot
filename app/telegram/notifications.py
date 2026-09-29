@@ -215,30 +215,82 @@ async def notify_admin(
         log.info("notification already sent; skipping", kind=kind, case_id=case.case_id if case else None)
         return None
     if not chats:
-        row.error = "ADMIN_NOTIFY_CHAT_ID not configured"
+        row.error = NOT_CONFIGURED
         log.warning("ADMIN_NOTIFY_CHAT_ID not configured; notification stored only", kind=kind)
         return row
+    await _deliver(session, row, chats, parse_mode=parse_mode, reply_markup=reply_markup)
+    return row
+
+
+NOT_CONFIGURED = "ADMIN_NOTIFY_CHAT_ID not configured"
+
+
+async def _deliver(session: AsyncSession, row: Notification, chats, *, parse_mode, reply_markup=None) -> bool:
+    """Send one reserved notification to every admin chat. Returns True once at least one copy is out."""
     errors = []
     copies: dict[str, int] = {}  # chat -> message id of that admin's copy (to take a button off all of them)
     markup = {"reply_markup": reply_markup} if reply_markup is not None else {}
     for chat in chats:  # one failure never stops the others: each admin gets their own copy
         try:
             msg = await get_throttle().run(
-                chat, lambda: get_bot().send_message(chat, text, parse_mode=parse_mode, **markup)
+                chat, lambda: get_bot().send_message(chat, row.text, parse_mode=parse_mode, **markup)
             )
             row.sent = True
             row.telegram_message_id = row.telegram_message_id or msg.message_id
             copies[str(chat)] = msg.message_id
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{chat}: {str(exc)[:160]}")
-            log.error("notification send failed", kind=kind, chat=chat, error=str(exc))
+            log.error("notification send failed", kind=row.kind, case_id=row.case_id, chat=chat, error=str(exc))
     if row.sent:
-        await audit(
-            session, "ADMIN_NOTIFIED", case_id=case.case_id if case else None, result=kind, details={"copies": copies}
+        await audit(session, "ADMIN_NOTIFIED", case_id=row.case_id, result=row.kind, details={"copies": copies})
+    row.error = "; ".join(errors)[:500] if errors else None
+    return row.sent
+
+
+async def resend_failed_notifications(session: AsyncSession) -> int:
+    """Every notification that was reserved but never delivered (Telegram down, network gone) is sent again -
+    on every sweep, for NOTIFICATION_RETRY_MINUTES after it was created. Returns how many went out now."""
+    from datetime import timedelta
+
+    from sqlalchemy import select
+
+    from app.utils.timeutil import utcnow
+
+    s = get_settings()
+    chats = s.notify_chats
+    if not chats:
+        return 0
+    since = utcnow() - timedelta(minutes=s.notification_retry_minutes)
+    rows = (
+        (
+            await session.execute(
+                select(Notification)
+                .where(Notification.sent.is_(False), Notification.created_at >= since)
+                .order_by(Notification.id)
+            )
         )
-    if errors:
-        row.error = "; ".join(errors)[:500]
-    return row
+        .scalars()
+        .all()
+    )
+    sent = 0
+    for row in rows:
+        log.warning("retrying an undelivered notification", kind=row.kind, case_id=row.case_id, last_error=row.error)
+        parse_mode = None if "can't parse" in (row.error or "") else "HTML"
+        if await _deliver(session, row, chats, parse_mode=parse_mode):
+            sent += 1
+            log.info("undelivered notification sent on retry", kind=row.kind, case_id=row.case_id)
+    return sent
+
+
+async def notification_delivered(session: AsyncSession, case_id: str, kind: str) -> bool:
+    from sqlalchemy import select
+
+    res = await session.execute(
+        select(Notification.id)
+        .where(Notification.case_id == case_id, Notification.kind == kind, Notification.sent.is_(True))
+        .limit(1)
+    )
+    return res.scalar_one_or_none() is not None
 
 
 async def remove_buttons(session: AsyncSession, case_id: str, kind: str) -> int:

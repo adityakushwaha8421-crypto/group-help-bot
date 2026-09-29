@@ -1679,6 +1679,126 @@ async def refund_approved_withdrawal(case_id: str) -> str:
         return "escalated"
 
 
+def confirmed_by_label(case: Case, actor: str) -> str:
+    by = case.confirmed_by or actor
+    if case.system_confirmed_at and case.reviewer_confirmed_at:
+        by = f"{case.confirmed_by or 'reviewer'} + Betix system"
+    elif case.system_confirmed_at:
+        by = f"Betix system ({actor})"
+    return by
+
+
+async def _last_success_event(session: AsyncSession, case_id: str):
+    from sqlalchemy import select
+
+    from app.db.models import VerificationEvent
+
+    res = await session.execute(
+        select(VerificationEvent)
+        .where(
+            VerificationEvent.case_id == case_id,
+            VerificationEvent.event_type.in_(["SYSTEM_SUCCESS", "HUMAN_SUCCESS"]),
+            VerificationEvent.authority.in_(["system_bot", "group_member"]),
+        )
+        .order_by(VerificationEvent.id.desc())
+        .limit(1)
+    )
+    return res.scalars().first()
+
+
+async def confirmation_safety_net(session: AsyncSession) -> dict[str, int]:
+    """Runs on every sweep. Whatever happened in between (a crash, Telegram down, a confirmation that came while
+    the post was still in flight), EVERY confirmed case ends VERIFIED with its PAYMENT CONFIRMED sent - once.
+
+    1. a Betix confirmation is on record but the case is not VERIFIED yet -> verify it now if it can be
+    2. a case is VERIFIED but its PAYMENT CONFIRMED notification was never delivered -> send it
+    (undelivered notifications themselves are retried by `resend_failed_notifications`)"""
+    from datetime import timedelta
+
+    from sqlalchemy import or_, select
+
+    from app.cases.state_machine import can_transition
+    from app.db.models import Notification
+    from app.telegram.confirmation import is_confirmed
+
+    s = get_settings()
+    since = utcnow() - timedelta(days=s.confirmation_sweep_days)
+    out: dict[str, int] = {}
+    terminal = TERMINAL_OK | {CaseStatus.FAILED.value}
+
+    recorded = (
+        (
+            await session.execute(
+                select(Case).where(
+                    Case.status.notin_(list(terminal)),
+                    or_(Case.system_confirmed_at.isnot(None), Case.reviewer_confirmed_at.isnot(None)),
+                    Case.updated_at >= since,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for case in recorded:
+        confirmed = is_confirmed(
+            mode=s.confirmation_mode,
+            system_success=case.system_confirmed_at is not None,
+            reviewer_success=case.reviewer_confirmed_at is not None,
+        )
+        if not confirmed or not can_transition(case.status, CaseStatus.VERIFIED):
+            continue
+        ev = await _last_success_event(session, case.case_id)
+        if ev is None:
+            continue
+        actor = ev.actor or ("Betix system" if ev.authority == "system_bot" else "Betix member")
+        log.warning("applying a recorded confirmation", case_id=case.case_id, status=case.status, actor=actor)
+        ok = await verify_case(
+            session,
+            case,
+            confirmed_by=confirmed_by_label(case, actor),
+            confirmation_type=ev.authority,
+            confirmation_message_id=ev.betix_message_id,
+            confirmation_username=actor.lstrip("@") if actor.startswith("@") else None,
+        )
+        if ok:
+            out["verified_late"] = out.get("verified_late", 0) + 1
+
+    notified = select(Notification.case_id).where(Notification.kind == "payment_confirmed")
+    silent = (
+        (
+            await session.execute(
+                select(Case).where(
+                    Case.status == CaseStatus.VERIFIED.value,
+                    Case.verified_at >= since,
+                    or_(Case.confirmation_type.is_(None), Case.confirmation_type != "reversed"),
+                    Case.case_id.notin_(notified),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for case in silent:
+        log.warning("verified case without its PAYMENT CONFIRMED notification; sending it", case_id=case.case_id)
+        evidence = await list_evidence(session, case.case_id)
+        row = await notify_admin(
+            session,
+            kind="payment_confirmed",
+            case=case,
+            parse_mode="HTML",
+            text=format_confirmed(
+                case,
+                evidence,
+                confirmed_by=case.confirmed_by or "Betix",
+                confirmed_at=case.verified_at or utcnow(),
+                tz=s.timezone,
+            ),
+        )
+        if row is not None:
+            out["notified_late"] = out.get("notified_late", 0) + 1
+    return out
+
+
 async def apply_verification_signal(
     session: AsyncSession,
     case: Case,
@@ -1766,21 +1886,21 @@ async def apply_verification_signal(
             reviewer_success=case.reviewer_confirmed_at is not None,
         )
         if confirmed:
-            by = case.confirmed_by or actor
-            if case.system_confirmed_at and case.reviewer_confirmed_at:
-                by = f"{case.confirmed_by or 'reviewer'} + Betix system"
-            elif case.system_confirmed_at:
-                by = f"Betix system ({actor})"
-            await verify_case(
+            ok = await verify_case(
                 session,
                 case,
-                confirmed_by=by,
+                confirmed_by=confirmed_by_label(case, actor),
                 confirmation_type=authority,
                 confirmation_message_id=betix_message_id,
                 confirmation_user_id=sender_id,
                 confirmation_username=sender_username,
             )
-            return "verified"
+            if ok:
+                return "verified"
+            # e.g. the post is still in flight: the confirmation is on record and the sweep applies it as soon
+            # as the case can be verified (confirmation_safety_net)
+            log.warning("confirmation recorded, not applied yet", case_id=case.case_id, status=case.status)
+            return "confirmation_recorded"
         # strict mode: half of the requirement satisfied -> inform admin once, keep monitoring & follow-ups
         which = "Betix system" if authority == "system_bot" else f"Betix group member {actor}"
         need = "a human Betix group member" if authority == "system_bot" else "the Betix system bot"

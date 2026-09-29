@@ -106,6 +106,11 @@ class Settings(BaseSettings):
     tg_group_send_interval_seconds: float = 3.0
     tg_private_send_interval_seconds: float = 0.4
     tg_sends_per_second: int = 25
+    # PAYMENT CONFIRMED must reach the operator for EVERY verified case: a failed send is retried on every sweep
+    # for this long, and a verified case without its notification (or a recorded confirmation that could not be
+    # applied yet) is picked up by the sweep for this many days.
+    notification_retry_minutes: int = 120
+    confirmation_sweep_days: int = 3
     add_session_seconds: int = 20  # an /add waits this long for the evidence, then it is DISCARDED
     add_discard_grace_seconds: int = 120  # a file arriving this soon after a discarded /add is refused, not a new case
     inline_job_workers: int = 8  # jobs running at once when INLINE_JOBS=true (app/workers/runner.py)

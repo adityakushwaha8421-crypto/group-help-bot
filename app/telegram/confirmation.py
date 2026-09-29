@@ -132,6 +132,16 @@ def _first(patterns, text):
     return None
 
 
+def strip_ids(text: str, betex_pattern: re.Pattern[str], plat_pattern: re.Pattern[str]) -> str:
+    """The message without order ids, withdrawal ids, UTRs and @mentions - what the person actually said."""
+    t = betex_pattern.sub(" ", text or "")
+    t = plat_pattern.sub(" ", t)
+    t = WITHDRAWAL_ID_RE.sub(" ", t)
+    t = re.sub(r"@\w+", " ", t)
+    t = re.sub(r"\b(?:UTR\s*:?\s*)?\d{12}\b", " ", t, flags=re.I)
+    return re.sub(r"\s+", " ", t).strip(" :-,")
+
+
 def extract_ids(
     text: str, betex_pattern: re.Pattern[str], plat_pattern: re.Pattern[str]
 ) -> tuple[list[str], list[str], list[str]]:
@@ -183,7 +193,9 @@ def classify_human_message(
         return Classification("UNKNOWN", 0.0, "regex", None, orders, plats, utrs)
     if t.startswith("/"):
         return Classification("IRRELEVANT", 0.95, "regex", "command", orders, plats, utrs)
-    if HUMAN_SUCCESS.match(t):
+    if HUMAN_SUCCESS.match(t) or HUMAN_SUCCESS.match(strip_ids(t, betex_pattern, plat_pattern)):
+        # "ILLUN-1790... done ✅" / "@fantasyAdda_support PI26... confirmed": the ids around the word do not
+        # change what the member said
         return Classification("SUCCESS", 0.9, "regex", t[:60], orders, plats, utrs)
     if HUMAN_NEED_MORE.search(t) and not SHARE_BOILERPLATE.search(t):
         return Classification("NEED_MORE_EVIDENCE", 0.85, "regex", t[:60], orders, plats, utrs)

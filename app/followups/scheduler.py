@@ -66,9 +66,32 @@ async def sweep(poster_factory) -> dict[str, int]:
         except Exception as exc:  # noqa: BLE001
             log.error("followup sweep error", case_id=case_id, number=number, error=repr(exc))
             results["error"] = results.get("error", 0) + 1
+    # PAYMENT CONFIRMED for every verified case, no matter what: recorded confirmations applied, missing
+    # notifications sent, failed sends retried. Each in its own transaction; a failure here never stops the loop.
+    for name, fn in (("confirmations", _safety_net), ("notifications", _resend)):
+        try:
+            async with session_scope() as session:
+                for k, v in (await fn(session)).items():
+                    results[k] = results.get(k, 0) + v
+        except Exception as exc:  # noqa: BLE001
+            log.error(f"{name} sweep error", error=repr(exc))
+            results["error"] = results.get("error", 0) + 1
     if results:
         log.info("followup sweep", **results)
     return results
+
+
+async def _safety_net(session) -> dict[str, int]:
+    from app.cases.manager import confirmation_safety_net
+
+    return await confirmation_safety_net(session)
+
+
+async def _resend(session) -> dict[str, int]:
+    from app.telegram.notifications import resend_failed_notifications
+
+    n = await resend_failed_notifications(session)
+    return {"notifications_resent": n} if n else {}
 
 
 async def run_forever(poster_factory, interval_seconds: int = 30, stop_event: asyncio.Event | None = None) -> None:

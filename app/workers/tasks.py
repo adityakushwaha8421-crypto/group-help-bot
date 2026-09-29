@@ -91,10 +91,32 @@ async def added_evidence_job(ctx, case_id: str) -> int:
         return await manager.post_added_evidence(session, case, poster_factory())
 
 
-async def betix_message_job(ctx, payload: dict) -> dict:
+BETIX_MESSAGE_RETRIES = 3
+BETIX_MESSAGE_RETRY_SECONDS = 15
+
+
+async def betix_message_job(ctx, payload: dict, attempt: int = 0) -> dict:
+    """One Betix group message. A crash (database hiccup, network) must never lose a confirmation: the job is
+    retried a few times, then the failure is logged loudly."""
     msg = IncomingGroupMessage.from_dict(payload)
-    async with session_scope() as session:
-        result = await handle_group_message(session, msg)
+    try:
+        async with session_scope() as session:
+            result = await handle_group_message(session, msg)
+    except Exception as exc:  # noqa: BLE001
+        if attempt + 1 >= BETIX_MESSAGE_RETRIES:
+            log.error(
+                "betix message given up after retries", message_id=msg.message_id, attempts=attempt + 1, error=repr(exc)
+            )
+            raise
+        log.warning("betix message failed; retrying", message_id=msg.message_id, attempt=attempt + 1, error=repr(exc))
+        await enqueue(
+            "betix_message_job",
+            payload,
+            attempt + 1,
+            job_id=f"betix-{msg.chat_id}-{msg.message_id}-retry{attempt + 1}",
+            defer_seconds=BETIX_MESSAGE_RETRY_SECONDS,
+        )
+        return {"action": "retry", "attempt": attempt + 1}
     if result.get("action") == "pi_ready":  # the /pi UPI check picked the order: post it now
         await enqueue("post_case_job", result["case_id"], job_id=f"post-{result['case_id']}")
     return result

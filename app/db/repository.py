@@ -246,12 +246,17 @@ async def find_case_by_order_ids(
         conds.append(Case.utr == utr)
     if not conds:
         return []
+    from sqlalchemy import case as sql_case
     from sqlalchemy import or_
 
+    # A Betix reply that names the order belongs to the case that is with Betix (monitoring). A case that is not
+    # there yet (still being posted) is found too, so the confirmation is RECORDED and applied once it can be.
+    monitoring = [s.value for s in MONITORING_STATUSES]
+    statuses = monitoring + [s.value for s in OPEN_STATUSES if s not in MONITORING_STATUSES]
     res = await session.execute(
         select(Case)
-        .where(or_(*conds), Case.status.in_([s.value for s in MONITORING_STATUSES]))
-        .order_by(Case.id.desc())
+        .where(or_(*conds), Case.status.in_(statuses))
+        .order_by(sql_case((Case.status.in_(monitoring), 0), else_=1), Case.id.desc())
     )
     return list(res.scalars())
 
