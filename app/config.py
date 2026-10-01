@@ -178,8 +178,8 @@ class Settings(BaseSettings):
 
     # Follow-ups
     # Follow-ups ("Any update?" replies to our screenshot post) at these minutes AFTER POSTING, while the payment
-    # is not solved: 2 h, 8 h, 24 h, 48 h. Confirmation cancels whatever is left immediately.
-    followup_schedule_minutes: str = "120,480,1440,2880"
+    # is not solved: 30 min, 2 h, 4 h (user, 2026-10-01). Confirmation cancels whatever is left immediately.
+    followup_schedule_minutes: str = "30,120,240"
     escalation_delay_minutes: int = 480  # manual-review alert this long after the LAST follow-up
     # Seconds-resolution overrides. Empty in production; set them to rehearse the reminder chain in under a
     # minute ("10,20,30") without waiting half an hour for the first reply.

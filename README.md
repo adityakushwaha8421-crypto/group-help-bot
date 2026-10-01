@@ -167,7 +167,7 @@ Fill in `.env`. The important ones:
 | `BETIX_SYSTEM_BOT_USERNAMES` | `betixpay_cs_bot` |
 | `CONFIRMATION_MODE` | `either` (default: system bot OR any group member) or `strict` (both) |
 | `ILLUNISE_ADMIN_USERNAME` / `PASSWORD` | admin panel credentials, never logged |
-| `FOLLOWUP_SCHEDULE_MINUTES`, `ESCALATION_DELAY_MINUTES` | 120,480,1440,2880 / 480 |
+| `FOLLOWUP_SCHEDULE_MINUTES`, `ESCALATION_DELAY_MINUTES` | 30,120,240 / 480 |
 | `ORDER_MATCH_THRESHOLD`, `ORDER_MATCH_AMBIGUITY_GAP`, `PAYMENT_TIME_WINDOW_MINUTES` | 0.90 / 0.10 / 15 |
 
 **Two Telegram credential sets.** `TELEGRAM_BOT_TOKEN` is the **Bot API** credential and is always required.

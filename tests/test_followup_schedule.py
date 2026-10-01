@@ -1,5 +1,5 @@
-"""Follow-up timing: replies to the SAME screenshot post at fixed offsets after posting (2 h, 8 h, 24 h, 48 h
-in production), all cancelled the moment the payment is confirmed."""
+"""Follow-up timing: replies to the SAME screenshot post at fixed offsets after posting (30 min, 2 h, 4 h in
+production; any list works), all cancelled the moment the payment is confirmed."""
 
 from datetime import timedelta
 
@@ -94,3 +94,14 @@ async def test_confirmation_stops_the_remaining_followups_immediately(
             f.status, f.due_at = "scheduled", utcnow() - timedelta(minutes=1)
     assert await sweep(lambda: fake_poster) == {"skipped": 5}
     assert len(fake_poster.texts) == 2
+
+
+def test_the_production_default_is_30_min_2_h_4_h(monkeypatch):
+    """User, 2026-10-01: "Any update?" 30 min, 2 h and 4 h after the post; manual review 8 h after the last."""
+    monkeypatch.delenv("FOLLOWUP_SCHEDULE_MINUTES", raising=False)
+    monkeypatch.delenv("ESCALATION_DELAY_MINUTES", raising=False)
+    from app.config import Settings
+
+    s = Settings(_env_file=None)
+    assert s.followup_delays == [timedelta(minutes=m) for m in (30, 120, 240)]
+    assert s.escalation_delay == timedelta(minutes=480)
