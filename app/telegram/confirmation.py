@@ -18,6 +18,11 @@ SYS_SUCCESS = [
     re.compile(r"Status\s*│\s*✅\s*Confirmed", re.I),
     re.compile(r"Status\s*:\s*✅\s*Confirmed", re.I),
     re.compile(r"^✅\s*Order\b.*Order ID", re.I | re.S),
+    # "OrderStatus: Failed | CallbackStatus: Success" (live 2026-10-02, ILLUN-17896364668745): Betix completed
+    # the order by hand - the success callback reached the merchant and Illunise shows Success, while the
+    # order's own status stays Failed / Expired. The CALLBACK status is what says the payment was credited.
+    # (Keep new patterns at the END: SYS_SUCCESS[4] is referenced by index below.)
+    re.compile(r"CallbackStatus\s*:\s*Success", re.I),
 ]
 SYS_FAILED = [
     re.compile(r"🛑\s*STATUS\s*:\s*Fail", re.I),

@@ -71,6 +71,33 @@ def test_system_templates():
     assert classify_system_message(ILLUN_CARD, BX, PL).outcome == "SUCCESS"
 
 
+# Live 2026-10-02: Betix completed a failed order by hand. Illunise showed Success; the bot read "Failed".
+PI_FAILED_CALLBACK_OK = (
+    "Order's UPI: fasil-h@ptyes\n💵OrderAmount: 1000\n 💰PaidAmount: 0\n"
+    "📄OrderStatus: Failed | 🔁CallbackStatus: Success\n🧾UTR: NA\n"
+    "📌PlatOrderNo: PI2609175tt4dkigc2f ( 52 )\n📌MerchantOrderNo: ILLUN-17896364668745\n"
+    "🕒CreatedTime: 2026-09-17 14:44:27 +05:30\n🕒UpdatedTime: 2026-09-17 14:44:27 +05:30"
+)
+
+
+def test_callback_success_is_a_confirmation_whatever_the_order_status():
+    c = classify_system_message(PI_FAILED_CALLBACK_OK, BX, PL)
+    assert c.outcome == "SUCCESS" and c.confidence >= 0.95
+    assert c.order_ids == ["ILLUN-17896364668745"] and c.plat_order_nos == ["PI2609175tt4dkigc2f"]
+    for status in ("Expired", "Closed", "Paid", "Pending"):
+        t = PI_FAILED_CALLBACK_OK.replace("OrderStatus: Failed", f"OrderStatus: {status}")
+        assert classify_system_message(t, BX, PL).outcome == "SUCCESS", status
+    # the callback did NOT succeed: the order status decides, as before
+    for cb, want in (("Init", "FAILED"), ("Failed", "FAILED"), ("Pending", "FAILED")):
+        t = PI_FAILED_CALLBACK_OK.replace("CallbackStatus: Success", f"CallbackStatus: {cb}")
+        assert classify_system_message(t, BX, PL).outcome == want, cb
+    assert classify_system_message(PI_PENDING, BX, PL).outcome == "PENDING"
+    # a reversed withdrawal is still a reversal, never a confirmation
+    rev = PI_FAILED_CALLBACK_OK.replace("OrderStatus: Failed", "OrderStatus: Reversed")
+    c = classify_system_message(rev, BX, PL)
+    assert c.outcome == "FAILED" and c.extra.get("reversed")
+
+
 def test_human_phrases():
     for t in [
         "Success",

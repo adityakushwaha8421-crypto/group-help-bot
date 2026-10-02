@@ -196,3 +196,25 @@ async def test_the_sweep_leaves_old_and_reversed_cases_alone(
         c.verified_at = c.verified_at - timedelta(days=10)  # long closed: not the sweep's business
     assert (await sweep(lambda: fake_poster)).get("notified_late") is None
     assert len(confirmed_texts(fake_bot)) == 1
+
+
+async def test_failed_order_with_callback_success_confirms_the_case(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, either
+):
+    """Live 2026-10-02: "OrderStatus: Failed | CallbackStatus: Success" from the Betix bot is the confirmation."""
+    case_id = await posted(db, order_search, fake_poster)
+    text = (
+        "Order's UPI: fasil-h@ptyes\n💵OrderAmount: 6500\n 💰PaidAmount: 0\n"
+        "📄OrderStatus: Failed | 🔁CallbackStatus: Success\n🧾UTR: NA\n"
+        "📌PlatOrderNo: PI2609175tt4dkigc2f ( 52 )\n📌MerchantOrderNo: ILLUN-178621243657290\n"
+        "🕒CreatedTime: 2026-09-17 14:44:27 +05:30"
+    )
+    async with db.session_scope() as s:
+        r = await handle_group_message(s, make_group_msg(610, text, sender_username="betixpay_cs_bot", is_bot=True))
+        assert r["action"] == "verified", r
+    texts = confirmed_texts(fake_bot)
+    assert len(texts) == 1 and "Betix System" in texts[0] and "ILLUN-178621243657290" in texts[0]
+    assert not any("MANUAL REVIEW" in t for _, t in fake_bot.sent)
+    async with db.session_scope() as s:
+        c = await get_case(s, case_id)
+        assert c.status == CaseStatus.VERIFIED.value and c.followup_cancelled
