@@ -814,7 +814,7 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
     pi_note = ""
     if s.betix_pi_check and doubtful:
         started, pi_note = await start_pi_check(
-            session, case, doubtful, f"no order is a clear match ({result.reason}); {len(doubtful)} fit amount and time"
+            session, case, doubtful, f"no order is a clear match ({result.reason}); {len(doubtful)} close in time"
         )
         if started:
             return "checking_upi"
@@ -824,8 +824,10 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
         # Orders DO sit right before the payment with the right amount: never "no order". Say which, and why none
         # of them could be confirmed (no receiver UPI on the screenshot, /pi not possible ...).
         first_fit = doubtful[0].candidate
+        same_amount = all((sc.signals.get("amount") or {}).get("score") == 1.0 for sc in doubtful)
+        what = f"of about ₹{case.amount:,.2f} were" if same_amount else "under this number were"
         reason = (
-            f"{len(doubtful)} order(s) of about ₹{case.amount:,.2f} were created just before the payment ({when}), "
+            f"{len(doubtful)} order(s) {what} created just before the payment ({when}, ₹{case.amount:,.2f}), "
             f"nearest {first_fit.betex_order_id}, but none could be confirmed" + (f": {pi_note}" if pi_note else ".")
         )
         lines = [
@@ -992,7 +994,26 @@ def doubt_candidates(result: MatchResult) -> list:
         and ((sc.signals.get("time") or {}).get("score") or 0) > 0.0
         and (sc.signals.get("gateway") or {}).get("score") != 0.0
     ]
-    return sorted(fit, key=lambda sc: (lead(sc), -sc.score))[: s.pi_check_max_orders]
+    fit.sort(key=lambda sc: (lead(sc), -sc.score))
+    # The customer's OWN order, created inside the window right before the payment, but for ANOTHER amount
+    # (live 2026-10-03: order ₹300 at 18:47, paid ₹330 at 18:48 - the customer typed a different amount).
+    # Asked after the orders whose amount fits; only its UPI can make it the order.
+    other_amount = [sc for sc in result.scored if own_order_other_amount(sc)]
+    other_amount.sort(key=lambda sc: (lead(sc), -sc.score))
+    return (fit + other_amount)[: s.pi_check_max_orders]
+
+
+def own_order_other_amount(sc) -> bool:
+    """Registered to the case's mobile, a Betix order, created before the payment inside the time window - and
+    its amount is NOT the paid amount."""
+    sig = sc.signals
+    return bool(
+        sc.candidate.betex_order_id
+        and (sig.get("registration") or {}).get("score") == 1.0
+        and (sig.get("amount") or {}).get("score") != 1.0
+        and ((sig.get("time") or {}).get("score") or 0) >= 0.7
+        and (sig.get("gateway") or {}).get("score") != 0.0
+    )
 
 
 def candidate_line(sc, tz: str) -> str:
@@ -1219,6 +1240,22 @@ async def resolve_pi_check(session: AsyncSession, case_id: str, *, timed_out: st
                     details={"reason": reason, "checked": asked},
                 )
             )
+            paid, ordered = case.amount, row.amount
+            if paid is not None and ordered is not None and abs(paid - ordered) > s.order_amount_tolerance:
+                # the customer paid another amount than the order's: matched by UPI, and the operator is told
+                reason += f"; order amount ₹{ordered:,.2f}, paid ₹{paid:,.2f}"
+                await notify_admin(
+                    session,
+                    kind="amount_differs",
+                    case=case,
+                    dedupe_suffix=current,
+                    text=format_info(
+                        case,
+                        "Order matched by UPI \u2014 amount differs",
+                        f"🧾 Order: {current}\n💵 Order amount: ₹{ordered:,.2f}\n💰 Paid: ₹{paid:,.2f}\n"
+                        f"🏦 UPI: {answers[current]} fits the screenshot.\nSent to Betix with this order id.",
+                    ),
+                )
             return await select_order(
                 session, case, row, reason=reason, confidence=row.score, signals={"pi_checked": asked, "why": why}
             )

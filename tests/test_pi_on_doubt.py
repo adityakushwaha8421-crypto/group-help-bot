@@ -62,7 +62,10 @@ async def test_a_clear_match_needs_no_pi(db, fake_bot, order_search, no_download
 async def test_an_order_that_fits_neither_amount_nor_time_is_never_asked(
     db, fake_bot, order_search, no_download, fake_poster, setup
 ):
-    wrong = [{**GOOD[0], "amount": 9000.0}, {**GOOD[0], "betex_order_id": B, "order_time": "2026-09-10 12:00:00"}]
+    wrong = [
+        {**GOOD[0], "amount": 9000.0, "registration_number": "9000000001"},  # another customer's, another amount
+        {**GOOD[0], "betex_order_id": B, "order_time": "2026-09-10 12:00:00"},  # hours before the payment
+    ]
     manager.set_order_search(None)
     _, outcome = await run_until_ready(db, order_search, wrong)
     assert outcome == "escalated" and pi_queries(fake_poster) == {}
@@ -98,4 +101,73 @@ async def test_an_order_created_after_the_payment_is_never_asked(
 ):
     after = [{**GOOD[0], "order_time": "2026-09-10 19:50:00"}]
     _, outcome = await run_until_ready(db, order_search, after)
+    assert outcome == "escalated" and pi_queries(fake_poster) == {}
+
+
+# ---------------------------------------------------------------- the customer's own order, another amount
+# Live 2026-10-03 (CASE-20261003-000039): order ₹300 created 18:47 under the customer's mobile, ₹330 paid at 18:48.
+# It went to Manual Review as "no order" - it is a DOUBT: asked with /pi, and its UPI decides.
+OWN_OTHER_AMOUNT = [{**GOOD[0], "amount": 6000.0, "status": "Expired"}]  # paid: ₹6,499.92
+
+
+async def test_own_order_with_another_amount_is_checked_with_pi_and_matched_by_upi(
+    db, fake_bot, order_search, no_download, fake_poster, setup
+):
+    case_id, outcome = await run_until_ready(db, order_search, OWN_OTHER_AMOUNT)
+    assert outcome == "checking_upi"
+    assert list(pi_queries(fake_poster)) == [f"/pi {A}"]
+    qid = (await query_ids(db, case_id))[A]
+    r = await answer(db, 900, pi_answer(A, "shoriful-5011@ptyes"), qid)
+    assert r["action"] == "pi_ready"
+    async with db.session_scope() as s:
+        c = await get_case(s, case_id)
+        assert c.status == CaseStatus.READY_FOR_BETIX.value and c.betex_pay_order_id == A
+    assert not any("MANUAL REVIEW" in t for _, t in fake_bot.sent)
+    told = [t for _, t in fake_bot.sent if "amount differs" in t]
+    assert len(told) == 1 and "₹6,000.00" in told[0] and "₹6,499.92" in told[0]
+
+
+async def test_own_order_with_another_amount_and_another_upi_is_manual_review(
+    db, fake_bot, order_search, no_download, fake_poster, setup
+):
+    case_id, _ = await run_until_ready(db, order_search, OWN_OTHER_AMOUNT)
+    qid = (await query_ids(db, case_id))[A]
+    await answer(db, 900, pi_answer(A, "someoneelse-7777@okaxis"), qid)
+    async with db.session_scope() as s:
+        c = await get_case(s, case_id)
+        assert c.status == CaseStatus.ORDER_MATCH_AMBIGUOUS.value and not c.betex_pay_order_id
+    assert any("MANUAL REVIEW" in t for _, t in fake_bot.sent)
+    assert not any("amount differs" in t for _, t in fake_bot.sent)
+
+
+async def test_orders_that_fit_the_amount_are_asked_before_one_that_does_not(
+    db, fake_bot, order_search, no_download, fake_poster, setup
+):
+    cands = [
+        {**GOOD[0], "amount": 6000.0, "status": "Expired", "order_time": "2026-09-10 19:31:30"},  # nearest, other ₹
+        {**GOOD[0], "illunise_order_id": "1003", "betex_order_id": B, "status": "Success", "utr": OTHER_UTR,
+         "order_time": "2026-09-10 19:20:00"},
+    ]  # fmt: skip
+    case_id, outcome = await run_until_ready(db, order_search, cands)
+    assert outcome == "checking_upi"
+    assert list(pi_queries(fake_poster)) == [f"/pi {B}"]  # the amount fits: first, although it is further away
+    await answer(db, 900, pi_answer(B, "someoneelse-7777@okaxis"), (await query_ids(db, case_id))[B])
+    assert list(pi_queries(fake_poster)) == [f"/pi {B}", f"/pi {A}"]  # then the customer's other-amount order
+
+
+async def test_another_customers_order_with_another_amount_is_never_asked(
+    db, fake_bot, order_search, no_download, fake_poster, setup
+):
+    _, outcome = await run_until_ready(
+        db, order_search, [{**GOOD[0], "amount": 6000.0, "registration_number": "9000000001"}]
+    )
+    assert outcome == "escalated" and pi_queries(fake_poster) == {}
+
+
+async def test_own_order_of_another_amount_long_before_the_payment_is_never_asked(
+    db, fake_bot, order_search, no_download, fake_poster, setup
+):
+    _, outcome = await run_until_ready(
+        db, order_search, [{**GOOD[0], "amount": 6000.0, "order_time": "2026-09-10 17:00:00"}]
+    )
     assert outcome == "escalated" and pi_queries(fake_poster) == {}
