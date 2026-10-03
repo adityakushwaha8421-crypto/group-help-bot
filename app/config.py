@@ -161,6 +161,9 @@ class Settings(BaseSettings):
     #   "matched" = only the order that matched | "all" = every /pi of the case, once an order matched | "off"
     pi_cleanup: Literal["each", "matched", "all", "off"] = "each"
     upi_ending_min_chars: int = 3
+    # Paid amount differs from the order amount (more than ORDER_AMOUNT_TOLERANCE): say so in the Betix group, as a
+    # reply to the screenshot post ("User paid extra amount" / "User paid less amount").
+    betix_amount_note: bool = True
     betix_followup_text: str = "Any update?"  # both follow-ups, sent as replies to the screenshot post
     # Bank statement / payment video in the Betix group. They are only ever sent as REPLIES to the screenshot post:
     #   always     = statement (+ its password) and video go right after the screenshot, as replies  [default]

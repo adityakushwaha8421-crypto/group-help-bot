@@ -188,7 +188,28 @@ class BetixPoster:
                 details={"message_id": mid, "reply_to": root_id},
             )
             await session.commit()
+        await self.send_amount_note(session, case, root_id)
         case.betix_posted_at = case.betix_posted_at or utcnow()
+
+    async def send_amount_note(self, session: AsyncSession, case: Case, root_id: int | None) -> int | None:
+        """The customer paid MORE or LESS than the order's amount: tell the Betix group, once, as a reply to the
+        screenshot post. Never fails the post."""
+        text = amount_note(case, self.s.order_amount_tolerance)
+        if not text or not self.s.betix_amount_note or not root_id:
+            return None
+        if await case_has_out_kind(session, case.case_id, "amount_note"):
+            return None
+        try:
+            mid = await self._send_text(text, reply_to=root_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("amount note not sent", case_id=case.case_id, error=str(exc)[:160])
+            return None
+        await self._record(session, case, mid, "amount_note", text, root_id)
+        await audit(
+            session, "BETIX_AMOUNT_NOTE", case_id=case.case_id, result=text.split("\n")[0], details={"message_id": mid}
+        )
+        await session.commit()
+        return mid
 
     async def post_withdrawal(self, session: AsyncSession, case: Case, evidence: list[Evidence]) -> None:
         """WITHDRAWAL: the group receives the id as "BX<withdrawal id>" (one plain text message, the case's
@@ -290,3 +311,20 @@ class BetixPoster:
         elif number == 2:
             case.followup_2_message_id = mid
         return mid
+
+
+def amount_note(case: Case, tolerance: float) -> str | None:
+    """ "User paid extra amount" / "User paid less amount" with both figures - None when the amounts agree
+    (inside ORDER_AMOUNT_TOLERANCE: the padded paise of a normal Betix payment are not a difference)."""
+    paid, ordered = case.amount, case.order_amount
+    if paid is None or ordered is None:
+        return None
+    diff = round(float(paid) - float(ordered), 2)
+    if abs(diff) <= tolerance + 1e-9:
+        return None
+    head = "User paid extra amount." if diff > 0 else "User paid less amount."
+    word = "Extra" if diff > 0 else "Less"
+    return (
+        f"{head}\nOrder amount: ₹{ordered:,.2f}\nPaid amount: ₹{paid:,.2f}\n{word}: ₹{abs(diff):,.2f}\n"
+        f"Order: {case.betex_pay_order_id}"
+    )

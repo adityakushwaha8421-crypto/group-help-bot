@@ -171,3 +171,59 @@ async def test_own_order_of_another_amount_long_before_the_payment_is_never_aske
         db, order_search, [{**GOOD[0], "amount": 6000.0, "order_time": "2026-09-10 17:00:00"}]
     )
     assert outcome == "escalated" and pi_queries(fake_poster) == {}
+
+
+# ---------------------------------------------------------------- the Betix group is told (2026-10-03)
+async def post_own_other_amount(db, order_search, fake_poster, ordered: float) -> str:
+    case_id, _ = await run_until_ready(db, order_search, [{**GOOD[0], "amount": ordered, "status": "Expired"}])
+    qid = (await query_ids(db, case_id))[A]
+    await answer(db, 900, pi_answer(A, "shoriful-5011@ptyes"), qid)
+    async with db.session_scope() as s:
+        assert await manager.post_case_to_betix(s, case_id, fake_poster) == "posted"
+    return case_id
+
+
+def notes(fake_poster):
+    return [(t, r) for t, r in fake_poster.texts if "User paid" in t]
+
+
+async def test_the_betix_group_is_told_the_user_paid_extra(db, fake_bot, order_search, no_download, fake_poster, setup):
+    case_id = await post_own_other_amount(db, order_search, fake_poster, 6000.0)  # paid ₹6,499.92
+    async with db.session_scope() as s:
+        root = (await get_case(s, case_id)).betix_root_message_id
+    ((text, reply_to),) = notes(fake_poster)
+    assert reply_to == root  # a reply to the screenshot post
+    assert text.startswith("User paid extra amount.")
+    assert "Order amount: ₹6,000.00" in text and "Paid amount: ₹6,499.92" in text and "Extra: ₹499.92" in text
+    assert A in text
+    async with db.session_scope() as s:  # posting again never repeats it
+        from app.db.repository import list_evidence
+
+        await fake_poster.post_case(s, await get_case(s, case_id), await list_evidence(s, case_id))
+    assert len(notes(fake_poster)) == 1
+
+
+async def test_the_betix_group_is_told_the_user_paid_less(db, fake_bot, order_search, no_download, fake_poster, setup):
+    await post_own_other_amount(db, order_search, fake_poster, 7000.0)
+    ((text, _),) = notes(fake_poster)
+    assert text.startswith("User paid less amount.") and "Less: ₹500.08" in text
+
+
+async def test_no_note_when_the_amounts_agree(db, fake_bot, order_search, no_download, fake_poster, setup):
+    case_id, outcome = await run_until_ready(db, order_search, GOOD)
+    assert outcome == "ready"
+    async with db.session_scope() as s:
+        assert await manager.post_case_to_betix(s, case_id, fake_poster) == "posted"
+    assert notes(fake_poster) == []
+
+
+def test_padded_paise_are_not_a_difference():
+    from types import SimpleNamespace
+
+    from app.telegram.betix_poster import amount_note
+
+    case = SimpleNamespace(amount=13999.35, order_amount=14000.0, betex_pay_order_id=A)
+    assert amount_note(case, 1.0) is None
+    case.amount = 330.0
+    case.order_amount = 300.0
+    assert amount_note(case, 1.0).startswith("User paid extra amount.")
