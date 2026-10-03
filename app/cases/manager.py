@@ -1706,6 +1706,78 @@ async def _last_success_event(session: AsyncSession, case_id: str):
     return res.scalars().first()
 
 
+async def reopen_wrongly_confirmed_withdrawals(session: AsyncSession, since) -> dict[str, int]:
+    """Between 2026-10-02 and 2026-10-03 the Betix bot's "OrderStatus: Completed | CallbackStatus: Success" closed
+    WITHDRAWAL cases as confirmed. That status is no resolution. Such a case is put back to waiting (its
+    remaining follow-ups re-armed), so the Reversed that really solves it is still seen and acted on."""
+    from sqlalchemy import select, update
+
+    from app.db.models import Followup
+    from app.db.repository import record_status_change
+
+    rows = (
+        (
+            await session.execute(
+                select(Case).where(
+                    Case.kind == KIND_WITHDRAWAL,
+                    Case.status == CaseStatus.VERIFIED.value,
+                    Case.confirmation_type == "system_bot",
+                    Case.verified_at >= since,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    n = 0
+    for case in rows:
+        ev = await _last_success_event(session, case.case_id)
+        matched = (((ev.details or {}).get("classification") or {}).get("matched") or "") if ev else ""
+        if "callbackstatus" not in matched.lower():
+            continue
+        log.warning("reopening a withdrawal closed by 'CallbackStatus: Success'", case_id=case.case_id)
+        await record_status_change(
+            session,
+            case,
+            CaseStatus.WAITING_FOR_CONFIRMATION,
+            "reopened: Betix's Completed status is not a resolution; a withdrawal is solved by Reversed",
+            "system",
+        )
+        case.verified_at = None
+        case.confirmed_by = None
+        case.confirmation_type = None
+        case.confirmation_message_id = None
+        case.confirmation_user_id = None
+        case.confirmation_username = None
+        case.confirmation_at = None
+        case.system_confirmed_at = None
+        case.followup_cancelled = False
+        await session.execute(
+            update(Followup)
+            .where(Followup.case_id == case.case_id, Followup.status == "cancelled", Followup.due_at > utcnow())
+            .values(status="scheduled")
+        )
+        await audit(
+            session, "WITHDRAWAL_REOPENED", case_id=case.case_id, result="not_reversed", details={"was": matched}
+        )
+        await notify_admin(
+            session,
+            kind="withdrawal_reopened",
+            case=case,
+            text=format_info(
+                case,
+                "Withdrawal reopened \u2014 it was NOT solved",
+                "The earlier PAYMENT CONFIRMED for this withdrawal was wrong: Betix only showed it as completed.\n"
+                "A withdrawal is solved only when Betix reverses it. Waiting for Reversed again.",
+            ),
+        )
+        from app.telegram.progress import push
+
+        await push(session, case)
+        n += 1
+    return {"withdrawals_reopened": n} if n else {}
+
+
 async def confirmation_safety_net(session: AsyncSession) -> dict[str, int]:
     """Runs on every sweep. Whatever happened in between (a crash, Telegram down, a confirmation that came while
     the post was still in flight), EVERY confirmed case ends VERIFIED with its PAYMENT CONFIRMED sent - once.
@@ -1726,10 +1798,13 @@ async def confirmation_safety_net(session: AsyncSession) -> dict[str, int]:
     out: dict[str, int] = {}
     terminal = TERMINAL_OK | {CaseStatus.FAILED.value}
 
+    out.update(await reopen_wrongly_confirmed_withdrawals(session, since))
+
     recorded = (
         (
             await session.execute(
                 select(Case).where(
+                    Case.kind != KIND_WITHDRAWAL,  # a withdrawal is closed by Reversed only
                     Case.status.notin_(list(terminal)),
                     or_(Case.system_confirmed_at.isnot(None), Case.reviewer_confirmed_at.isnot(None)),
                     Case.updated_at >= since,
@@ -1768,6 +1843,7 @@ async def confirmation_safety_net(session: AsyncSession) -> dict[str, int]:
         (
             await session.execute(
                 select(Case).where(
+                    Case.kind != KIND_WITHDRAWAL,
                     Case.status == CaseStatus.VERIFIED.value,
                     Case.verified_at >= since,
                     or_(Case.confirmation_type.is_(None), Case.confirmation_type != "reversed"),
@@ -1851,6 +1927,33 @@ async def apply_verification_signal(
                 ),
             )
         return "ignored_unknown_sender"
+    if cls.outcome == "SUCCESS" and case.kind == KIND_WITHDRAWAL:
+        # "OrderStatus: Completed | CallbackStatus: Success" on a WITHDRAWAL is Betix saying the payout went out -
+        # the very thing the customer disputes. It solves nothing: a withdrawal is solved only when Betix
+        # REVERSES it (user rule, 2026-10-03). Recorded, told once, the case keeps waiting and following up.
+        await audit(
+            session,
+            "BETIX_WITHDRAWAL_STATUS",
+            case_id=case.case_id,
+            actor=actor,
+            result="completed_not_reversed",
+            confidence=cls.confidence,
+            source="betix_group",
+            details=cls.as_dict(),
+        )
+        await notify_admin(
+            session,
+            kind="withdrawal_not_reversed",
+            case=case,
+            text=format_info(
+                case,
+                "Withdrawal not solved yet",
+                f"Betix ({actor}) shows it as completed: {(cls.matched or '')[:120]}\n"
+                "A withdrawal is solved only when Betix reverses it.\n"
+                "Still waiting for Reversed; follow-ups continue.",
+            ),
+        )
+        return "withdrawal_not_resolved"
     if cls.outcome == "SUCCESS":
         if correlation_confidence < 0.8:
             await notify_admin(

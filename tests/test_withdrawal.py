@@ -72,9 +72,11 @@ async def test_posting_sends_bx_id_then_the_statement_as_a_reply(
     assert fake_poster.media_replies == [("bank_statement", 501)]  # the statement replies to it, nothing else
 
 
-async def test_confirmation_and_followups_work_as_for_a_payment(
+async def test_a_success_status_does_not_close_a_withdrawal(
     db, fake_bot, fake_ai, order_search, no_download, fake_poster, monkeypatch
 ):
+    """User rule 2026-10-03: a withdrawal is solved only by Reversed. Betix saying "successful / completed" is
+    the payout the customer disputes - the case keeps waiting and following up."""
     monkeypatch.setenv("CONFIRMATION_MODE", "either")
     from app.config import reset_settings_cache
 
@@ -88,10 +90,12 @@ async def test_confirmation_and_followups_work_as_for_a_payment(
         r = await handle_group_message(
             s, make_group_msg(601, SYS_OK, sender_username="betixpay_cs_bot", is_bot=True, reply_to=501)
         )
-        assert r["action"] == "verified"
+        assert r["action"] == "withdrawal_not_resolved"
         c = await get_case(s, cid)
-        assert c.status == CaseStatus.VERIFIED.value and c.followup_cancelled
-    assert any("PAYMENT CONFIRMED" in t and f"BX{WD}" in t for _, t in fake_bot.sent)
+        assert c.status == CaseStatus.WAITING_FOR_CONFIRMATION.value and not c.followup_cancelled
+        assert c.system_confirmed_at is None
+    assert not any("PAYMENT CONFIRMED" in t for _, t in fake_bot.sent)
+    assert any("Withdrawal not solved yet" in t and f"BX{WD}" in t for _, t in fake_bot.sent)
 
 
 async def test_the_same_withdrawal_id_is_posted_once(db, fake_bot, fake_ai, order_search, no_download, fake_poster):

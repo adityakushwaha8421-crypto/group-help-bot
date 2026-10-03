@@ -279,3 +279,118 @@ async def test_the_button_goes_from_every_admins_copy(
     async with db.session_scope() as s:
         assert await notifications.remove_buttons(s, cid, "refund_request") == 2
     assert {(c, markup) for c, _, markup in fake_bot.markup_edits} == {(8412466614, None), (7996741359, None)}
+
+
+# ------------------------------------------------------------------ "Completed" is not a resolution (2026-10-03)
+# Live: MerchantOrderNo BXWD-49437-70854, "OrderStatus: Completed | CallbackStatus: Success". That is Betix saying
+# the payout went out - the thing the customer disputes. A withdrawal is solved ONLY by Reversed.
+BOT_COMPLETED = (
+    "MerchantId B3126--INR\n💵OrderAmount: 14550\n📄OrderStatus: Completed | 🔁CallbackStatus: Success\n"
+    "🧾UTR: 299628437497\n📌PlatOrderNo: PO2610013c276tvh2gf(72)\n"
+    f"📌MerchantOrderNo: BX{WD}\n🕒CreatedTime: 2026-10-01 15:00:38 +05:30\n"
+    "🕒UpdatedTime: 2026-10-01 17:07:08 +05:30\n\n👩‍🎓Beneficiary Information👩‍🎓:\nBeneficiary Name: RANIK\n"
+    "Beneficiary Account: 2206110010040905\nIFSC: UJVN0002206"
+)
+
+
+async def posted_withdrawal(db, fake_poster) -> str:
+    async with db.session_scope() as s:
+        cid = (await attach_message(s, make_input(1, "text", WD))).case.case_id
+        await attach_message(s, make_input(2, "document"))
+    async with db.session_scope() as s:
+        await manager.process_case(s, cid, force=True)
+        await manager.post_case_to_betix(s, cid, fake_poster)
+    return cid
+
+
+async def test_completed_callback_success_does_not_close_a_withdrawal(
+    db, fake_bot, no_download, fake_poster, jobs, refunder
+):
+    from app.db.repository import list_followups
+    from app.followups.scheduler import sweep
+
+    cid = await posted_withdrawal(db, fake_poster)
+    async with db.session_scope() as s:
+        r = await handle_group_message(
+            s, make_group_msg(620, BOT_COMPLETED, sender_username="betixpay_cs_bot", is_bot=True)
+        )
+        assert r["action"] == "withdrawal_not_resolved" and r["case_id"] == cid
+        r = await handle_group_message(s, make_group_msg(621, "Success", sender_username="wendy", reply_to=501))
+        assert r["action"] == "withdrawal_not_resolved"  # a member's "success" is the same claim
+    await sweep(lambda: fake_poster)  # the safety net must not close it either
+    async with db.session_scope() as s:
+        c = await get_case(s, cid)
+        assert c.status == CaseStatus.WAITING_FOR_CONFIRMATION.value and not c.followup_cancelled
+        assert c.system_confirmed_at is None and c.reviewer_confirmed_at is None
+        assert any(f.status == "scheduled" for f in await list_followups(s, cid))
+    assert not texts(fake_bot, "PAYMENT CONFIRMED") and not texts(fake_bot, "WITHDRAWAL REVERSED")
+    assert len(texts(fake_bot, "Withdrawal not solved yet")) == 1  # told once, not per message
+
+    # the Reversed that really solves it still starts the reversed flow
+    async with db.session_scope() as s:
+        r = await handle_group_message(
+            s, make_group_msg(622, BOT_REVERSED, sender_username="betixpay_cs_bot", is_bot=True)
+        )
+        assert r["action"] == "reversal_check_queued"
+
+
+async def test_a_withdrawal_closed_by_callback_success_is_reopened(
+    db, fake_bot, no_download, fake_poster, jobs, refunder
+):
+    """The case as the 2026-10-02 build left it: VERIFIED by the bot's "CallbackStatus: Success", follow-ups
+    cancelled. The sweep puts it back to waiting, so Reversed is still seen."""
+    from app.db.repository import add_verification_event, list_followups
+    from app.followups.scheduler import sweep
+
+    cid = await posted_withdrawal(db, fake_poster)
+    async with db.session_scope() as s:
+        c = await get_case(s, cid)
+        await add_verification_event(
+            s,
+            case_id=cid,
+            dedupe_key="msg:620",
+            event_type="SYSTEM_SUCCESS",
+            authority="system_bot",
+            betix_message_id=620,
+            actor="@betixpay_cs_bot",
+            confidence=0.99,
+            details={"classification": {"outcome": "SUCCESS", "matched": "CallbackStatus: Success"}},
+        )
+        c.system_confirmed_at = c.betix_posted_at
+        assert await manager.verify_case(
+            s, c, confirmed_by="Betix system (@betixpay_cs_bot)", confirmation_type="system_bot"
+        )
+    assert len(texts(fake_bot, "PAYMENT CONFIRMED")) == 1
+
+    r = await sweep(lambda: fake_poster)
+    assert r.get("withdrawals_reopened") == 1
+    async with db.session_scope() as s:
+        c = await get_case(s, cid)
+        assert c.status == CaseStatus.WAITING_FOR_CONFIRMATION.value
+        assert c.verified_at is None and c.system_confirmed_at is None and not c.followup_cancelled
+        assert any(f.status == "scheduled" for f in await list_followups(s, cid))
+    assert len(texts(fake_bot, "Withdrawal reopened")) == 1
+    assert (await sweep(lambda: fake_poster)).get("withdrawals_reopened") is None  # once
+    assert len(texts(fake_bot, "<b>PAYMENT CONFIRMED</b>")) == 1  # and never "confirmed" again
+
+    async with db.session_scope() as s:
+        r = await handle_group_message(
+            s, make_group_msg(622, BOT_REVERSED, sender_username="betixpay_cs_bot", is_bot=True)
+        )
+        assert r["action"] == "reversal_check_queued" and r["case_id"] == cid
+
+
+async def test_a_withdrawal_solved_by_reversed_is_never_reopened(
+    db, fake_bot, no_download, fake_poster, jobs, refunder
+):
+    from app.followups.scheduler import sweep
+
+    cid = await reversed_case(db, fake_poster)
+    assert await manager.reversal_check(cid) == "asked"
+    async with db.session_scope() as s:
+        await manager.approve_refund(s, cid, "@me")
+    assert await manager.refund_approved_withdrawal(cid) == "reversed"
+    assert (await sweep(lambda: fake_poster)).get("withdrawals_reopened") is None
+    async with db.session_scope() as s:
+        assert (await get_case(s, cid)).status == CaseStatus.VERIFIED.value
+    assert not texts(fake_bot, "Withdrawal reopened") and not texts(fake_bot, "PAYMENT CONFIRMED")
