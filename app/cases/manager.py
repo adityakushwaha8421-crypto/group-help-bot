@@ -92,16 +92,28 @@ def set_statement_dater(fn) -> None:
 
 def _readable_statement(path, password: str | None):
     """The statement as a PDF that can be read (decrypted with the password when protected); None when it cannot."""
+
+    return _readable_statement_why(path, password)[0]
+
+
+def _readable_statement_why(path, password: str | None):
+    """(readable PDF or None, why not: "no password" | "wrong password" | "unreadable" | "ok")."""
     from pathlib import Path
 
-    from app.evidence.pdf import decrypt_pdf, pdf_is_encrypted, pdf_view
+    from app.evidence.pdf import open_protected_pdf, pdf_is_encrypted, pdf_view
 
     if not path:
-        return None
+        return None, UNREADABLE_PDF
     view = pdf_view(path) or Path(path)
-    if pdf_is_encrypted(view):
-        view = decrypt_pdf(path, password) if password else None
-    return Path(view) if view else None
+    if not pdf_is_encrypted(view):
+        return Path(view), "ok"
+    if not password:
+        return None, "no password"
+    opened, why = open_protected_pdf(view, password)  # the VIEW: a .uu statement is decrypted as the PDF it is
+    return (Path(opened), "ok") if opened else (None, why)
+
+
+UNREADABLE_PDF = "unreadable"
 
 
 async def _check_statement(path, payout, password: str | None):
@@ -113,13 +125,19 @@ async def _check_statement(path, payout, password: str | None):
 
     if not path:
         return AccountCheck(UNKNOWN, "none", note="the statement file could not be downloaded")
-    view = _readable_statement(path, password)
+    view, why = _readable_statement_why(path, password)
     if view is None:
-        return AccountCheck(
-            UNKNOWN,
-            "none",
-            note="the statement is password-protected and could not be opened with the password given",
-        )
+        if why == "no password":
+            note = "the statement is password-protected and no password was given"
+        elif why == "wrong password":
+            note = (
+                f"the statement is password-protected and the password given ({password}) was rejected - tried as "
+                "typed, without spaces, in CAPITALS, in small letters and digits only. "
+                "Send the correct password and the check runs again"
+            )
+        else:
+            note = "the statement PDF could not be read (damaged file?)"
+        return AccountCheck(UNKNOWN, "none", note=note)
     return await check_statement(view, account, beneficiary=payout.beneficiary, ifsc=payout.ifsc, bank=payout.bank)
 
 

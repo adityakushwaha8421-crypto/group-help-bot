@@ -26,6 +26,7 @@ from app.db.repository import (
     find_evidence_by_unique_id,
     find_open_case_for_late_evidence,
     find_open_collecting_case,
+    find_withdrawal_rejected_password,
     get_betix_message,
     list_evidence,
     list_monitoring_cases,
@@ -305,6 +306,15 @@ async def attach_message(session: AsyncSession, inp: IncomingInput, *, force_new
         awaits = candidate is not None and statement_awaits_password(
             candidate, await list_evidence(session, candidate.case_id)
         )
+        retry = None
+        if not awaits and candidate is None:
+            # a withdrawal in Manual Review because its statement password was rejected: a new password is a
+            # retry of that check, not chatter (the case comes back from ESCALATED and is processed again)
+            retry = await find_withdrawal_rejected_password(
+                session, inp.chat_id, inp.user_id, s.password_retry_window_minutes
+            )
+            if retry is not None and (ex.statement_password.value or looks_like_bare_password(text)):
+                candidate, awaits = retry, True
         if awaits and not ex.statement_password.value and not looks_like_bare_password(text):
             # The wording is not one the rules recognise ("wo jo bheja tha na, 4321 daal dena"). The case is
             # waiting for a password, so let the model read the sentence before the message is thrown away.
@@ -313,6 +323,17 @@ async def attach_message(session: AsyncSession, inp: IncomingInput, *, force_new
                 ex.statement_password = Field(guess, 0.8, "ai_text")
         if awaits and (ex.statement_password.value or looks_like_bare_password(text)):
             case, is_password = candidate, True
+            if retry is not None:
+                from app.cases.state_machine import transition
+
+                case.statement_password = None  # replaced by the one in this message
+                stored = dict(case.extraction or {})
+                stored.pop("statement_password", None)  # the rejected one must not outrank the new one on merge
+                case.extraction = stored
+                case.failure_reason = None
+                await transition(
+                    session, case, CaseStatus.WAITING_FOR_INPUT, reason="new statement password: checking again"
+                )
         elif not reg:
             log.info("text with no evidence; ignored", chat_id=inp.chat_id, open_case=case.case_id if case else None)
             return AttachResult(case, False, True, None, ex, None)

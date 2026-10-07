@@ -111,6 +111,9 @@ class Settings(BaseSettings):
     # applied yet) is picked up by the sweep for this many days.
     notification_retry_minutes: int = 120
     confirmation_sweep_days: int = 3
+    # A corrected statement password sent this long after a withdrawal went to Manual Review (password rejected)
+    # re-runs that withdrawal's check.
+    password_retry_window_minutes: int = 24 * 60
     add_session_seconds: int = 20  # an /add waits this long for the evidence, then it is DISCARDED
     add_discard_grace_seconds: int = 120  # a file arriving this soon after a discarded /add is refused, not a new case
     inline_job_workers: int = 8  # jobs running at once when INLINE_JOBS=true (app/workers/runner.py)

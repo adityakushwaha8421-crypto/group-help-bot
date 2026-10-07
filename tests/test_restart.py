@@ -56,3 +56,40 @@ async def test_pull_says_what_changed(monkeypatch):
 
     monkeypatch.setattr(restart, "_git", fake_git)
     assert await restart.pull_latest() == (True, "updated abc1234 -> def5678")
+
+
+async def test_a_pull_that_changes_requirements_installs_them(monkeypatch):
+    heads = iter(["abc1234", "def5678"])
+    installed = []
+
+    async def fake_git(*args, timeout=60):
+        if args[0] == "rev-parse":
+            return 0, next(heads)
+        if args[0] == "diff":
+            return 0, "app/evidence/pdf.py\nrequirements.txt"
+        return 0, "Fast-forward"
+
+    async def fake_install():
+        installed.append(True)
+        return "dependencies installed"
+
+    monkeypatch.setattr(restart, "_git", fake_git)
+    monkeypatch.setattr(restart, "install_requirements", fake_install)
+    assert await restart.pull_latest() == (True, "updated abc1234 -> def5678; dependencies installed")
+    assert installed == [True]
+
+
+async def test_a_pull_without_requirement_changes_installs_nothing(monkeypatch):
+    heads = iter(["abc1234", "def5678"])
+
+    async def fake_git(*args, timeout=60):
+        if args[0] == "rev-parse":
+            return 0, next(heads)
+        return (0, "app/cases/manager.py") if args[0] == "diff" else (0, "Fast-forward")
+
+    async def never():
+        raise AssertionError("pip must not run")
+
+    monkeypatch.setattr(restart, "_git", fake_git)
+    monkeypatch.setattr(restart, "install_requirements", never)
+    assert await restart.pull_latest() == (True, "updated abc1234 -> def5678")

@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
+    KIND_WITHDRAWAL,
     MONITORING_STATUSES,
     OPEN_STATUSES,
     AuditLog,
@@ -197,6 +198,28 @@ async def find_open_case_for_late_evidence(
             if not any(e.type == evidence_type for e in await list_evidence(session, c.case_id)):
                 return c
     return rows[0]
+
+
+async def find_withdrawal_rejected_password(
+    session: AsyncSession, chat_id: int, user_id: int, window_minutes: int
+) -> Case | None:
+    """This submitter's newest withdrawal that went to Manual Review because its statement password was
+    rejected: a corrected password re-runs its check."""
+    cutoff = utcnow() - timedelta(minutes=window_minutes)
+    res = await session.execute(
+        select(Case)
+        .where(
+            Case.source_chat_id == chat_id,
+            Case.source_user_id == user_id,
+            Case.kind == KIND_WITHDRAWAL,
+            Case.status == CaseStatus.ESCALATED.value,
+            Case.failure_reason.like("%password%rejected%"),
+            Case.last_input_at >= cutoff,
+        )
+        .order_by(Case.id.desc())
+        .limit(1)
+    )
+    return res.scalar_one_or_none()
 
 
 async def find_evidence_by_unique_id(session: AsyncSession, case_id: str, file_unique_id: str) -> Evidence | None:

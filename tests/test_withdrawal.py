@@ -178,3 +178,70 @@ async def test_an_unknown_withdrawal_id_is_not_sent(db, fake_bot, no_download, f
         assert await manager.process_case(s, cid, force=True) == "escalated"
     assert fake_poster.texts == []
     assert any("not found in Illunise payouts" in t for _, t in fake_bot.sent)
+
+
+# ------------------------------------------------------------------ rejected statement password (2026-10-07)
+async def test_a_rejected_password_is_named_and_can_be_corrected(db, fake_bot, no_download, fake_poster, payout):
+    from app.evidence.statement_account import UNKNOWN, AccountCheck
+
+    payout()
+    note = (
+        "the statement is password-protected and the password given (subh046) was rejected - tried as typed, "
+        "without spaces, in CAPITALS, in small letters and digits only. Send the correct password and the check "
+        "runs again"
+    )
+    holder = {"check": AccountCheck(UNKNOWN, "none", note=note)}
+
+    async def checker(path, account):
+        return holder["check"]
+
+    manager.set_statement_checker(checker)
+    try:
+        async with db.session_scope() as s:
+            cid = (await attach_message(s, make_input(1, "text", WD))).case.case_id
+            await attach_message(s, make_input(2, "document"))
+            await attach_message(s, make_input(3, "text", "Password:- subh046"))
+        async with db.session_scope() as s:
+            assert await manager.process_case(s, cid, force=True) == "escalated"
+            c = await get_case(s, cid)
+            assert c.status == CaseStatus.ESCALATED.value and c.statement_password == "subh046"
+        alert = next(t for _, t in fake_bot.sent if "MANUAL REVIEW" in t)
+        assert "(subh046) was rejected" in alert and "Send the correct password" in alert
+
+        # the operator sends the right password: the case comes back and is checked again
+        holder["check"] = AccountCheck("match", "full", "50100123451231")
+        async with db.session_scope() as s:
+            r = await attach_message(s, make_input(4, "text", "Subh0463"))
+            assert r.case.case_id == cid and not r.created
+            c = await get_case(s, cid)
+            assert c.status == CaseStatus.WAITING_FOR_INPUT.value and c.statement_password == "Subh0463"
+            assert c.failure_reason is None
+        async with db.session_scope() as s:
+            assert await manager.process_case(s, cid, force=True) == "ready"
+    finally:
+        manager.set_statement_checker(None)
+
+
+async def test_chatter_after_a_rejected_password_is_still_ignored(db, fake_bot, no_download, fake_poster, payout):
+    from app.evidence.statement_account import UNKNOWN, AccountCheck
+
+    payout()
+    note = "the statement is password-protected and the password given (x) was rejected - tried as typed"
+
+    async def checker(path, account):
+        return AccountCheck(UNKNOWN, "none", note=note)
+
+    manager.set_statement_checker(checker)
+    try:
+        async with db.session_scope() as s:
+            cid = (await attach_message(s, make_input(1, "text", WD))).case.case_id
+            await attach_message(s, make_input(2, "document"))
+            await attach_message(s, make_input(3, "text", "password x12"))
+        async with db.session_scope() as s:
+            assert await manager.process_case(s, cid, force=True) == "escalated"
+        async with db.session_scope() as s:
+            r = await attach_message(s, make_input(4, "text", "please check this"))
+            assert r.evidence is None and not r.created
+            assert (await get_case(s, cid)).status == CaseStatus.ESCALATED.value  # not a password: untouched
+    finally:
+        manager.set_statement_checker(None)

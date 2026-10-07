@@ -253,3 +253,51 @@ async def test_labelled_files_are_never_downloaded_to_sniff(db, fake_bot, no_dow
     await input_bot.ingest(make_input(1, "photo"))
     await input_bot.ingest(make_input(3, "document"))  # PhonePe_Statement.pdf
     assert calls == []
+
+
+# ---------------------------------------------------------------- protected statements (live 2026-10-07)
+# CASE-20261007-000008: the statement held the account number in full, but the PDF never opened - Manual Review.
+def test_the_password_opens_the_statement_in_any_of_its_slips(tmp_path):
+    from app.evidence.pdf import open_protected_pdf, password_variants
+
+    assert password_variants(" Subh0463. ")[:2] == [" Subh0463. ", "Subh0463"]
+    assert "SUBH0463" in password_variants("Subh0463") and "subh0463" in password_variants("Subh0463")
+    assert "06101990" in password_variants("06/10/1990")
+    assert "Subh0463" in password_variants("SUBH0463")
+    for given in ("SUBH0463", "subh0463", " Subh0463.", "Subh 0463"):
+        locked = make_pdf(tmp_path / f"{len(given)}{given[:2]}.pdf", "Subh0463")
+        out, why = open_protected_pdf(locked, given)
+        assert out is not None and why == "ok" and pdf_is_encrypted(out) is False, given
+    locked = make_pdf(tmp_path / "dob.pdf", "06101990")
+    assert open_protected_pdf(locked, "06/10/1990")[1] == "ok"
+
+
+def test_a_wrong_password_says_so_and_a_second_opener_is_tried(tmp_path, monkeypatch):
+    from app.evidence import pdf as pdfmod
+
+    locked = make_pdf(tmp_path / "locked.pdf", "1234")
+    assert pdfmod.open_protected_pdf(locked, "9999") == (None, "wrong password")
+    assert not (tmp_path / "locked.decrypted.pdf").exists()
+
+    def broken(src, out, password):  # pypdf cannot read this file at all
+        raise ValueError("unsupported PDF feature")
+
+    monkeypatch.setattr(pdfmod, "_decrypt_pypdf", broken)
+    out, why = pdfmod.open_protected_pdf(locked, "1234")  # pikepdf (qpdf) opens it instead
+    assert out is not None and why == "ok" and pdf_is_encrypted(out) is False
+
+
+def test_an_aes_protected_statement_opens(tmp_path):
+    from pypdf import PdfWriter
+
+    from app.evidence.pdf import open_protected_pdf
+
+    path = tmp_path / "aes.pdf"
+    w = PdfWriter()
+    w.add_blank_page(width=200, height=200)
+    w.encrypt("5364", algorithm="AES-256")
+    with path.open("wb") as fh:
+        w.write(fh)
+    assert pdf_is_encrypted(path)
+    assert open_protected_pdf(path, "5364")[1] == "ok"
+    assert open_protected_pdf(tmp_path / "aes.pdf", "0000")[0] is not None  # the copy from the first open is reused

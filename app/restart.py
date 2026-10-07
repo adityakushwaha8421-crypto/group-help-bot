@@ -79,7 +79,34 @@ async def pull_latest() -> tuple[bool, str]:
         last = out.splitlines()[-1][:120] if out else "unknown error"
         return False, f"could not update ({last}) - code unchanged"
     after = (await _git("rev-parse", "--short", "HEAD"))[1]
-    return (False, f"already up to date ({after})") if before == after else (True, f"updated {before} -> {after}")
+    if before == after:
+        return False, f"already up to date ({after})"
+    line = f"updated {before} -> {after}"
+    changed = (await _git("diff", "--name-only", before, after))[1].splitlines()
+    if "requirements.txt" in changed:
+        line += "; " + await install_requirements()
+    return True, line
+
+
+async def _run(*cmd: str, timeout: float) -> tuple[int, str]:
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=ROOT, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except TimeoutError:
+        proc.kill()
+        return 1, "timed out"
+    return proc.returncode or 0, out.decode(errors="replace").strip()
+
+
+async def install_requirements() -> str:
+    """requirements.txt changed in the pull: install it into THIS interpreter's environment before restarting."""
+    code, out = await _run(sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt", timeout=600)
+    if code == 0:
+        return "dependencies installed"
+    last = out.splitlines()[-1][:120] if out else "unknown error"
+    return f"dependency install FAILED ({last}) - run: pip install -r requirements.txt"
 
 
 def reexec() -> None:
