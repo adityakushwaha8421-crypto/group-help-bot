@@ -394,3 +394,78 @@ async def test_a_withdrawal_solved_by_reversed_is_never_reopened(
     async with db.session_scope() as s:
         assert (await get_case(s, cid)).status == CaseStatus.VERIFIED.value
     assert not texts(fake_bot, "Withdrawal reopened") and not texts(fake_bot, "PAYMENT CONFIRMED")
+
+
+# ------------------------------------------------------------------ reversed while in Manual Review (2026-10-10)
+# BXWD-78390-72416: the withdrawal case sat in Manual Review (statement not verified); Betix then posted
+# "OrderStatus: Reversed" - and nothing happened. A reversal must be handled whatever the case was waiting on.
+async def escalated_withdrawal(db, fake_poster) -> str:
+    from app.evidence.statement_account import UNKNOWN, AccountCheck
+
+    async def checker(path, account):
+        return AccountCheck(UNKNOWN, "none", note="no account number could be read from it")
+
+    manager.set_statement_checker(checker)
+    try:
+        async with db.session_scope() as s:
+            cid = (await attach_message(s, make_input(1, "text", WD))).case.case_id
+            await attach_message(s, make_input(2, "document"))
+        async with db.session_scope() as s:
+            assert await manager.process_case(s, cid, force=True) == "escalated"
+    finally:
+        manager.set_statement_checker(None)
+    return cid
+
+
+async def test_a_reversal_of_a_withdrawal_in_manual_review_is_handled(
+    db, fake_bot, no_download, fake_poster, jobs, refunder
+):
+    calls, _ = refunder
+    cid = await escalated_withdrawal(db, fake_poster)
+    async with db.session_scope() as s:
+        r = await handle_group_message(
+            s, make_group_msg(630, BOT_REVERSED, sender_username="betixpay_cs_bot", is_bot=True)
+        )
+        assert r["action"] == "reversal_check_queued" and r["case_id"] == cid
+    assert ("reversal_check_job", cid) in jobs
+    assert await manager.reversal_check(cid) == "asked"  # not skipped: the payout is read, the operator asked
+    assert len(texts(fake_bot, "REFUND NEEDED")) == 1 and calls == []
+    async with db.session_scope() as s:
+        await manager.approve_refund(s, cid, "@me")
+    assert await manager.refund_approved_withdrawal(cid) == "reversed"
+    assert calls == [WD] and len(texts(fake_bot, "WITHDRAWAL REVERSED")) == 1
+    async with db.session_scope() as s:
+        assert (await get_case(s, cid)).status == CaseStatus.VERIFIED.value
+
+
+async def test_a_reversal_recorded_but_never_checked_is_picked_up_by_the_sweep(
+    db, fake_bot, no_download, fake_poster, jobs, refunder
+):
+    """The case as the older code left it: BETIX_REVERSED on record, check skipped. The sweep queues the check;
+    a second Reversed from Betix runs it too instead of being 'already known'."""
+    from app.db.repository import audit
+    from app.followups.scheduler import sweep
+
+    cid = await escalated_withdrawal(db, fake_poster)
+    async with db.session_scope() as s:
+        await audit(
+            s, "BETIX_REVERSED", case_id=cid, actor="@betixpay_cs_bot", result=f"BX{WD}", source="betix_group",
+            details={"betix_message_id": 630, "sender_id": 1, "sender_username": "betixpay_cs_bot", "quote": "Reversed"},
+        )  # fmt: skip
+    r = await sweep(lambda: fake_poster)
+    assert r.get("reversals_requeued") == 1 and ("reversal_check_job", cid) in jobs
+    jobs.clear()
+    async with db.session_scope() as s:
+        r = await handle_group_message(
+            s, make_group_msg(631, BOT_REVERSED, sender_username="betixpay_cs_bot", is_bot=True)
+        )
+        assert r["action"] == "reversal_check_queued"  # the check never ran: not "already known"
+    assert await manager.reversal_check(cid) == "asked"
+    assert len(texts(fake_bot, "REFUND NEEDED")) == 1
+    assert (await sweep(lambda: fake_poster)).get("reversals_requeued") is None  # checked: nothing to requeue
+    async with db.session_scope() as s:
+        r = await handle_group_message(
+            s, make_group_msg(632, BOT_REVERSED, sender_username="betixpay_cs_bot", is_bot=True)
+        )
+        assert r["action"] == "reversal_already_known"  # asked once, however often Betix repeats it
+    assert len(texts(fake_bot, "REFUND NEEDED")) == 1

@@ -22,6 +22,7 @@ from app.db.repository import (
     case_evidence_requested,
     case_has_out_kind,
     find_case_that_sent_order,
+    get_case,
     get_case_for_update,
     latest_candidate,
     list_candidates,
@@ -1532,7 +1533,9 @@ async def start_reversal(
     """Betix said "Reversed". Remember who said it (the audit row survives a restart); the check runs as a job.
     A second "Reversed" for the same case (the bot's status line after a member's message, a repeated /live) is
     recorded and changes nothing: the operator is asked once."""
-    already = await _reversal_info(session, case.case_id) is not None
+    # "already": the check RAN for an earlier Reversed. A Reversed that was only recorded (the case was in Manual
+    # Review when the older code skipped the check) is acted on now.
+    already = await _reversal_info(session, case.case_id) is not None and await _reversal_checked(session, case.case_id)
     await cancel_case_followups(session, case, "Betix reversed the withdrawal")  # Betix has answered
     await audit(
         session,
@@ -1575,13 +1578,57 @@ async def _reversal_info(session: AsyncSession, case_id: str) -> tuple[str, dict
 
 
 def _reversal_open(case: Case | None) -> bool:
+    """A withdrawal Betix can still reverse: not solved, not cancelled. A case in MANUAL REVIEW (statement not
+    verified, payout not found ...) is included - live 2026-10-10: Betix reversed BXWD-78390-72416 while the case
+    sat in Manual Review and nothing happened."""
     return bool(
         case
         and case.kind == KIND_WITHDRAWAL
         and case.withdrawal_id
         and case.status not in TERMINAL_OK
-        and case.status not in (CaseStatus.ESCALATED.value, CaseStatus.FAILED.value)
+        and case.status != CaseStatus.FAILED.value
     )
+
+
+async def _reversal_checked(session: AsyncSession, case_id: str) -> bool:
+    """The reversal check really ran for this case (read the payout, asked / solved / escalated)."""
+    from sqlalchemy import select
+
+    from app.db.models import AuditLog
+
+    res = await session.execute(
+        select(AuditLog.id).where(AuditLog.case_id == case_id, AuditLog.action == "REVERSAL_CHECKED").limit(1)
+    )
+    return res.scalar_one_or_none() is not None
+
+
+async def requeue_unhandled_reversals(session: AsyncSession, since) -> dict[str, int]:
+    """Runs on every sweep: a withdrawal Betix reversed whose check never ran (the case was in Manual Review when
+    the older code skipped it, or the job was lost) gets its check queued now."""
+    from sqlalchemy import select
+
+    from app.db.models import AuditLog
+
+    rows = (
+        (
+            await session.execute(
+                select(AuditLog.case_id)
+                .where(AuditLog.action == "BETIX_REVERSED", AuditLog.created_at >= since)
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    n = 0
+    for case_id in rows:
+        case = await get_case(session, case_id)
+        if not _reversal_open(case) or await _reversal_checked(session, case_id):
+            continue
+        log.warning("reversed withdrawal never checked; queuing the check", case_id=case_id, status=case.status)
+        await enqueue("reversal_check_job", case_id, job_id=f"reversal-{case_id}")
+        n += 1
+    return {"reversals_requeued": n} if n else {}
 
 
 async def _close_reversed(session: AsyncSession, case: Case, actor: str, info: dict, payout) -> None:
@@ -1623,6 +1670,13 @@ async def reversal_check(case_id: str) -> str:
         if not _reversal_open(case):
             return "skipped"
         status = (payout.status or "").strip().lower() if payout else ""
+        await audit(
+            session,
+            "REVERSAL_CHECKED",
+            case_id=case_id,
+            result=status or ("error" if problem else "not_found"),
+            details={"id": wd, "problem": problem},
+        )
         if status == "refunded":
             await audit(session, "WITHDRAWAL_REFUND", case_id=case_id, result="already_refunded", details={"id": wd})
             await _close_reversed(session, case, actor, info, payout)
@@ -1854,6 +1908,7 @@ async def confirmation_safety_net(session: AsyncSession) -> dict[str, int]:
     terminal = TERMINAL_OK | {CaseStatus.FAILED.value}
 
     out.update(await reopen_wrongly_confirmed_withdrawals(session, since))
+    out.update(await requeue_unhandled_reversals(session, since))
 
     recorded = (
         (

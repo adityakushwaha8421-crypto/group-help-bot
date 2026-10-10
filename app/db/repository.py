@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -261,6 +261,12 @@ async def find_case_by_order_ids(
     conds = []
     if betex_order_id:
         conds.append(Case.betex_pay_order_id == betex_order_id)
+        up = betex_order_id.upper()
+        if up.startswith("BXWD-") or up.startswith("WD-"):
+            # a withdrawal: Betix's MerchantOrderNo "BXWD-..." is the case's withdrawal id, with or without the BX,
+            # also for a case that never reached Betix (Manual Review before the post)
+            bare = up[2:] if up.startswith("BX") else up
+            conds.append(func.upper(Case.withdrawal_id).in_([bare, "BX" + bare]))
     if plat_order_no:
         conds.append(Case.betix_plat_order_no == plat_order_no)
     if registration:
