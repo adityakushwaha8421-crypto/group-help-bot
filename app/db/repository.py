@@ -77,9 +77,14 @@ async def get_case(session: AsyncSession, case_id: str) -> Case | None:
 async def find_case_by_order_id(session: AsyncSession, order_id: str) -> Case | None:
     """The case behind an Illunise order id (the id the operator sees as the case id once matched)."""
     oid = order_id.strip().upper()
+    wd = [oid[2:], oid] if oid.startswith("BXWD-") else ([oid, "BX" + oid] if oid.startswith("WD-") else [])
     res = await session.execute(
         select(Case)
-        .where((Case.betex_pay_order_id == oid) | (Case.illunise_order_id == oid))
+        .where(
+            (Case.betex_pay_order_id == oid)
+            | (Case.illunise_order_id == oid)
+            | (func.upper(Case.withdrawal_id).in_(wd) if wd else False)
+        )
         .order_by(Case.betix_root_message_id.is_(None), Case.id.desc())
         .limit(1)
     )

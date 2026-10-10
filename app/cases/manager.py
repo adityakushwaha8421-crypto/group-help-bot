@@ -1602,6 +1602,70 @@ async def _reversal_checked(session: AsyncSession, case_id: str) -> bool:
     return res.scalar_one_or_none() is not None
 
 
+async def relink_unlinked_reversals(session: AsyncSession, since) -> dict[str, int]:
+    """Runs on every sweep: a "Reversed" from the Betix system bot that was stored UNLINKED (no case matched when
+    it arrived - the withdrawal case did not exist yet, or could not be found by its BXWD id) is tied to its case
+    now and starts the reversed flow. Live 2026-10-10: BXWD-78390-72416 stayed untouched after the fix because its
+    Reversed had been filed before the fix, with no case."""
+    from sqlalchemy import select
+
+    from app.db.models import BetixMessage
+    from app.db.repository import find_case_by_order_ids
+    from app.telegram.confirmation import extract_ids, is_reversed
+
+    s = get_settings()
+    rows = (
+        (
+            await session.execute(
+                select(BetixMessage)
+                .where(
+                    BetixMessage.direction == "in",
+                    BetixMessage.case_id.is_(None),
+                    BetixMessage.sender_is_bot.is_(True),
+                    BetixMessage.text.ilike("%revers%"),
+                    BetixMessage.sent_at >= since,
+                )
+                .order_by(BetixMessage.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    names, ids = s.system_bot_usernames, s.system_bot_ids
+    n = 0
+    for m in rows:
+        if names or ids:
+            if (m.sender_username or "").lstrip("@").lower() not in names and m.sender_id not in ids:
+                continue  # another bot: never a Betix status
+        rev = is_reversed(m.text or "", status_line_only=True)
+        if not rev:
+            continue
+        orders, _, _ = extract_ids(m.text or "", s.betex_order_id_pattern, s.plat_order_pattern)
+        case = None
+        for oid in orders:
+            found = await find_case_by_order_ids(session, betex_order_id=oid)
+            if found:
+                case = found[0]
+                break
+        if case is None or not _reversal_open(case):
+            continue
+        m.case_id = case.case_id
+        m.correlation = {**(m.correlation or {}), "method": "relinked_by_sweep"}
+        actor = ("@" + m.sender_username) if m.sender_username else (m.sender_name or str(m.sender_id))
+        log.warning("unlinked Reversed tied to its case now", case_id=case.case_id, message_id=m.message_id)
+        await start_reversal(
+            session,
+            case,
+            actor=actor,
+            betix_message_id=m.message_id,
+            sender_id=m.sender_id,
+            sender_username=m.sender_username,
+            quote=rev.group(0)[:200],
+        )
+        n += 1
+    return {"reversals_relinked": n} if n else {}
+
+
 async def requeue_unhandled_reversals(session: AsyncSession, since) -> dict[str, int]:
     """Runs on every sweep: a withdrawal Betix reversed whose check never ran (the case was in Manual Review when
     the older code skipped it, or the job was lost) gets its check queued now."""
@@ -1908,6 +1972,7 @@ async def confirmation_safety_net(session: AsyncSession) -> dict[str, int]:
     terminal = TERMINAL_OK | {CaseStatus.FAILED.value}
 
     out.update(await reopen_wrongly_confirmed_withdrawals(session, since))
+    out.update(await relink_unlinked_reversals(session, since))
     out.update(await requeue_unhandled_reversals(session, since))
 
     recorded = (

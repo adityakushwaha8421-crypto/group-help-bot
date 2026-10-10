@@ -469,3 +469,41 @@ async def test_a_reversal_recorded_but_never_checked_is_picked_up_by_the_sweep(
         )
         assert r["action"] == "reversal_already_known"  # asked once, however often Betix repeats it
     assert len(texts(fake_bot, "REFUND NEEDED")) == 1
+
+
+async def test_a_reversed_that_arrived_before_its_case_existed_is_linked_by_the_sweep(
+    db, fake_bot, no_download, fake_poster, jobs, refunder
+):
+    """Betix posted "Reversed" at a time no case matched (stored unlinked). Once the withdrawal case exists, the
+    sweep ties the message to it and starts the reversed flow - Betix never has to post again."""
+    from app.followups.scheduler import sweep
+
+    async with db.session_scope() as s:
+        r = await handle_group_message(
+            s, make_group_msg(640, BOT_REVERSED, sender_username="betixpay_cs_bot", is_bot=True)
+        )
+        assert r["action"] == "unlinked"
+    assert (await sweep(lambda: fake_poster)).get("reversals_relinked") is None  # still no case: nothing to do
+    cid = await escalated_withdrawal(db, fake_poster)
+    r = await sweep(lambda: fake_poster)
+    assert r.get("reversals_relinked") == 1 and ("reversal_check_job", cid) in jobs
+    assert await manager.reversal_check(cid) == "asked"
+    assert len(texts(fake_bot, "REFUND NEEDED")) == 1
+    assert (await sweep(lambda: fake_poster)).get("reversals_relinked") is None  # linked once
+    async with db.session_scope() as s:
+        from sqlalchemy import select
+
+        from app.db.models import BetixMessage
+
+        m = (await s.execute(select(BetixMessage).where(BetixMessage.message_id == 640))).scalar_one()
+        assert m.case_id == cid
+
+
+async def test_status_finds_a_withdrawal_by_its_bxwd_id(db, fake_bot, no_download, fake_poster):
+    from app.db.repository import find_case_by_order_id
+
+    async with db.session_scope() as s:
+        cid = (await attach_message(s, make_input(1, "text", WD))).case.case_id
+        for q in (f"BX{WD}", WD, f"bx{WD.lower()}"):
+            found = await find_case_by_order_id(s, q)
+            assert found is not None and found.case_id == cid, q
