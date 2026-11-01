@@ -13,6 +13,7 @@ from app.admin.browser import AdminError, LayoutChanged, LoginFailed, ManualAuth
 from app.admin.matcher import Candidate, MatchResult, match_orders
 from app.ai.extractor import Extraction, Field, extract_from_text
 from app.cases.correlation import hard_missing, merge_case_extraction, missing_items
+from app.cases.gateway import gateway_pending, is_native
 from app.cases.state_machine import transition
 from app.config import get_settings
 from app.db.models import KIND_WITHDRAWAL, Case, CaseStatus, EvidenceType, OrderCandidate, OrderMatch
@@ -498,6 +499,8 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
         return "deferred"
     evidence = await list_evidence(session, case.case_id)
     missing = missing_items(case, evidence)
+    if gateway_pending(case, missing):
+        return "gateway_pending"  # the card asks "Betix or Native?": nothing moves until the operator taps
     if force_send and missing and not hard_missing(missing):
         # FORCE SEND: screenshot + mobile are in and the wait for the statement / video ran out. Go with what we have.
         await audit(session, "FORCE_SEND", case_id=case.case_id, result="without " + ", ".join(missing))
@@ -654,6 +657,11 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
         reason, hint = search_error
         await escalate_case(session, case, reason, hint) if hint else await escalate_case(session, case, reason)
         return "escalated"
+    if is_native(case):
+        # NATIVE: the orders under the mobile only - no fallback search, no /pi, no doubt resolution.
+        if await _relock(session, case, version0) is None:
+            return "stale"
+        return await select_native_orders(session, case, merged, candidates, time_rule=time_rule)
 
     # FALLBACK SEARCHES. If nothing under the customer's number was created around the payment, the order may sit
     # under another registered number: the panel can be searched by UTR and by the exact padded amount, both of
@@ -728,70 +736,8 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
 
     if await _relock(session, case, version0) is None:
         return "stale"
-    attempt = 1 + max([c.search_attempt for c in await list_candidates(session, case.case_id)] or [0])
-    result: MatchResult = match_orders(
-        merged,
-        case.mobile,
-        candidates,
-        weights=s.match_weights,
-        threshold=s.order_match_threshold,
-        ambiguity_gap=s.order_match_ambiguity_gap,
-        time_window_minutes=s.payment_time_window_minutes,
-        amount_tolerance=s.order_amount_tolerance,
-        time_rule=time_rule,
-        gateway_name=s.betix_gateway_name,
-        compatible_statuses=s.compatible_statuses,
-        expired_statuses=s.expired_statuses,
-        success_statuses=s.success_statuses,
-        time_tiebreak_minutes=s.order_time_tiebreak_minutes,
-    )
-    cand_rows: dict[int, OrderCandidate] = {}
-    for sc in result.scored:
-        c = sc.candidate
-        row = OrderCandidate(
-            case_id=case.case_id,
-            search_attempt=attempt,
-            illunise_order_id=c.illunise_order_id,
-            betex_order_id=c.betex_order_id,
-            registration_number=c.registration_number,
-            amount=c.amount,
-            order_time=c.order_time,
-            status=c.status,
-            utr=c.utr,
-            upi_id=c.upi_id,
-            payer_name=c.payer_name,
-            gateway=c.gateway,
-            betix_plat_order_no=c.betix_plat_order_no,
-            raw=c.raw,
-            score=sc.score,
-            signals=sc.signals,
-        )
-        session.add(row)
-        await session.flush()
-        cand_rows[id(sc)] = row
-        await audit(
-            session,
-            "ORDER_CANDIDATE_FOUND",
-            case_id=case.case_id,
-            result=c.betex_order_id or c.illunise_order_id,
-            confidence=sc.score,
-            source="illunise_admin",
-            details=sc.signals,
-        )
-    best_row = cand_rows.get(id(result.best)) if result.best else None
-    session.add(
-        OrderMatch(
-            case_id=case.case_id,
-            candidate_id=best_row.id if best_row else None,
-            decision=result.decision,
-            confidence=result.confidence,
-            runner_up_confidence=result.runner_up.score if result.runner_up else None,
-            illunise_order_id=result.best.candidate.illunise_order_id if result.best else None,
-            betex_order_id=result.best.candidate.betex_order_id if result.best else None,
-            details={"reason": result.reason, "candidates": len(candidates)},
-        )
-    )
-    case.match_confidence = result.confidence
+    result: MatchResult = match_orders(merged, case.mobile, candidates, **_kw())
+    await _record_match(session, case, result, len(candidates))
 
     if result.decision == "MATCHED":
         return await select_order(
@@ -915,6 +861,138 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
     top += "\nLikely: the order was made under another registered number, or the payment was made without an order."
     await escalate_case(session, case, reason, top)
     return "escalated"
+
+
+async def _record_match(session: AsyncSession, case: Case, result: MatchResult, searched: int) -> None:
+    """Store every scored candidate and the match decision (audit + the rows /pi and the alerts read)."""
+    attempt = 1 + max([c.search_attempt for c in await list_candidates(session, case.case_id)] or [0])
+    cand_rows: dict[int, OrderCandidate] = {}
+    for sc in result.scored:
+        c = sc.candidate
+        row = OrderCandidate(
+            case_id=case.case_id,
+            search_attempt=attempt,
+            illunise_order_id=c.illunise_order_id,
+            betex_order_id=c.betex_order_id,
+            registration_number=c.registration_number,
+            amount=c.amount,
+            order_time=c.order_time,
+            status=c.status,
+            utr=c.utr,
+            upi_id=c.upi_id,
+            payer_name=c.payer_name,
+            gateway=c.gateway,
+            betix_plat_order_no=c.betix_plat_order_no,
+            raw=c.raw,
+            score=sc.score,
+            signals=sc.signals,
+        )
+        session.add(row)
+        await session.flush()
+        cand_rows[id(sc)] = row
+        await audit(
+            session,
+            "ORDER_CANDIDATE_FOUND",
+            case_id=case.case_id,
+            result=c.betex_order_id or c.illunise_order_id,
+            confidence=sc.score,
+            source="illunise_admin",
+            details=sc.signals,
+        )
+    best_row = cand_rows.get(id(result.best)) if result.best else None
+    session.add(
+        OrderMatch(
+            case_id=case.case_id,
+            candidate_id=best_row.id if best_row else None,
+            decision=result.decision,
+            confidence=result.confidence,
+            runner_up_confidence=result.runner_up.score if result.runner_up else None,
+            illunise_order_id=result.best.candidate.illunise_order_id if result.best else None,
+            betex_order_id=result.best.candidate.betex_order_id if result.best else None,
+            details={"reason": result.reason, "candidates": searched},
+        )
+    )
+    case.match_confidence = result.confidence
+
+
+def native_amount(paid: float) -> float:
+    """A Native order is created for a ROUND figure: the paid amount, rounded to the rupee."""
+    return float(round(float(paid)))
+
+
+def native_fit(sc, paid: float, tolerance: float, native_gateway: str) -> bool:
+    """A Native candidate: the customer's own order (never another number's), created before the payment inside
+    the window, for the rounded paid amount, and not a Betix order (or, when NATIVE_GATEWAY_NAME is set, one of
+    that gateway)."""
+    sig = sc.signals
+    c = sc.candidate
+    if (sig.get("registration") or {}).get("score") == 0.0:
+        return False
+    if ((sig.get("time") or {}).get("score") or 0) < 0.7:
+        return False
+    if c.amount is None or abs(float(c.amount) - native_amount(paid)) > tolerance + 1e-9:
+        return False
+    gw = (c.gateway or "").lower().replace(" ", "")
+    if native_gateway:
+        return native_gateway.lower().replace(" ", "") in gw
+    return (sig.get("gateway") or {}).get("score") != 1.0  # a Betix order is never a Native one
+
+
+async def select_native_orders(session: AsyncSession, case: Case, merged, candidates, *, time_rule) -> str:
+    """NATIVE: every order created under the mobile at the payment time for the rounded amount goes out - one or
+    several, closest to the payment first - with the screenshot, to the Native group. None: manual review."""
+    s = get_settings()
+    result: MatchResult = match_orders(
+        merged,
+        case.mobile,
+        candidates,
+        weights=s.match_weights,
+        threshold=s.order_match_threshold,
+        ambiguity_gap=s.order_match_ambiguity_gap,
+        time_window_minutes=s.payment_time_window_minutes,
+        amount_tolerance=s.order_amount_tolerance,
+        time_rule=time_rule,
+        gateway_name=s.betix_gateway_name,
+        compatible_statuses=s.compatible_statuses,
+        expired_statuses=s.expired_statuses,
+        success_statuses=s.success_statuses,
+        time_tiebreak_minutes=s.order_time_tiebreak_minutes,
+    )
+    await _record_match(session, case, result, len(candidates))
+    fit = [sc for sc in result.scored if native_fit(sc, case.amount, s.order_amount_tolerance, s.native_gateway_name)]
+
+    def lead(sc) -> float:
+        v = (sc.signals.get("time") or {}).get("lead_minutes")
+        return float(v) if v is not None else 1e9
+
+    fit.sort(key=lead)  # closest to the payment first
+    tz = s.timezone
+    when = fmt_local(case.payment_time, tz, "%d %b %Y %H:%M") if case.payment_time else "?"
+    rounded = native_amount(case.amount)
+    if not fit:
+        lines = [candidate_line(sc, tz) for sc in result.scored[:5]]
+        reason = (
+            f"Native: no order of ₹{rounded:,.0f} (₹{case.amount:,.2f} paid, rounded) was created under this number "
+            f"before the payment ({when})."
+        )
+        extra = ("Nearest orders:\n" + "\n".join(lines) + "\n" if lines else "") + "Pick the right one in Illunise."
+        await escalate_case(session, case, reason, extra)
+        return "escalated"
+    ids = [sc.candidate.betex_order_id or sc.candidate.illunise_order_id for sc in fit]
+    case.native_order_ids = ids
+    await audit(
+        session,
+        "NATIVE_ORDERS_SELECTED",
+        case_id=case.case_id,
+        result=", ".join(ids),
+        confidence=fit[0].score,
+        source="matcher",
+        details={"count": len(ids), "rounded_amount": rounded, "paid": case.amount},
+    )
+    reason = f"Native: {len(ids)} order(s) of ₹{rounded:,.0f} created under the mobile just before the payment ({when})"
+    return await select_order(
+        session, case, fit[0].candidate, reason=reason, confidence=fit[0].score, signals=fit[0].signals
+    )
 
 
 # ------------------------------------------------------------------ posting
@@ -1333,17 +1411,28 @@ async def post_case_to_betix(session: AsyncSession, case_id: str, poster, *, for
             await mark_already_sent(session, case, first)
             return "already_sent"
     evidence = await list_evidence(session, case.case_id)
+    native = is_native(case)
     try:
         if case.kind == KIND_WITHDRAWAL:
             await poster.post_withdrawal(session, case, evidence)  # "BXWD-..." + the statement as its reply
+        elif native:
+            await poster.post_native(session, case, evidence)  # the screenshot + every order id, Native group
         else:
             await poster.post_case(session, case, evidence)
     except Exception as exc:  # noqa: BLE001
         log.exception("betix post failed", case_id=case.case_id)
-        await escalate_case(session, case, f"Telegram posting to Betix group failed: {exc}")
+        where = "Native group" if native else "Betix group"
+        await escalate_case(session, case, f"Telegram posting to {where} failed: {exc}")
         return "escalated"
     await transition(session, case, CaseStatus.POSTED_TO_BETIX, reason="evidence posted", strict=False)
-    await transition(session, case, CaseStatus.WAITING_FOR_CONFIRMATION, reason="monitoring Betix replies")
+    await transition(
+        session,
+        case,
+        CaseStatus.WAITING_FOR_CONFIRMATION,
+        reason="monitoring Native group replies" if native else "monitoring Betix replies",
+    )
+    if native:
+        return "posted"  # no reminders in the Native group, nothing else to send there
     await schedule_case_followups(session, case)
     if get_settings().betix_extra_evidence_policy == "always":
         await post_late_evidence(session, case, poster, requested=True)

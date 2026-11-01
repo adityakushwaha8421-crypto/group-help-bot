@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Case, CaseStatus
+from app.cases.gateway import gateway_pending, is_native
+from app.db.models import GATEWAY_BETIX, GATEWAY_NATIVE, Case, CaseStatus
 from app.telegram.ui import case_label, code, esc, i
 from app.utils.logging import get_logger
 
@@ -63,6 +64,12 @@ def progress_card(case: Case) -> str:
                 [f"\U0001f9fe Withdrawal: {order}"],
                 "\U0001f4e4 Sending it to the Betix group...",
             )
+        if is_native(case):
+            return _card(
+                "\U0001f3af ORDERS FOUND" if len(native_ids(case)) > 1 else "\U0001f3af ORDER MATCHED",
+                [native_orders_line(case), "\U0001f500 Gateway: Native"],
+                "\U0001f4e4 Sending the screenshot to the Native group...",
+            )
         return _card(
             "\U0001f3af ORDER MATCHED",
             [f"\U0001f9fe Order: {order}"],
@@ -80,6 +87,12 @@ def progress_card(case: Case) -> str:
         S.FOLLOWUP_1_SENT.value,
         S.FOLLOWUP_2_SENT.value,
     ):
+        if is_native(case):
+            return _card(
+                "\U0001f4e4 SENT TO NATIVE GROUP",
+                [native_orders_line(case), "\U0001f500 Gateway: Native"],
+                "\U0001f440 Waiting for the Native group to confirm...",
+            )
         sent = case.followups_sent or 0
         rows = [f"\U0001f9fe Order: {order}"]
         if sent:
@@ -95,7 +108,7 @@ def progress_card(case: Case) -> str:
             "\u2705 Solved \u2014 Betix reversed this withdrawal.\n\U0001f4b8 Please pay the customer manually.",
         )
     if st == S.VERIFIED.value:
-        rows = [f"\U0001f9fe Order: {order}"]
+        rows = [native_orders_line(case) if is_native(case) else f"\U0001f9fe Order: {order}"]
         if case.confirmed_by:
             rows.append(f"\u2705 Confirmed by: {esc(case.confirmed_by)}")
         return _card("\u2705 PAYMENT CONFIRMED", rows, "\U0001f64f Payment successfully confirmed.")
@@ -119,14 +132,45 @@ def progress_card(case: Case) -> str:
     return _card("\u26d4 CASE CLOSED", [ident], f"\u2757 {i(reason)}" if reason else "")
 
 
+def native_ids(case: Case) -> list[str]:
+    """The order id(s) of a Native case: all of them when several were created at the payment time."""
+    ids = [x for x in (case.native_order_ids or []) if x]
+    return ids or [x for x in (case.betex_pay_order_id or case.illunise_order_id,) if x]
+
+
+def native_orders_line(case: Case) -> str:
+    ids = native_ids(case)
+    if len(ids) > 1:
+        return "\U0001f9fe Orders: " + ", ".join(code(x) for x in ids)
+    return f"\U0001f9fe Order: {code(ids[0]) if ids else '-'}"
+
+
 def _card(head: str, rows: list[str], foot: str) -> str:
     """Heading, a blank line, one detail per line, a blank line, the next step."""
     blocks = ["<b>" + head + "</b>", "\n".join(x for x in rows if x), foot]
     return "\n\n".join(x for x in blocks if x)
 
 
-def card_buttons(case: Case):
-    """The buttons under the card. Only "ALREADY WITH BETIX" has one: FORCE SEND. None removes any old button."""
+def gateway_buttons(case: Case):
+    """[Betix] [Native] - the question the card asks before anything is processed."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="\U0001f7e6 Betix", callback_data=f"gw:{GATEWAY_BETIX}:{case.case_id}"),
+                InlineKeyboardButton(text="\U0001f7e9 Native", callback_data=f"gw:{GATEWAY_NATIVE}:{case.case_id}"),
+            ]
+        ]
+    )
+
+
+def card_buttons(case: Case, missing: list[str] | None = None):
+    """The buttons under the card: [Betix] [Native] while the gateway question is open (`missing` = what the case
+    still lacks, so the screenshot + mobile are known to be in), FORCE SEND under "ALREADY WITH BETIX". None
+    removes any old button."""
+    if missing is not None and case.status == S.WAITING_FOR_INPUT.value and gateway_pending(case, missing):
+        return gateway_buttons(case)
     if case.status != S.ALREADY_SENT.value:
         return None
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -142,24 +186,43 @@ async def push(session: AsyncSession, case: Case) -> bool:
     """Edit the case's progress message to reflect its current status. Returns True when an edit was sent."""
     if not case.progress_chat_id or not case.progress_message_id:
         return False
-    from app.telegram import notifications
 
     try:
-        text = progress_card(case)
-        from app.telegram.throttle import get_throttle
+        missing = None
+        if case.status == S.WAITING_FOR_INPUT.value and case.kind != "withdrawal" and case.gateway_choice is None:
+            from app.cases.correlation import missing_items
+            from app.db.repository import list_evidence
 
-        await get_throttle().run(
-            case.progress_chat_id,
-            lambda: notifications.get_bot().edit_message_text(
-                text,
-                chat_id=case.progress_chat_id,
-                message_id=case.progress_message_id,
-                parse_mode="HTML",
-                reply_markup=card_buttons(case),
-            ),
-        )
+            missing = missing_items(case, await list_evidence(session, case.case_id))
+            if gateway_pending(case, missing):
+                # The question is still open: the card keeps asking it (text from input_bot, buttons here).
+                from app.telegram.input_bot import case_card
+
+                text = case_card(
+                    case, await list_evidence(session, case.case_id), missing, created=False, forwarded=False
+                )
+                await _edit(case, text, gateway_buttons(case))
+                return True
+        text = progress_card(case)
+        await _edit(case, text, card_buttons(case))
         return True
     except Exception as exc:  # noqa: BLE001
         if "not modified" not in str(exc):
             log.warning("progress edit failed", case_id=case.case_id, error=str(exc)[:200])
         return False
+
+
+async def _edit(case: Case, text: str, reply_markup) -> None:
+    from app.telegram import notifications
+    from app.telegram.throttle import get_throttle
+
+    await get_throttle().run(
+        case.progress_chat_id,
+        lambda: notifications.get_bot().edit_message_text(
+            text,
+            chat_id=case.progress_chat_id,
+            message_id=case.progress_message_id,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        ),
+    )

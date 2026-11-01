@@ -121,9 +121,12 @@ async def is_group_member(chat_id: int, user_id: int | None) -> bool | None:
 
 
 def is_betix_chat(chat_id: int, username: str | None = None) -> bool:
-    """Is this one of the Betix groups the bot works with (BETIX_GROUP_CHAT_ID may list several)?"""
+    """Is this one of the groups the bot works with: the Betix groups (BETIX_GROUP_CHAT_ID may list several) or
+    the Native group (a member's "done" there confirms a Native case the same way)?"""
     s = get_settings()
     if chat_id in s.betix_chat_ids:
+        return True
+    if s.native_chat is not None and chat_id == s.native_chat:
         return True
     if s.betix_group_username and username:
         return s.betix_group_username.lstrip("@").lower() == username.lstrip("@").lower()
@@ -309,7 +312,8 @@ async def run_user_monitor(stop_event=None) -> None:
 
     s = get_settings()
     client = await get_user_client()
-    entities = [await client.get_entity(c) for c in s.betix_chats]  # every configured group
+    chats = list(s.betix_chats) + ([s.native_chat] if s.native_chat is not None else [])
+    entities = [await client.get_entity(c) for c in chats]  # every configured group
     entity = entities[0]
     chat_id = (
         int(f"-100{entity.id}")

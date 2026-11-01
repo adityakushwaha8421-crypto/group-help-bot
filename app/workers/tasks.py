@@ -7,6 +7,7 @@ from arq import cron
 from arq.connections import RedisSettings
 
 from app.cases import manager
+from app.cases.gateway import gateway_pending
 from app.config import get_settings
 from app.db.models import CaseStatus
 from app.db.repository import get_case, list_evidence, list_open_cases
@@ -172,7 +173,9 @@ async def recover(ctx=None) -> dict:
 
                 missing = missing_items(case, ev)
                 s = get_settings()
-                if missing and not hard_missing(missing) and s.force_send_seconds > 0:
+                if gateway_pending(case, missing):
+                    counts["gateway_pending"] = counts.get("gateway_pending", 0) + 1  # the card's buttons wait
+                elif missing and not hard_missing(missing) and s.force_send_seconds > 0:
                     waited = (utcnow() - case.last_input_at).total_seconds() if case.last_input_at else 1e9
                     case.processing_version += 1
                     await enqueue(

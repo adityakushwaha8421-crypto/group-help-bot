@@ -8,6 +8,7 @@ from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cases.gateway import is_native
 from app.config import get_settings
 from app.db.models import BetixMessage, Case, Evidence, EvidenceType
 from app.db.repository import add_betix_message, audit, case_has_out_kind, list_case_betix_messages
@@ -40,8 +41,13 @@ class BetixPoster:
         self.chat = self.default_chat
 
     def choose_group(self, case: Case) -> int | str:
-        """Which group a NEW case is posted to. Today: the default (first configured) group. This is the one
-        place to put a routing rule (per operator, per customer, round-robin) when more groups are in use."""
+        """Which group a NEW case is posted to: the Native group for a Native case, else the default (first
+        configured) Betix group. This is the one place to put any further routing rule."""
+        if is_native(case):
+            chat = self.s.native_chat
+            if chat is None:
+                raise BetixPostError("NATIVE_GROUP_CHAT_ID not configured")
+            return chat
         return self.default_chat
 
     def bind(self, case: Case) -> int | str:
@@ -159,7 +165,37 @@ class BetixPoster:
             amount=f"{case.amount:,.2f}" if case.amount is not None else "",
             case_id=case.case_id,
         )
+        root_id = await self._post_screenshots(session, case, shots, caption)
+        await self.send_amount_note(session, case, root_id)
+        case.betix_posted_at = case.betix_posted_at or utcnow()
 
+    async def post_native(self, session: AsyncSession, case: Case, evidence: list[Evidence]) -> None:
+        """NATIVE: the payment screenshot goes to the Native group captioned with EVERY order id created under the
+        mobile at the payment time (one per line, closest to the payment first). Nothing else: no statement, no
+        video, no amount note, no reminders. Idempotent."""
+        self.bind(case)
+        ids = [x for x in (case.native_order_ids or []) if x] or (
+            [case.betex_pay_order_id] if case.betex_pay_order_id else []
+        )
+        if not ids:
+            raise BetixPostError("case has no order id; refusing to post")
+        shots = [e for e in evidence if e.type == EvidenceType.payment_screenshot.value]
+        if not shots:
+            raise BetixPostError("no payment screenshot to post")
+        await self._post_screenshots(session, case, shots, "\n".join(ids), event="NATIVE_EVIDENCE_POSTED")
+        case.betix_posted_at = case.betix_posted_at or utcnow()
+
+    async def _post_screenshots(
+        self,
+        session: AsyncSession,
+        case: Case,
+        shots: list[Evidence],
+        caption: str,
+        *,
+        event: str = "BETIX_EVIDENCE_POSTED",
+    ) -> int:
+        """The first screenshot (the anchor) and the same payment's other screens as replies to it, every one with
+        the same caption. Returns the anchor's message id. Idempotent per screenshot."""
         root = await case_has_out_kind(session, case.case_id, "evidence_screenshot")
         if root is None:
             mid = await self._send_media(shots[0], caption)
@@ -167,12 +203,10 @@ class BetixPoster:
             shots[0].posted_to_betix_message_id = mid
             case.betix_root_message_id = mid  # the anchor: every follow-up is a Telegram reply to this
             case.betix_chat_id = self.chat if isinstance(self.chat, int) else None
-            await audit(
-                session, "BETIX_EVIDENCE_POSTED", case_id=case.case_id, result="screenshot", details={"message_id": mid}
-            )
+            await audit(session, event, case_id=case.case_id, result="screenshot", details={"message_id": mid})
             await session.commit()
         root_id = root.message_id if hasattr(root, "message_id") else case.betix_root_message_id
-        for shot in shots[1:]:  # the same payment's other screens, under the first one, same order id
+        for shot in shots[1:]:  # the same payment's other screens, under the first one, same caption
             if shot.posted_to_betix_message_id:
                 continue
             mid = await self._send_media(shot, caption, reply_to=root_id)
@@ -182,14 +216,13 @@ class BetixPoster:
             shot.posted_to_betix_message_id = mid
             await audit(
                 session,
-                "BETIX_EVIDENCE_POSTED",
+                event,
                 case_id=case.case_id,
                 result="screenshot_extra",
                 details={"message_id": mid, "reply_to": root_id},
             )
             await session.commit()
-        await self.send_amount_note(session, case, root_id)
-        case.betix_posted_at = case.betix_posted_at or utcnow()
+        return root_id
 
     async def send_amount_note(self, session: AsyncSession, case: Case, root_id: int | None) -> int | None:
         """The customer paid MORE or LESS than the order's amount: tell the Betix group, once, as a reply to the

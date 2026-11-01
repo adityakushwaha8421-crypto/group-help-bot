@@ -93,3 +93,52 @@ async def test_a_pull_without_requirement_changes_installs_nothing(monkeypatch):
     monkeypatch.setattr(restart, "_git", fake_git)
     monkeypatch.setattr(restart, "install_requirements", never)
     assert await restart.pull_latest() == (True, "updated abc1234 -> def5678")
+
+
+async def test_a_pull_that_adds_a_migration_upgrades_the_database(monkeypatch):
+    heads = iter(["abc1234", "def5678"])
+    migrated = []
+
+    async def fake_git(*args, timeout=60):
+        if args[0] == "rev-parse":
+            return 0, next(heads)
+        if args[0] == "diff":
+            return 0, "app/db/migrations/versions/c3d9a7e51b20_gateway_choice.py\napp/db/models.py"
+        return 0, "Fast-forward"
+
+    async def fake_migrate():
+        migrated.append(True)
+        return "database migrated"
+
+    async def never():
+        raise AssertionError("pip must not run")
+
+    monkeypatch.setattr(restart, "_git", fake_git)
+    monkeypatch.setattr(restart, "install_requirements", never)
+    monkeypatch.setattr(restart, "migrate_database", fake_migrate)
+    assert await restart.pull_latest() == (True, "updated abc1234 -> def5678; database migrated")
+    assert migrated == [True]
+
+
+async def test_a_pull_without_a_migration_runs_no_upgrade(monkeypatch):
+    heads = iter(["abc1234", "def5678"])
+
+    async def fake_git(*args, timeout=60):
+        if args[0] == "rev-parse":
+            return 0, next(heads)
+        return (0, "app/db/models.py") if args[0] == "diff" else (0, "Fast-forward")
+
+    async def never():
+        raise AssertionError("alembic must not run")
+
+    monkeypatch.setattr(restart, "_git", fake_git)
+    monkeypatch.setattr(restart, "migrate_database", never)
+    assert await restart.pull_latest() == (True, "updated abc1234 -> def5678")
+
+
+async def test_the_sqlite_dev_database_is_never_migrated_with_alembic(env, monkeypatch):
+    async def never(*cmd, timeout):
+        raise AssertionError("alembic must not run on sqlite")
+
+    monkeypatch.setattr(restart, "_run", never)
+    assert await restart.migrate_database() == "schema created at start (sqlite)"

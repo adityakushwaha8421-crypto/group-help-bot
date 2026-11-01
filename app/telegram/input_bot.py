@@ -30,6 +30,7 @@ from app.cases.correlation import (
     missing_items,
     statement_needs_password,
 )
+from app.cases.gateway import choose_gateway, gateway_label, gateway_pending, is_native
 from app.config import get_settings
 from app.db.models import KIND_WITHDRAWAL, Case, CaseStatus
 from app.db.repository import (
@@ -44,6 +45,7 @@ from app.db.repository import (
 from app.db.session import session_scope
 from app.telegram import add_evidence, notifications, order_search
 from app.telegram.betix_monitor import build_router as build_betix_router
+from app.telegram.progress import card_buttons
 from app.telegram.throttle import get_throttle
 from app.telegram.ui import b, card, case_label, code, esc, i, join_and, kv, para, title
 from app.utils.logging import get_logger
@@ -109,6 +111,10 @@ def help_text() -> str:
         + b("Good to know")
         + "\n"
         + i(f"\u23f1 Everything sent within {q}s becomes one case.")
+        + "\n"
+        + i(
+            "\U0001f500 Screenshot + mobile in: I ask Betix or Native. Native needs nothing else and goes to the Native group."
+        )
         + "\n"
         + i("\U0001f522 A visible UTR helps the match; it is not required.")
         + "\n"
@@ -315,7 +321,10 @@ async def cmd_add(message: Message, command: CommandObject):
         have = {e.type for e in ev}
         sess = add_evidence.start(message.chat.id, message.from_user.id, case, q)
         pending = [t.replace("_", " ") for t in ("bank_statement", "payment_video") if t not in have]
-        where = "already with Betix" if case.betix_root_message_id else "not with Betix yet"
+        if is_native(case):
+            pending = []  # a Native case needs nothing but the screenshot and the mobile
+        group = "the Native group" if is_native(case) else "Betix"
+        where = f"already with {group}" if case.betix_root_message_id else f"not with {group} yet"
         need = f"Still missing the {join_and(pending)}." if pending else "It already has everything."
         limit = get_settings().add_session_seconds
         await message.answer(
@@ -658,7 +667,7 @@ def _customer_line(case, forwarded: bool) -> str:
     return kv("👤", "Customer", who + (" (forwarded)" if forwarded else ""))
 
 
-def case_card(case, evidence, missing, *, created: bool, forwarded: bool) -> str:
+def case_card(case, evidence, missing, *, created: bool, forwarded: bool, head: str | None = None) -> str:
     """The one message per case in the operator chat: who it is for, what arrived, what happens next."""
     who = (
         case.original_username
@@ -668,13 +677,25 @@ def case_card(case, evidence, missing, *, created: bool, forwarded: bool) -> str
     )
     what = "New Withdrawal" if case.kind == KIND_WITHDRAWAL else "New Case"
     icon = "\U0001f4b8" if case.kind == KIND_WITHDRAWAL else "\U0001f195"
-    head = (
+    head = head or (
         f"{icon} {b(what)} \u2014 {esc(who)}"
         if created
         else f"\U0001f4ce {b('Evidence Added')} \u2014 {code(case_label(case))}"
     ) + (" (Forwarded)" if forwarded and created else "")
     if case.kind == KIND_WITHDRAWAL and not missing:
         nxt = "\U0001f4e4 Sending the withdrawal to Betix now."
+    elif gateway_pending(case, missing) and case.status == CaseStatus.WAITING_FOR_INPUT.value:
+        nxt = (
+            "\U0001f500 Which gateway did the customer pay through?\n"
+            "\U0001f447 Tap "
+            + b("Betix")
+            + " or "
+            + b("Native")
+            + " \u2014 nothing is sent until you do.\n"
+            + i("Native: only the screenshot and the mobile are needed.")
+        )
+    elif is_native(case) and not missing:
+        nxt = "\U0001f50e Native \u2014 checking the order(s) in Illunise, then sending to the Native group..."
     elif force_send_pending(case, missing):
         secs = get_settings().force_send_seconds
         nxt = (
@@ -728,7 +749,6 @@ def force_send_pending(case, missing: list[str]) -> bool:
 
 async def flush_chat(chat_id: int) -> list[str]:
     """Attach everything held for the chat, send ONE card per case touched, start processing where complete."""
-    s = get_settings()
     items = _held.pop(chat_id, [])
     # The payment screenshot opens the case, so it goes first whatever order the batch arrived in; everything
     # else keeps its arrival order (a PDF before its password, the mobile wherever it was typed). A statement
@@ -755,36 +775,91 @@ async def flush_chat(chat_id: int) -> list[str]:
                 await enqueue("late_evidence_job", case_id, job_id=f"late-{case_id}-{e['message'].message_id}")
             await refresh_progress(case_id)
             continue
-        if not e["missing"] and case.status == CaseStatus.WAITING_FOR_INPUT.value:
-            async with session_scope() as session:
-                c = await get_case_for_update(session, case_id)
-                c.processing_version += 1
-                version = c.processing_version
-            await enqueue("process_case_job", case_id, version, True, job_id=f"process-{case_id}-{version}")
-        elif force_send_pending(case, e["missing"]):
-            # Screenshot + mobile are in; only the statement / video is missing. (Re)start the FORCE SEND wait: a
-            # newer version makes any earlier timer stale, so every new file restarts the 30 seconds.
-            async with session_scope() as session:
-                c = await get_case_for_update(session, case_id)
-                c.processing_version += 1
-                version = c.processing_version
-            await enqueue(
-                "process_case_job",
-                case_id,
-                version,
-                True,
-                True,
-                job_id=f"force-{case_id}-{version}",
-                defer_seconds=s.force_send_seconds,
-            )
+        await kick_off(case, e["missing"])
         text = case_card(case, e["evidence"], e["missing"], created=e["created"], forwarded=e["forwarded"])
+        buttons = card_buttons(case, e["missing"])
         # ONE message per case: created once, edited afterwards (and by every processing step).
         if not e["created"] and case.progress_chat_id == chat_id and case.progress_message_id:
-            if await edit_case_message(case.progress_chat_id, case.progress_message_id, text):
+            if await edit_case_message(case.progress_chat_id, case.progress_message_id, text, buttons):
                 continue
-        sent = await e["message"].answer(text, parse_mode="HTML")
+        kw = {"reply_markup": buttons} if buttons is not None else {}
+        sent = await e["message"].answer(text, parse_mode="HTML", **kw)
         await track_progress(case_id, chat_id, sent)
     return list(touched)
+
+
+async def kick_off(case, missing: list[str]) -> str | None:
+    """Start what the case's evidence allows: "process" when nothing is missing, "force" (the FORCE SEND wait)
+    when only the statement / video is, None otherwise - and NOTHING while the gateway question is open."""
+    s = get_settings()
+    case_id = case.case_id
+    if case.status != CaseStatus.WAITING_FOR_INPUT.value:
+        return None
+    if gateway_pending(case, missing):
+        return None  # the card's [Betix] [Native] buttons decide; the tap calls kick_off again
+    if not missing:
+        async with session_scope() as session:
+            c = await get_case_for_update(session, case_id)
+            c.processing_version += 1
+            version = c.processing_version
+        await enqueue("process_case_job", case_id, version, True, job_id=f"process-{case_id}-{version}")
+        return "process"
+    if force_send_pending(case, missing):
+        # Screenshot + mobile are in; only the statement / video is missing. (Re)start the FORCE SEND wait: a
+        # newer version makes any earlier timer stale, so every new file restarts the 30 seconds.
+        async with session_scope() as session:
+            c = await get_case_for_update(session, case_id)
+            c.processing_version += 1
+            version = c.processing_version
+        await enqueue(
+            "process_case_job",
+            case_id,
+            version,
+            True,
+            True,
+            job_id=f"force-{case_id}-{version}",
+            defer_seconds=s.force_send_seconds,
+        )
+        return "force"
+    return None
+
+
+@router.callback_query(F.data.startswith("gw:"))
+async def on_gateway_button(query: CallbackQuery):
+    """[Betix] / [Native] under a case card: the operator's answer. Betix goes on as before (the statement / video
+    waited for, then the Betix group); Native needs nothing more and goes to the Native group right away."""
+    if query.from_user.id not in get_settings().admin_user_ids:
+        await query.answer("\u26d4 Not authorized", show_alert=True)
+        return
+    try:
+        _, choice, case_id = query.data.split(":", 2)
+    except ValueError:
+        await query.answer("\u26a0\ufe0f Unknown button")
+        return
+    who = f"@{query.from_user.username}" if query.from_user.username else str(query.from_user.id)
+    async with session_scope() as session:
+        case = await get_case_for_update(session, case_id)
+        if case is None:
+            await query.answer("\U0001f914 I couldn't find that case.", show_alert=True)
+            return
+        if not await choose_gateway(session, case, choice, who):
+            await query.answer(f"Already chosen: {gateway_label(case)}")
+            return
+        ev = await list_evidence(session, case_id)
+        missing = missing_items(case, ev)
+        chosen = gateway_label(case)
+    started = await kick_off(case, missing)
+    await query.answer(f"\u2705 {chosen}")
+    head = f"\U0001f500 {b('Gateway: ' + chosen)} \u2014 {code(case_label(case))}"
+    text = case_card(case, ev, missing, created=False, forwarded=False, head=head)
+    chat_id = query.message.chat.id if query.message else case.progress_chat_id
+    msg_id = query.message.message_id if query.message else case.progress_message_id
+    if chat_id and msg_id and await edit_case_message(chat_id, msg_id, text, None):
+        return
+    if query.message:
+        sent = await query.message.answer(text, parse_mode="HTML")
+        await track_progress(case_id, chat_id, sent)
+    log.info("gateway chosen", case_id=case_id, gateway=choice, by=who, started=started)
 
 
 @router.message(F.chat.type == "private", F.photo | F.video | F.document | F.video_note | F.text)
@@ -871,12 +946,12 @@ async def add_to_case(message: Message, inp: IncomingInput, sess) -> None:
     await message.answer(para(f"✅ Added the {esc(note)} to case {code(label)}.", tail), parse_mode="HTML")
 
 
-async def edit_case_message(chat_id: int, message_id: int, text: str) -> bool:
+async def edit_case_message(chat_id: int, message_id: int, text: str, reply_markup=None) -> bool:
     try:
         await get_throttle().run(
             chat_id,
             lambda: notifications.get_bot().edit_message_text(
-                text, chat_id=chat_id, message_id=message_id, parse_mode="HTML"
+                text, chat_id=chat_id, message_id=message_id, parse_mode="HTML", reply_markup=reply_markup
             ),
         )
         return True
@@ -945,11 +1020,20 @@ def case_status_lines(case, evidence) -> list[str]:
     lines = [
         ("\u2705 Payment Screenshot" if "payment_screenshot" in types else "\u23f3 Payment Screenshot \u2014 waiting"),
         (f"\u2705 Mobile: {code(case.mobile)}" if case.mobile else "\u23f3 Mobile \u2014 waiting"),
+    ]
+    if is_native(case):
+        lines.append("\U0001f500 Gateway: " + b("Native") + " \u2014 no statement or video needed")
+        return lines
+    lines += [
         ("\u2705 Bank Statement" if "bank_statement" in types else "\u23f3 Bank Statement \u2014 waiting"),
         ("\u2705 Payment Video" if "payment_video" in types else "\u23f3 Payment Video \u2014 waiting"),
     ]
     if statement_needs_password(case, evidence):
         lines.append("\U0001f510 Statement is password protected \u2014 please send the password.")
+    if case.gateway_choice:
+        lines.append("\U0001f500 Gateway: " + b(gateway_label(case)))
+    elif get_settings().ask_gateway and "payment_screenshot" in types and case.mobile:
+        lines.append("\U0001f500 Gateway \u2014 waiting for your choice")
     return lines
 
 

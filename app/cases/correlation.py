@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.extractor import Extraction, Field, extract_from_text
 from app.config import get_settings
-from app.db.models import KIND_WITHDRAWAL, Case, CaseStatus, Evidence, EvidenceType
+from app.db.models import GATEWAY_NATIVE, KIND_WITHDRAWAL, Case, CaseStatus, Evidence, EvidenceType
 from app.db.repository import (
     add_case_message,
     add_evidence,
@@ -483,6 +483,8 @@ def missing_items(case: Case, evidence: list[Evidence], require_all: bool | None
         missing.append("payment screenshot")
     if not case.mobile:
         missing.append("mobile number")
+    if case.gateway_choice == GATEWAY_NATIVE:
+        return missing  # NATIVE: the screenshot and the mobile, nothing else - no statement, video or password
     if require_all and EvidenceType.bank_statement.value not in types:
         missing.append("bank statement")
     elif EvidenceType.bank_statement.value in types and statement_needs_password(case, evidence):

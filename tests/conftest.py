@@ -34,6 +34,10 @@ TEST_ENV = {
     "BETIX_EXTRA_EVIDENCE_POLICY": "always",
     "COLLECTION_SECONDS": "5",
     "BATCH_JOIN_SECONDS": "15",
+    # The "Betix or Native?" question is off for the Betix-flow tests (every case is a Betix case, as before the
+    # choice existed); tests/test_native_gateway.py turns it on.
+    "ASK_GATEWAY": "false",
+    "NATIVE_GROUP_CHAT_ID": "-1004444",
 }
 
 

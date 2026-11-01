@@ -289,6 +289,22 @@ python -m pytest -q
   case status before every send.
 * **Secrets** only from the environment; the structured logger redacts token/password/session-like values.
 
+## Betix or Native (the gateway question)
+
+As soon as the payment screenshot and the mobile are on a case, its card asks **Which gateway did the customer
+pay through?** with two buttons, `Betix` and `Native`. Nothing is processed until an admin taps one
+(`ASK_GATEWAY=false` switches the question off: every case is a Betix case, as before).
+
+- **Betix**: the flow above - the statement and video are waited for `FORCE_SEND_SECONDS`, the order is matched
+  (with `/pi` on any doubt), the screenshot goes to the Betix group, reminders follow.
+- **Native**: only the screenshot and the mobile are needed - no statement, video or password, no wait. The
+  order amount is a round figure, so the paid amount is rounded to the rupee and every order created under the
+  mobile just before the payment for that amount counts (a Betix order never does; set `NATIVE_GATEWAY_NAME` to
+  keep one gateway only). The screenshot goes to `NATIVE_GROUP_CHAT_ID` captioned with the order id(s), one per
+  line, closest to the payment first - one post, however many orders. No `/pi`, no amount note, no reminders.
+  A member's "done" / "success" as a reply to that post confirms the case like a Betix member's would. No order
+  at the payment time: manual review, nothing posted.
+
 ## Withdrawals
 
 A withdrawal case needs only two things from the operator, in any order: the **withdrawal id** as Betix shows

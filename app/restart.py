@@ -54,6 +54,7 @@ def pop_notice(max_age: float = 300) -> int | None:
 
 
 ROOT = Path(__file__).resolve().parent.parent
+MIGRATIONS = "app/db/migrations/versions/"
 
 
 async def _git(*args: str, timeout: float = 60) -> tuple[int, str]:
@@ -85,6 +86,8 @@ async def pull_latest() -> tuple[bool, str]:
     changed = (await _git("diff", "--name-only", before, after))[1].splitlines()
     if "requirements.txt" in changed:
         line += "; " + await install_requirements()
+    if any(f.startswith(MIGRATIONS) for f in changed):
+        line += "; " + await migrate_database()
     return True, line
 
 
@@ -107,6 +110,20 @@ async def install_requirements() -> str:
         return "dependencies installed"
     last = out.splitlines()[-1][:120] if out else "unknown error"
     return f"dependency install FAILED ({last}) - run: pip install -r requirements.txt"
+
+
+async def migrate_database() -> str:
+    """A migration file arrived in the pull: bring the database schema to it (alembic upgrade head) before the
+    new code, which expects the new columns, starts. A SQLite dev database is created by the app itself."""
+    from app.config import get_settings
+
+    if get_settings().is_sqlite:
+        return "schema created at start (sqlite)"
+    code, out = await _run(sys.executable, "-m", "alembic", "upgrade", "head", timeout=300)
+    if code == 0:
+        return "database migrated"
+    last = out.splitlines()[-1][:120] if out else "unknown error"
+    return f"database migration FAILED ({last}) - run: alembic upgrade head"
 
 
 def reexec() -> None:

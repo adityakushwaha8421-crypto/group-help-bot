@@ -168,6 +168,16 @@ class Settings(BaseSettings):
     # reply to the screenshot post ("User paid extra amount" / "User paid less amount").
     betix_amount_note: bool = True
     betix_followup_text: str = "Any update?"  # both follow-ups, sent as replies to the screenshot post
+
+    # GATEWAY CHOICE. Once the payment screenshot and the mobile are in, the operator is asked which gateway the
+    # customer paid through - Betix or Native - and nothing is processed until they tap one. Betix: the flow
+    # above (statement + video waited for, the Betix group, /pi, follow-ups). Native: nothing else is needed,
+    # the order amount is a round figure, and the screenshot goes to NATIVE_GROUP_CHAT_ID captioned with EVERY
+    # order id created under the mobile at the payment time (one or several). ASK_GATEWAY=false: never asked,
+    # every case is a Betix case (the behaviour before the choice existed).
+    ask_gateway: bool = True
+    native_group_chat_id: str = ""  # the Native group; "1003515687583" and "-1003515687583" both work
+    native_gateway_name: str = ""  # empty: a Native order is any order that is not a Betix one
     # Bank statement / payment video in the Betix group. They are only ever sent as REPLIES to the screenshot post:
     #   always     = statement (+ its password) and video go right after the screenshot, as replies  [default]
     #   on_request = kept internal; sent only once Betix asks for more evidence
@@ -253,7 +263,7 @@ class Settings(BaseSettings):
     evidence_retention_days: int = 90
     evidence_max_download_mb: int = 20
 
-    @field_validator("admin_notify_chat_id", "betix_group_chat_id", mode="before")
+    @field_validator("admin_notify_chat_id", "betix_group_chat_id", "native_group_chat_id", mode="before")
     @classmethod
     def _strip(cls, v):  # noqa: D102
         return str(v).strip() if v is not None else ""
@@ -314,6 +324,21 @@ class Settings(BaseSettings):
     @property
     def betix_chat_ids(self) -> set[int]:
         return {c for c in self.betix_chats if isinstance(c, int)}
+
+    @property
+    def native_chat(self) -> int | None:
+        """NATIVE_GROUP_CHAT_ID as the Bot API wants it. A supergroup id copied without its sign ("1003515687583",
+        or the bare "3515687583") is turned into the -100... form; None when not configured."""
+        v = self.native_group_chat_id.strip()
+        if not v:
+            return None
+        try:
+            n = int(v)
+        except ValueError:
+            return None
+        if n > 0:
+            n = -n if v.startswith("100") and len(v) >= 13 else int("-100" + v)
+        return n
 
     @property
     def betix_chat(self) -> int | str | None:

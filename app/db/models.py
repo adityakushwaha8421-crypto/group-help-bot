@@ -108,6 +108,9 @@ def _ts():
 
 
 KIND_PAYMENT, KIND_WITHDRAWAL = "payment", "withdrawal"
+# The operator's answer to "Betix or Native?" (Case.gateway_choice). NULL = not answered yet (or never asked:
+# ASK_GATEWAY=false), which means Betix everywhere.
+GATEWAY_BETIX, GATEWAY_NATIVE = "betix", "native"
 
 
 class Case(Base):
@@ -141,6 +144,10 @@ class Case(Base):
     # payment (default) or withdrawal: a withdrawal case carries a WD-xxxxx-xxxxx id + the bank statement only
     kind: Mapped[str] = mapped_column(String(20), default="payment", server_default="payment", index=True)
     withdrawal_id: Mapped[str | None] = mapped_column(String(60), index=True)
+    # betix | native: which gateway the operator said the customer paid through (see GATEWAY_*)
+    gateway_choice: Mapped[str | None] = mapped_column(String(10))
+    # Native: EVERY order id created under the mobile at the payment time, closest first; all go in the caption
+    native_order_ids: Mapped[list | None] = mapped_column(JSON)
     betix_plat_order_no: Mapped[str | None] = mapped_column(String(100), index=True)
     # /pi UPI check: the close order ids, best first. Asked ONE BY ONE; the first whose UPI fits wins.
     pi_check_orders: Mapped[list | None] = mapped_column(JSON)
