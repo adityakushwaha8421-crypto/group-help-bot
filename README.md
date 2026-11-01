@@ -291,9 +291,12 @@ python -m pytest -q
 
 ## Betix or Native (the gateway question)
 
-As soon as the payment screenshot and the mobile are on a case, its card asks **Which gateway did the customer
-pay through?** with two buttons, `Betix` and `Native`. Nothing is processed until an admin taps one
-(`ASK_GATEWAY=false` switches the question off: every case is a Betix case, as before).
+As soon as the payment screenshot and the mobile are on a case, the bot reads the paid amount. **Paise**
+(₹100.20, ₹6,499.92: Betix pads every order with unique paise) make it a **Betix case by itself** - nobody is
+asked. A **round figure** (₹10,000) could be either, so the card asks **Which gateway did the customer pay
+through?** with two buttons, `Betix` and `Native` (shown from the first card on, so a quick tap never waits
+for the read). Nothing is processed until the gateway is known (`ASK_GATEWAY=false` switches all of this off:
+every case is a Betix case, as before).
 
 - **Betix**: the flow above - the statement and video are waited for `FORCE_SEND_SECONDS`, the order is matched
   (with `/pi` on any doubt), the screenshot goes to the Betix group, reminders follow.

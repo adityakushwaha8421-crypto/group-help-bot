@@ -50,6 +50,37 @@ async def process_case_job(ctx, case_id: str, version: int = 0, force: bool = Fa
     return outcome
 
 
+async def gateway_job(ctx, case_id: str) -> str:
+    """The screenshot and the mobile are in and the gateway question is open: read the paid amount. Paise -> a
+    Betix case, decided here, processing starts (the FORCE SEND wait or the full run); a round figure or no
+    amount -> the card keeps asking Betix or Native. Returns: chosen | decided | asked | gone"""
+    from app.cases.correlation import missing_items
+    from app.cases.gateway import apply_auto_gateway
+    from app.db.repository import get_case_for_update
+    from app.telegram.input_bot import kick_off, show_gateway_card
+
+    async with session_scope() as session:
+        case = await get_case(session, case_id)
+        if case is None or case.status != CaseStatus.WAITING_FOR_INPUT.value:
+            return "gone"
+        if case.gateway_choice is not None:
+            return "chosen"  # the operator tapped in the meantime
+        if case.amount is None:
+            await manager.read_payment_amount(session, case)
+    async with session_scope() as session:
+        case = await get_case_for_update(session, case_id)
+        if case is None or case.gateway_choice is not None:
+            return "chosen"
+        decided = await apply_auto_gateway(session, case)
+        missing = missing_items(case, await list_evidence(session, case.case_id))
+    if decided:
+        await kick_off(case, missing)
+    await show_gateway_card(case_id)
+    outcome = "decided" if decided else "asked"
+    log.info("gateway", case_id=case_id, outcome=outcome, amount=case.amount)
+    return outcome
+
+
 async def post_case_job(ctx, case_id: str) -> str:
     async with session_scope() as session:
         outcome = await manager.post_case_to_betix(session, case_id, poster_factory())
@@ -174,7 +205,9 @@ async def recover(ctx=None) -> dict:
                 missing = missing_items(case, ev)
                 s = get_settings()
                 if gateway_pending(case, missing):
-                    counts["gateway_pending"] = counts.get("gateway_pending", 0) + 1  # the card's buttons wait
+                    # the amount decides or the card's buttons do: read it again (cached) and show the card
+                    await enqueue("gateway_job", case.case_id, job_id=f"recover-gateway-{case.case_id}")
+                    counts["gateway_pending"] = counts.get("gateway_pending", 0) + 1
                 elif missing and not hard_missing(missing) and s.force_send_seconds > 0:
                     waited = (utcnow() - case.last_input_at).total_seconds() if case.last_input_at else 1e9
                     case.processing_version += 1
@@ -244,6 +277,7 @@ async def shutdown(ctx) -> None:
 class WorkerSettings:
     functions = [
         process_case_job,
+        gateway_job,
         post_case_job,
         reversal_check_job,
         refund_withdrawal_job,

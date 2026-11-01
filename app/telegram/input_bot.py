@@ -30,7 +30,7 @@ from app.cases.correlation import (
     missing_items,
     statement_needs_password,
 )
-from app.cases.gateway import choose_gateway, gateway_label, gateway_pending, is_native
+from app.cases.gateway import auto_reason, choose_gateway, gateway_label, gateway_pending, is_native
 from app.config import get_settings
 from app.db.models import KIND_WITHDRAWAL, Case, CaseStatus
 from app.db.repository import (
@@ -685,13 +685,20 @@ def case_card(case, evidence, missing, *, created: bool, forwarded: bool, head: 
     if case.kind == KIND_WITHDRAWAL and not missing:
         nxt = "\U0001f4e4 Sending the withdrawal to Betix now."
     elif gateway_pending(case, missing) and case.status == CaseStatus.WAITING_FOR_INPUT.value:
+        if case.amount is None:
+            lead = (
+                "\U0001f4f8 Reading the paid amount \u2014 paise (\u20b9100.20) means Betix by itself, "
+                "a round figure means your choice.\n"
+            )
+        else:
+            lead = f"\U0001f4b0 \u20b9{case.amount:,.0f} is a round figure \u2014 Betix or Native?\n"
         nxt = (
-            "\U0001f500 Which gateway did the customer pay through?\n"
-            "\U0001f447 Tap "
+            lead
+            + "\U0001f447 Tap "
             + b("Betix")
             + " or "
             + b("Native")
-            + " \u2014 nothing is sent until you do.\n"
+            + " \u2014 nothing is sent until the gateway is known.\n"
             + i("Native: only the screenshot and the mobile are needed.")
         )
     elif is_native(case) and not missing:
@@ -796,7 +803,11 @@ async def kick_off(case, missing: list[str]) -> str | None:
     if case.status != CaseStatus.WAITING_FOR_INPUT.value:
         return None
     if gateway_pending(case, missing):
-        return None  # the card's [Betix] [Native] buttons decide; the tap calls kick_off again
+        if case.amount is None:
+            # the amount may decide (paise = Betix): read it now; meanwhile the card's buttons are live too
+            await enqueue("gateway_job", case_id, job_id=f"gateway-{case_id}")
+            return "gateway"
+        return None  # a round figure: only the card's [Betix] [Native] buttons decide
     if not missing:
         async with session_scope() as session:
             c = await get_case_for_update(session, case_id)
@@ -946,6 +957,24 @@ async def add_to_case(message: Message, inp: IncomingInput, sess) -> None:
     await message.answer(para(f"✅ Added the {esc(note)} to case {code(label)}.", tail), parse_mode="HTML")
 
 
+async def show_gateway_card(case_id: str) -> bool:
+    """Rewrite the case card after the amount was read: the question (round figure, buttons stay) or the
+    decision (paise: Betix, no buttons) and what happens next."""
+    async with session_scope() as session:
+        case = await get_case(session, case_id)
+        if case is None or not (case.progress_chat_id and case.progress_message_id):
+            return False
+        ev = await list_evidence(session, case_id)
+        missing = missing_items(case, ev)
+        head = None
+        if case.gateway_choice:
+            head = f"\U0001f500 {b('Gateway: ' + gateway_label(case))} \u2014 {code(case_label(case))}"
+        text = case_card(case, ev, missing, created=False, forwarded=False, head=head)
+        buttons = card_buttons(case, missing)
+        chat_id, msg_id = case.progress_chat_id, case.progress_message_id
+    return await edit_case_message(chat_id, msg_id, text, buttons)
+
+
 async def edit_case_message(chat_id: int, message_id: int, text: str, reply_markup=None) -> bool:
     try:
         await get_throttle().run(
@@ -1031,7 +1060,8 @@ def case_status_lines(case, evidence) -> list[str]:
     if statement_needs_password(case, evidence):
         lines.append("\U0001f510 Statement is password protected \u2014 please send the password.")
     if case.gateway_choice:
-        lines.append("\U0001f500 Gateway: " + b(gateway_label(case)))
+        why = auto_reason(case)
+        lines.append("\U0001f500 Gateway: " + b(gateway_label(case)) + (f" \u2014 {esc(why)}" if why else ""))
     elif get_settings().ask_gateway and "payment_screenshot" in types and case.mobile:
         lines.append("\U0001f500 Gateway \u2014 waiting for your choice")
     return lines

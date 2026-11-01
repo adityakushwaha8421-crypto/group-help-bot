@@ -113,9 +113,9 @@ def test_the_native_group_is_monitored_like_a_betix_group():
 async def test_the_card_asks_betix_or_native_and_nothing_starts(db, fake_bot, asking, jobs):
     sink = []
     case_id = await send(sink, make_input(1, "photo"), make_input(2, "text", MOBILE))
-    assert jobs == []  # no processing, no FORCE SEND wait
+    assert jobs == [("gateway_job", (case_id,), 0)]  # the amount is read; no processing, no FORCE SEND wait
     text, markup = sink[-1]
-    assert "Which gateway" in text and "Gateway — waiting for your choice" in text
+    assert "Reading the paid amount" in text and "Gateway — waiting for your choice" in text
     assert buttons_of(markup) == [f"gw:betix:{case_id}", f"gw:native:{case_id}"]
     async with db.session_scope() as s:
         c = await get_case(s, case_id)
@@ -127,9 +127,9 @@ async def test_more_evidence_keeps_the_question_open(db, fake_bot, asking, jobs)
     sink = []
     case_id = await send(sink, make_input(1, "photo"), make_input(2, "text", MOBILE))
     await send(sink, make_input(3, "document"), make_input(4, "video"))
-    assert jobs == []  # all four in, still nothing until the tap
+    assert {j[0] for j in jobs} == {"gateway_job"}  # all four in, still nothing until the gateway is known
     _, _, text = fake_bot.edits[-1]
-    assert "Which gateway" in text and "✅ Bank Statement" in text and "✅ Payment Video" in text
+    assert "until the gateway is known" in text and "✅ Bank Statement" in text and "✅ Payment Video" in text
     async with db.session_scope() as s:
         assert (await get_case(s, case_id)).gateway_choice is None
 
@@ -138,22 +138,22 @@ async def test_the_question_is_not_asked_before_the_screenshot_and_mobile(db, fa
     sink = []
     await send(sink, make_input(1, "photo"))
     text, markup = sink[-1]
-    assert "Which gateway" not in text and markup is None
+    assert "gateway is known" not in text and markup is None and jobs == []
     assert "Waiting for the mobile number" in text
 
 
 async def test_a_withdrawal_is_never_asked(db, fake_bot, asking, jobs):
     sink = []
-    await send(sink, make_input(1, "text", "WD-84425-67115"), make_input(2, "document"))
+    case_id = await send(sink, make_input(1, "text", "WD-84425-67115"), make_input(2, "document"))
     text, markup = sink[-1]
-    assert "Which gateway" not in text and markup is None
+    assert "gateway is known" not in text and markup is None and jobs == [("process_case_job", (case_id, 1, True), 0)]
 
 
 async def test_with_the_question_off_the_case_starts_as_before(db, fake_bot, jobs):
     sink = []
     case_id = await send(sink, make_input(1, "photo"), make_input(2, "text", MOBILE))
     assert jobs == [("process_case_job", (case_id, 1, True, True), 30)]
-    assert "Which gateway" not in sink[-1][0] and sink[-1][1] is None
+    assert "gateway is known" not in sink[-1][0] and sink[-1][1] is None
 
 
 # ---------------------------------------------------------------- the tap
@@ -163,7 +163,7 @@ async def test_betix_with_only_the_screenshot_starts_the_force_send_wait(db, fak
     tap = Tap(GATEWAY_BETIX, case_id)
     await input_bot.on_gateway_button(tap)
     assert tap.answers == ["✅ Betix"]
-    assert jobs == [("process_case_job", (case_id, 1, True, True), 30)]  # the 30 s wait, as before
+    assert jobs[-1] == ("process_case_job", (case_id, 1, True, True), 30)  # the 30 s wait, as before
     _, _, text = fake_bot.edits[-1]
     assert "Gateway: Betix" in text and "Waiting 30s for the bank statement and payment video" in text
     async with db.session_scope() as s:
@@ -178,7 +178,7 @@ async def test_betix_with_everything_in_is_processed_at_once(db, fake_bot, askin
     case_id = await send(sink, make_input(1, "photo"), make_input(2, "text", MOBILE), make_input(3, "document"),
                          make_input(4, "video"))  # fmt: skip
     await input_bot.on_gateway_button(Tap(GATEWAY_BETIX, case_id))
-    assert jobs == [("process_case_job", (case_id, 1, True), 0)]
+    assert jobs[-1] == ("process_case_job", (case_id, 1, True), 0)
 
 
 async def test_native_starts_at_once_and_needs_nothing_else(db, fake_bot, asking, jobs):
@@ -187,7 +187,7 @@ async def test_native_starts_at_once_and_needs_nothing_else(db, fake_bot, asking
     tap = Tap(GATEWAY_NATIVE, case_id)
     await input_bot.on_gateway_button(tap)
     assert tap.answers == ["✅ Native"]
-    assert jobs == [("process_case_job", (case_id, 1, True), 0)]  # no wait for a statement or video
+    assert jobs[-1] == ("process_case_job", (case_id, 1, True), 0)  # no wait for a statement or video
     _, _, text = fake_bot.edits[-1]
     assert "Gateway: Native" in text and "no statement or video needed" in text
     assert "Bank Statement" not in text and "Payment Video" not in text
@@ -206,7 +206,7 @@ async def test_a_second_tap_changes_nothing(db, fake_bot, asking, jobs):
     await input_bot.on_gateway_button(Tap(GATEWAY_NATIVE, case_id))
     tap = Tap(GATEWAY_BETIX, case_id)
     await input_bot.on_gateway_button(tap)
-    assert tap.answers == ["Already chosen: Native"] and len(jobs) == 1
+    assert tap.answers == ["Already chosen: Native"] and len([j for j in jobs if j[0] != "gateway_job"]) == 1
     async with db.session_scope() as s:
         assert (await get_case(s, case_id)).gateway_choice == GATEWAY_NATIVE
 
@@ -216,7 +216,7 @@ async def test_only_an_admin_can_tap(db, fake_bot, asking, jobs):
     case_id = await send(sink, make_input(1, "photo"), make_input(2, "text", MOBILE))
     tap = Tap(GATEWAY_NATIVE, case_id, user_id=999)
     await input_bot.on_gateway_button(tap)
-    assert tap.answers == ["⛔ Not authorized"] and jobs == []
+    assert tap.answers == ["⛔ Not authorized"] and jobs == [("gateway_job", (case_id,), 0)]
 
 
 async def test_the_live_card_keeps_the_buttons_while_the_question_is_open(db, fake_bot, asking, jobs):
@@ -224,7 +224,7 @@ async def test_the_live_card_keeps_the_buttons_while_the_question_is_open(db, fa
     case_id = await send(sink, make_input(1, "photo"), make_input(2, "text", MOBILE))
     await input_bot.refresh_progress(case_id)  # any status push while waiting re-sends the question
     _, _, text = fake_bot.edits[-1]
-    assert "Which gateway" in text
+    assert "until the gateway is known" in text
     async with db.session_scope() as s:
         c = await get_case(s, case_id)
         from app.cases.correlation import missing_items
@@ -444,7 +444,8 @@ async def test_recovery_leaves_an_unanswered_case_alone(db, fake_bot, asking, jo
     sink = []
     await send(sink, make_input(1, "photo"), make_input(2, "text", MOBILE))
     counts = await tasks.recover()
-    assert counts.get("gateway_pending") == 1 and jobs == []
+    assert counts.get("gateway_pending") == 1 and jobs[-1][0] == "gateway_job"
+    assert not any(j[0] == "process_case_job" for j in jobs)
 
 
 async def test_add_on_a_native_case_needs_nothing(db, fake_bot, fake_ai, order_search, no_download, fake_poster):
@@ -492,3 +493,83 @@ async def test_a_bare_done_in_the_native_group_never_confirms_a_betix_case(
             assert r["case_id"] == case_id and r["correlation"] == "proximity"
     finally:
         set_membership_checker(None)
+
+
+# ---------------------------------------------------------------- the amount decides (paise = Betix)
+def test_a_round_figure_has_no_paise():
+    from app.cases.gateway import is_round
+
+    assert is_round(10000.0) and is_round(100) and is_round(99.999)
+    assert not is_round(100.2) and not is_round(6499.92) and not is_round(None)
+
+
+async def test_paise_make_it_a_betix_case_without_asking(db, fake_bot, fake_ai, no_download, asking, jobs):
+    """₹6,499.92 on the screenshot: Betix pads its orders with paise, so this is a Betix payment - decided by the
+    bot, the card says so and the FORCE SEND wait starts; the operator is never asked."""
+    sink = []
+    case_id = await send(sink, make_input(1, "photo"), make_input(2, "text", MOBILE))
+    assert jobs == [("gateway_job", (case_id,), 0)] and sink[-1][1] is not None  # buttons up while reading
+    assert await tasks.gateway_job({}, case_id) == "decided"
+    assert jobs[-1] == ("process_case_job", (case_id, 1, True, True), 30)  # Betix: the 30 s wait, as always
+    async with db.session_scope() as s:
+        c = await get_case(s, case_id)
+        assert c.gateway_choice == GATEWAY_BETIX and c.amount == 6499.92
+        rows = (await s.execute(select(AuditLog).where(AuditLog.action == "GATEWAY_AUTO"))).scalars().all()
+        assert len(rows) == 1 and rows[0].result == "betix"
+        assert card_buttons(c, ["bank statement", "payment video"]) is None  # nothing left to ask
+    _, _, text = fake_bot.edits[-1]
+    assert "Gateway: <b>Betix</b> — ₹6,499.92 is not a round figure" in text
+    assert "Waiting 30s for the bank statement and payment video" in text and "Betix or Native" not in text
+    assert fake_ai.calls == 1
+
+
+async def test_a_round_figure_keeps_asking(db, fake_bot, fake_ai, no_download, asking, jobs):
+    fake_ai.screenshot = {**fake_ai.screenshot, "amount": {"value": 10000.0, "confidence": 0.97}}
+    sink = []
+    case_id = await send(sink, make_input(1, "photo"), make_input(2, "text", MOBILE))
+    assert await tasks.gateway_job({}, case_id) == "asked"
+    assert jobs == [("gateway_job", (case_id,), 0)]  # nothing started
+    _, _, text = fake_bot.edits[-1]
+    assert "₹10,000 is a round figure — Betix or Native?" in text
+    async with db.session_scope() as s:
+        c = await get_case(s, case_id)
+        assert c.gateway_choice is None and c.amount == 10000.0
+        missing = ["bank statement", "payment video"]
+        assert buttons_of(card_buttons(c, missing)) == [f"gw:betix:{case_id}", f"gw:native:{case_id}"]
+        assert await manager.process_case(s, case_id, force=True) == "gateway_pending"
+    # the tap works as usual, and the screenshot is not read a second time
+    await input_bot.on_gateway_button(Tap(GATEWAY_NATIVE, case_id))
+    assert jobs[-1] == ("process_case_job", (case_id, 1, True), 0) and fake_ai.calls == 1
+
+
+async def test_an_unreadable_amount_still_asks(db, fake_bot, fake_ai, no_download, asking, jobs):
+    fake_ai.screenshot = {}
+    sink = []
+    case_id = await send(sink, make_input(1, "photo"), make_input(2, "text", MOBILE))
+    assert await tasks.gateway_job({}, case_id) == "asked"
+    _, _, text = fake_bot.edits[-1]
+    assert "Reading the paid amount" in text and "until the gateway is known" in text
+    async with db.session_scope() as s:
+        c = await get_case(s, case_id)
+        assert c.gateway_choice is None and c.amount is None
+
+
+async def test_a_tap_before_the_read_finishes_wins(db, fake_bot, fake_ai, no_download, asking, jobs):
+    sink = []
+    case_id = await send(sink, make_input(1, "photo"), make_input(2, "text", MOBILE))
+    await input_bot.on_gateway_button(Tap(GATEWAY_NATIVE, case_id))
+    assert await tasks.gateway_job({}, case_id) == "chosen"  # ₹6,499.92 would say Betix; the operator said Native
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).gateway_choice == GATEWAY_NATIVE
+
+
+async def test_processing_itself_decides_betix_from_the_paise(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, asking
+):
+    """process_case on a case nobody answered: the ₹6,499.92 decide Betix, the run goes on as a Betix case."""
+    case_id = await submit_four_messages(db)
+    order_search(GOOD)
+    async with db.session_scope() as s:
+        assert await manager.process_case(s, case_id, force=True) == "ready"
+        c = await get_case(s, case_id)
+        assert c.gateway_choice == GATEWAY_BETIX and c.native_order_ids is None

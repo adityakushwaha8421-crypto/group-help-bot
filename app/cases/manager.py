@@ -13,7 +13,7 @@ from app.admin.browser import AdminError, LayoutChanged, LoginFailed, ManualAuth
 from app.admin.matcher import Candidate, MatchResult, match_orders
 from app.ai.extractor import Extraction, Field, extract_from_text
 from app.cases.correlation import hard_missing, merge_case_extraction, missing_items
-from app.cases.gateway import gateway_pending, is_native
+from app.cases.gateway import apply_auto_gateway, gateway_pending, is_native
 from app.cases.state_machine import transition
 from app.config import get_settings
 from app.db.models import KIND_WITHDRAWAL, Case, CaseStatus, EvidenceType, OrderCandidate, OrderMatch
@@ -468,6 +468,34 @@ async def process_withdrawal(session: AsyncSession, case: Case, evidence, *, for
     return "escalated"
 
 
+async def read_payment_amount(session: AsyncSession, case: Case) -> float | None:
+    """Read the payment screenshot(s) now - before anything else - so the amount can decide the gateway (paise:
+    Betix; a round figure: the operator is asked). The analysis is kept on the evidence, so the full processing
+    later costs no second AI call. Returns the amount, None when it could not be read."""
+    s = get_settings()
+    evidence = await list_evidence(session, case.case_id)
+    shots = [e for e in evidence if e.type == EvidenceType.payment_screenshot.value]
+    if not shots:
+        return None
+    hint = f"Customer mobile supplied by the operator: {case.mobile}." if case.mobile else ""
+    merged = Extraction.from_dict(case.extraction)
+    for ev in shots:
+        await _download(ev)
+        merged = merged.merge(await analyze_evidence(session, ev, context_hint=hint))
+    case.extraction = merged.as_dict()
+    merge_case_extraction(case, merged)
+    await audit(
+        session,
+        "AMOUNT_READ",
+        case_id=case.case_id,
+        result=f"{case.amount}" if case.amount is not None else "unreadable",
+        confidence=merged.amount.confidence,
+        source="payment_screenshot",
+        details={"for": "gateway choice", "tolerance": s.order_amount_tolerance},
+    )
+    return case.amount
+
+
 async def _relock(session: AsyncSession, case: Case, version0: int) -> Case | None:
     """Take the case's row lock back after an unlocked stretch (file reads, AI calls, the Illunise browser).
 
@@ -499,6 +527,9 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
         return "deferred"
     evidence = await list_evidence(session, case.case_id)
     missing = missing_items(case, evidence)
+    if gateway_pending(case, missing) and case.amount is None:
+        await read_payment_amount(session, case)  # the paid amount may decide the gateway by itself
+    await apply_auto_gateway(session, case)  # paise in the paid amount: a Betix case, nobody is asked
     if gateway_pending(case, missing):
         return "gateway_pending"  # the card asks "Betix or Native?": nothing moves until the operator taps
     if force_send and missing and not hard_missing(missing):
