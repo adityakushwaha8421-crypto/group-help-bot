@@ -5,7 +5,7 @@ from app.cases import manager
 from app.db.repository import get_case
 from app.telegram import progress
 from app.telegram.betix_monitor import handle_group_message
-from tests.conftest import make_group_msg
+from tests.conftest import make_group_msg, make_input
 from tests.test_flow import GOOD, SYS_OK, submit_four_messages
 
 CHAT, MSG = 111, 4242
@@ -87,3 +87,32 @@ def test_card_renders_every_status(env):
         )
         text = progress.progress_card(c)
         assert "ILLUN-1" in text and len(text) > 20  # the order id is the visible case id
+
+
+async def test_every_card_names_the_customer_and_their_user_id(db):
+    """Operator request 2026-11-01: the live card ("SENT TO BETIX" and the rest) shows the customer's user id."""
+    from app.cases.correlation import ForwardOrigin, attach_message
+    from app.telegram.progress import progress_card
+
+    rahul = ForwardOrigin(user_id=90001, username="rahul_fa", first_name="Rahul", last_name="Sharma")
+    priya = ForwardOrigin(user_id=90002, username=None, first_name="Priya", last_name=None)
+    async with db.session_scope() as s:
+        a = (await attach_message(s, make_input(1, "photo", chat_id=111, user_id=111, forward=rahul))).case
+        await attach_message(s, make_input(2, "text", "9876543210", chat_id=111, user_id=111, forward=rahul))
+        for st in ("WAITING_FOR_INPUT", "SEARCHING_ORDER", "ORDER_MATCH_FOUND", "WAITING_FOR_CONFIRMATION",
+                   "VERIFIED", "ESCALATED", "ALREADY_SENT"):  # fmt: skip
+            a.status = st
+            text = progress_card(a)
+            assert "👤 Customer: @rahul_fa" in text and "🆔 User ID: <code>90001</code>" in text, st
+        a.status = "WAITING_FOR_CONFIRMATION"
+        a.betex_pay_order_id = "ILLUN-179351597046463"
+        text = progress_card(a)
+        assert (
+            text.index("Order: <code>ILLUN-179351597046463</code>")
+            < text.index("Customer")
+            < text.index("Waiting for Betix")
+        )
+        b = (await attach_message(s, make_input(3, "photo", chat_id=222, user_id=222, forward=priya))).case
+        b.status = "WAITING_FOR_CONFIRMATION"
+        text = progress_card(b)
+        assert '<a href="tg://user?id=90002">Priya</a>' in text and "🆔 User ID: <code>90002</code>" in text

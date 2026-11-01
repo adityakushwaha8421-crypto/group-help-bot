@@ -18,8 +18,27 @@ log = get_logger("progress")
 S = CaseStatus
 
 
+def customer_rows(case: Case) -> list[str]:
+    """Who the case is for: the customer (clickable) and their Telegram user id, when known."""
+    rows = []
+    name = " ".join(x for x in (case.original_first_name, case.original_last_name) if x).strip()
+    if case.original_username:
+        rows.append(f"\U0001f464 Customer: @{esc(case.original_username.lstrip('@'))}")
+    elif case.original_user_id:
+        link = f'<a href="tg://user?id={case.original_user_id}">{esc(name or "open chat")}</a>'
+        rows.append(f"\U0001f464 Customer: {link}")
+    if case.original_user_id:
+        rows.append(f"\U0001f194 User ID: {code(str(case.original_user_id))}")
+    return rows
+
+
 def progress_card(case: Case) -> str:
-    """The live message in the operator chat, rewritten at every step: heading, short detail lines, next step."""
+    """The live message in the operator chat, rewritten at every step: heading, short detail lines, next step.
+    Every card names the customer and their user id under the order / case line."""
+
+    def card(head: str, rows: list[str], foot: str) -> str:
+        return _card(head, rows + customer_rows(case), foot)
+
     label = code(case_label(case))
     order = code(case.betex_pay_order_id or case.illunise_order_id or "-")
     ident = (
@@ -39,44 +58,44 @@ def progress_card(case: Case) -> str:
         if reason_text.startswith("NEWER STATEMENT NEEDED"):
             return esc(reason_text)  # the withdrawal date, where the statement ends, what to send
         if reason_text.startswith(AI_UNAVAILABLE):  # on hold: the AI service is down, the bot retries by itself
-            return _card("\u23f8 ON HOLD", [ident], esc(reason_text))
-        return _card("\u23f3 WAITING FOR EVIDENCE", [ident], "\U0001f4e9 Send the remaining files and I'll continue.")
+            return card("\u23f8 ON HOLD", [ident], esc(reason_text))
+        return card("\u23f3 WAITING FOR EVIDENCE", [ident], "\U0001f4e9 Send the remaining files and I'll continue.")
     if st == S.ANALYZING_EVIDENCE.value:
-        return _card("\U0001f9e0 READING EVIDENCE", [ident], "\u23f3 Pulling out the payment details...")
+        return card("\U0001f9e0 READING EVIDENCE", [ident], "\u23f3 Pulling out the payment details...")
     if st == S.SEARCHING_ORDER.value and case.kind == "withdrawal":
-        return _card(
+        return card(
             "\U0001f50e CHECKING WITHDRAWAL",
             [f"\U0001f4b8 Withdrawal: {code(case.withdrawal_id or '-')}"],
             "\u23f3 Reading the payout in Illunise and matching the statement's bank account...",
         )
     if st == S.SEARCHING_ORDER.value:
-        return _card("\U0001f50e SEARCHING ILLUNISE", [ident], "\u23f3 Looking for the matching order...")
+        return card("\U0001f50e SEARCHING ILLUNISE", [ident], "\u23f3 Looking for the matching order...")
     if st == S.CHECKING_ORDER_UPI.value:
-        return _card(
+        return card(
             "\U0001f3e6 CHECKING ORDER UPI",
             [ident],
             "\u23f3 A few orders look alike \u2014 checking each one's UPI with Betix.",
         )
     if st in (S.ORDER_MATCH_FOUND.value, S.READY_FOR_BETIX.value):
         if case.kind == "withdrawal":
-            return _card(
+            return card(
                 "\U0001f4b8 WITHDRAWAL READY",
                 [f"\U0001f9fe Withdrawal: {order}"],
                 "\U0001f4e4 Sending it to the Betix group...",
             )
         if is_native(case):
-            return _card(
+            return card(
                 "\U0001f3af ORDERS FOUND" if len(native_ids(case)) > 1 else "\U0001f3af ORDER MATCHED",
                 [native_orders_line(case), "\U0001f500 Gateway: Native"],
                 "\U0001f4e4 Sending the screenshot to the Native group...",
             )
-        return _card(
+        return card(
             "\U0001f3af ORDER MATCHED",
             [f"\U0001f9fe Order: {order}"],
             "\U0001f4e4 Sending the evidence to the Betix group...",
         )
     if st == S.ORDER_MATCH_AMBIGUOUS.value:
-        return _card(
+        return card(
             "\u26a0\ufe0f MULTIPLE ORDERS MATCH",
             [ident],
             "\U0001f440 Please pick the right one \u2014 the candidates are in the manual-review message.",
@@ -88,7 +107,7 @@ def progress_card(case: Case) -> str:
         S.FOLLOWUP_2_SENT.value,
     ):
         if is_native(case):
-            return _card(
+            return card(
                 "\U0001f4e4 SENT TO NATIVE GROUP",
                 [native_orders_line(case), "\U0001f500 Gateway: Native"],
                 "\U0001f440 Waiting for the Native group to confirm...",
@@ -97,12 +116,12 @@ def progress_card(case: Case) -> str:
         rows = [f"\U0001f9fe Order: {order}"]
         if sent:
             rows.append(f"\U0001f504 Follow-ups sent: {sent}")
-        return _card("\U0001f4e4 SENT TO BETIX", rows, "\U0001f440 Waiting for Betix to confirm...")
+        return card("\U0001f4e4 SENT TO BETIX", rows, "\U0001f440 Waiting for Betix to confirm...")
     if st == S.VERIFIED.value and case.confirmation_type == "reversed":
         rows = [ident]
         if case.confirmed_by:
             rows.append(f"\U0001f464 Reported by: {esc(case.confirmed_by)}")
-        return _card(
+        return card(
             "\U0001f504 WITHDRAWAL REVERSED",
             rows,
             "\u2705 Solved \u2014 Betix reversed this withdrawal.\n\U0001f4b8 Please pay the customer manually.",
@@ -111,25 +130,25 @@ def progress_card(case: Case) -> str:
         rows = [native_orders_line(case) if is_native(case) else f"\U0001f9fe Order: {order}"]
         if case.confirmed_by:
             rows.append(f"\u2705 Confirmed by: {esc(case.confirmed_by)}")
-        return _card("\u2705 PAYMENT CONFIRMED", rows, "\U0001f64f Payment successfully confirmed.")
+        return card("\u2705 PAYMENT CONFIRMED", rows, "\U0001f64f Payment successfully confirmed.")
     if st == S.ALREADY_SUCCESS.value:
-        return _card(
+        return card(
             "\u267b\ufe0f ALREADY SUCCESSFUL",
             [f"\U0001f9fe Order: {order}"],
             "\u2139\ufe0f Illunise already shows this order as paid \u2014 nothing sent to Betix.",
         )
     if st == S.ALREADY_SENT.value:
-        return _card(
+        return card(
             "\U0001f501 ALREADY WITH BETIX",
             [f"\U0001f9fe Order: {order}"],
             "\u2139\ufe0f Sent earlier from another case \u2014 not sent again.\n"
             "\U0001f4e4 Need it sent anyway? Tap the button or use /push.",
         )
     if st == S.ESCALATED.value and (case.failure_reason or "").startswith("ACCOUNT DOES NOT MATCH"):
-        return _card("\u274c ACCOUNT DOES NOT MATCH", [ident], f"\u2757 {i(reason)}\n\U0001f6ab Not sent to Betix.")
+        return card("\u274c ACCOUNT DOES NOT MATCH", [ident], f"\u2757 {i(reason)}\n\U0001f6ab Not sent to Betix.")
     if st == S.ESCALATED.value:
-        return _card("\U0001f6a8 MANUAL REVIEW NEEDED", [ident], f"\u2757 {i(reason)}" if reason else "")
-    return _card("\u26d4 CASE CLOSED", [ident], f"\u2757 {i(reason)}" if reason else "")
+        return card("\U0001f6a8 MANUAL REVIEW NEEDED", [ident], f"\u2757 {i(reason)}" if reason else "")
+    return card("\u26d4 CASE CLOSED", [ident], f"\u2757 {i(reason)}" if reason else "")
 
 
 def native_ids(case: Case) -> list[str]:
