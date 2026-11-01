@@ -133,6 +133,7 @@ def score_candidate(
     amount_tolerance: float = 1.0,
     time_rule: dict[str, int] | None = None,
     gateway_name: str | None = None,
+    other_gateways: tuple[str, ...] = (),
     compatible_statuses: set[str] | None = None,
     expired_statuses: set[str] | None = None,
     success_statuses: set[str] | None = None,
@@ -182,12 +183,19 @@ def score_candidate(
     }
     parts.append(("time", s))
 
-    # Gateway: the order must belong to Betix.
+    # Gateway: the order must belong to Betix. `other_gateways` are the names that CONTAIN the Betix name but are
+    # another gateway (live 2026-11-01: a Native order is listed as "BETIXPAYNATIVE"): they never count as Betix.
+    how_gw = None
     if gateway_name and cand.gateway:
-        s = 1.0 if gateway_name.lower().replace(" ", "") in cand.gateway.lower().replace(" ", "") else 0.0
+        gw = cand.gateway.lower().replace(" ", "")
+        other = next((o for o in other_gateways if o and o.lower().replace(" ", "") in gw), None)
+        if other:
+            s, how_gw = 0.0, f"another gateway ({cand.gateway})"
+        else:
+            s = 1.0 if gateway_name.lower().replace(" ", "") in gw else 0.0
     else:
         s = None
-    signals["gateway"] = {"expected": gateway_name, "candidate": cand.gateway, "score": s}
+    signals["gateway"] = {"expected": gateway_name, "candidate": cand.gateway, "score": s, "how": how_gw}
     parts.append(("gateway", s))
 
     u_ev, u_c, u_ref = normalize_utr(ev.utr.value), normalize_utr(cand.utr), normalize_utr(cand.gateway_ref)
@@ -342,6 +350,7 @@ def match_orders(
     amount_tolerance: float = 1.0,
     time_rule: dict[str, int] | None = None,
     gateway_name: str | None = None,
+    other_gateways: tuple[str, ...] = (),
     compatible_statuses: set[str] | None = None,
     expired_statuses: set[str] | None = None,
     success_statuses: set[str] | None = None,
@@ -360,6 +369,7 @@ def match_orders(
                 amount_tolerance=amount_tolerance,
                 time_rule=time_rule,
                 gateway_name=gateway_name,
+                other_gateways=other_gateways,
                 compatible_statuses=compatible_statuses,
                 expired_statuses=expired_statuses,
                 success_statuses=success_statuses,

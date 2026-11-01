@@ -230,6 +230,7 @@ async def run(sess: SearchSession) -> str:
         amount_tolerance=s.order_amount_tolerance,
         time_rule=s.time_rule,
         gateway_name=s.betix_gateway_name,
+        other_gateways=s.other_gateways,
         compatible_statuses=s.compatible_statuses,
         expired_statuses=s.expired_statuses,
         success_statuses=s.success_statuses,

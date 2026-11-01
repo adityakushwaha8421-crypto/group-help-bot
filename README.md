@@ -299,8 +299,9 @@ pay through?** with two buttons, `Betix` and `Native`. Nothing is processed unti
   (with `/pi` on any doubt), the screenshot goes to the Betix group, reminders follow.
 - **Native**: only the screenshot and the mobile are needed - no statement, video or password, no wait. The
   order amount is a round figure, so the paid amount is rounded to the rupee and every order created under the
-  mobile just before the payment for that amount counts (a Betix order never does; set `NATIVE_GATEWAY_NAME` to
-  keep one gateway only). The screenshot goes to `NATIVE_GROUP_CHAT_ID` captioned with the order id(s), one per
+  mobile just before the payment for that amount counts - the orders of the Native gateway, which Illunise lists
+  as `BETIXPAYNATIVE` (`NATIVE_GATEWAY_NAME`); a Betix case never takes one of those, a Native case takes no
+  other. The screenshot goes to `NATIVE_GROUP_CHAT_ID` captioned with the order id(s), one per
   line, closest to the payment first - one post, however many orders. No `/pi`, no amount note, no reminders.
   A member's "done" / "success" as a reply to that post confirms the case like a Betix member's would. No order
   at the payment time: manual review, nothing posted.

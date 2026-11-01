@@ -177,7 +177,15 @@ class Settings(BaseSettings):
     # every case is a Betix case (the behaviour before the choice existed).
     ask_gateway: bool = True
     native_group_chat_id: str = ""  # the Native group; "1003515687583" and "-1003515687583" both work
-    native_gateway_name: str = ""  # empty: a Native order is any order that is not a Betix one
+    # The Native gateway as the Illunise orders list names it (live 2026-11-01: "BETIXPAYNATIVE"). A Native case
+    # takes only these orders; a Betix case never does. Empty: a Native order is any order that is not a Betix one.
+    native_gateway_name: str = "BetixPayNative"
+
+    @property
+    def other_gateways(self) -> tuple[str, ...]:
+        """Gateway names that contain the Betix name but are NOT Betix (for the matcher)."""
+        return (self.native_gateway_name,) if self.native_gateway_name else ()
+
     # Bank statement / payment video in the Betix group. They are only ever sent as REPLIES to the screenshot post:
     #   always     = statement (+ its password) and video go right after the screenshot, as replies  [default]
     #   on_request = kept internal; sent only once Betix asks for more evidence

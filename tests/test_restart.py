@@ -142,3 +142,21 @@ async def test_the_sqlite_dev_database_is_never_migrated_with_alembic(env, monke
 
     monkeypatch.setattr(restart, "_run", never)
     assert await restart.migrate_database() == "schema created at start (sqlite)"
+
+
+async def test_the_migration_runs_against_the_bots_own_database(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@dbhost:5433/live")
+    from app.config import reset_settings_cache
+
+    reset_settings_cache()
+    seen = {}
+
+    async def fake_run(*cmd, timeout, env=None):
+        seen["cmd"], seen["env"] = cmd, env
+        return 0, "INFO  [alembic.runtime.migration] Running upgrade"
+
+    monkeypatch.setattr(restart, "_run", fake_run)
+    assert await restart.migrate_database() == "database migrated"
+    assert seen["cmd"][1:] == ("-m", "alembic", "upgrade", "head")
+    assert seen["env"]["DATABASE_URL"] == "postgresql+asyncpg://u:p@dbhost:5433/live"
+    reset_settings_cache()

@@ -91,9 +91,9 @@ async def pull_latest() -> tuple[bool, str]:
     return True, line
 
 
-async def _run(*cmd: str, timeout: float) -> tuple[int, str]:
+async def _run(*cmd: str, timeout: float, env: dict[str, str] | None = None) -> tuple[int, str]:
     proc = await asyncio.create_subprocess_exec(
-        *cmd, cwd=ROOT, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+        *cmd, cwd=ROOT, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, env=env
     )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout)
@@ -117,9 +117,13 @@ async def migrate_database() -> str:
     new code, which expects the new columns, starts. A SQLite dev database is created by the app itself."""
     from app.config import get_settings
 
-    if get_settings().is_sqlite:
+    s = get_settings()
+    if s.is_sqlite:
         return "schema created at start (sqlite)"
-    code, out = await _run(sys.executable, "-m", "alembic", "upgrade", "head", timeout=300)
+    # alembic reads DATABASE_URL from the environment (else alembic.ini's default): the bot's own database, from
+    # its .env, is handed over explicitly - the .env is not exported to the environment.
+    env = {**os.environ, "DATABASE_URL": s.database_url}
+    code, out = await _run(sys.executable, "-m", "alembic", "upgrade", "head", timeout=300, env=env)
     if code == 0:
         return "database migrated"
     last = out.splitlines()[-1][:120] if out else "unknown error"

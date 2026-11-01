@@ -242,10 +242,11 @@ def order_search(env):
 
     holder = {"cands": []}
 
-    async def _search(query, amount=None, when=None):
+    async def _search(query, amount=None, when=None, **kw):
         holder["query"] = query
         holder["amount"] = amount
         holder["when"] = when
+        holder["kw"] = kw
         return make_candidates(holder["cands"])
 
     def set_(cands):

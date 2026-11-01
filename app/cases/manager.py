@@ -637,6 +637,8 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
     # that day is "before" the payment (the matcher is told so through the time rule).
     date_only = Extraction.from_dict(case.extraction).payment_time.precision == "date"
     search_kw = {"window_minutes": 24 * 60} if date_only else {}
+    if is_native(case):
+        search_kw["read_all"] = True  # several orders may share the payment: every View page is read
     time_rule = {**s.time_rule, "date_only": True, "tz": s.timezone} if date_only else s.time_rule
     try:
         candidates = await _get_order_search()(case.mobile, case.amount, case.payment_time, **search_kw)
@@ -675,6 +677,7 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
             amount_tolerance=s.order_amount_tolerance,
             time_rule=time_rule,
             gateway_name=s.betix_gateway_name,
+            other_gateways=s.other_gateways,
             compatible_statuses=s.compatible_statuses,
             expired_statuses=s.expired_statuses,
             success_statuses=s.success_statuses,
@@ -934,7 +937,9 @@ def native_fit(sc, paid: float, tolerance: float, native_gateway: str) -> bool:
         return False
     gw = (c.gateway or "").lower().replace(" ", "")
     if native_gateway:
-        return native_gateway.lower().replace(" ", "") in gw
+        # the Native gateway's orders (live: "BETIXPAYNATIVE"); an order whose gateway the panel did not show
+        # is not thrown out for that alone
+        return not gw or native_gateway.lower().replace(" ", "") in gw
     return (sig.get("gateway") or {}).get("score") != 1.0  # a Betix order is never a Native one
 
 
@@ -953,6 +958,7 @@ async def select_native_orders(session: AsyncSession, case: Case, merged, candid
         amount_tolerance=s.order_amount_tolerance,
         time_rule=time_rule,
         gateway_name=s.betix_gateway_name,
+        other_gateways=s.other_gateways,
         compatible_statuses=s.compatible_statuses,
         expired_statuses=s.expired_statuses,
         success_statuses=s.success_statuses,

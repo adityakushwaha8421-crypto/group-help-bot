@@ -304,9 +304,11 @@ async def enrich_candidates(
     max_pages: int | None = None,
     query: str = "",
     window_minutes: int | None = None,
+    read_all: bool = False,
 ) -> list[Candidate]:
     """Read the View page of the most promising candidates: amount matches (within the padded-amount tolerance)
-    first, closest to the payment time next, newest otherwise."""
+    first, closest to the payment time next, newest otherwise. `read_all`: no stopping at the first clear match
+    (a Native payment may belong to SEVERAL orders created at the same time; every one must be read)."""
     s = get_settings()
     sel = browser.selectors["orders"]
     view_map = browser.selectors.get("view_fields", {})
@@ -326,7 +328,7 @@ async def enrich_candidates(
         except Exception as exc:  # noqa: BLE001
             log.warning("view page read failed", order_id=oid, error=str(exc)[:120])
             continue
-        if is_clear_match(
+        if not read_all and is_clear_match(
             c, query, evidence_time, evidence_amount, tol, window_minutes or s.order_search_window_minutes
         ):
             log.info("clear match; no further orders read", order_id=oid, read=n, of=len(ordered))
@@ -358,6 +360,7 @@ async def search_orders(
     evidence_time=None,
     enrich: bool = True,
     window_minutes: int | None = None,
+    read_all: bool = False,
 ) -> list[Candidate]:
     """Search the orders page and return ALL candidates (all pages up to max_pages), enriched from their View pages.
     `window_minutes`: how far before the payment an order may be created (default ORDER_SEARCH_WINDOW_MINUTES;
@@ -429,12 +432,18 @@ async def search_orders(
             evidence_time=evidence_time,
             query=query,
             window_minutes=window,
+            read_all=read_all,
         )
     return candidates
 
 
 async def find_candidates(
-    query: str, evidence_amount: float | None = None, evidence_time=None, *, window_minutes: int | None = None
+    query: str,
+    evidence_amount: float | None = None,
+    evidence_time=None,
+    *,
+    window_minutes: int | None = None,
+    read_all: bool = False,
 ) -> list[Candidate]:
     """Search with a tab borrowed from the shared browser pool (see app.admin.pool): no browser launch, no fresh
     login per search, and a cap on how many searches run at the same time."""
@@ -443,7 +452,12 @@ async def find_candidates(
     async with get_pool().page() as browser:
         await ensure_logged_in(browser)
         return await search_orders(
-            browser, query, evidence_amount=evidence_amount, evidence_time=evidence_time, window_minutes=window_minutes
+            browser,
+            query,
+            evidence_amount=evidence_amount,
+            evidence_time=evidence_time,
+            window_minutes=window_minutes,
+            read_all=read_all,
         )
 
 

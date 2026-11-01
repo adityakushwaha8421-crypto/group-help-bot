@@ -23,10 +23,10 @@ from tests.test_flow import GOOD, MOBILE, submit_four_messages
 NATIVE_CHAT = -1004444
 A, B, C = "ILLUN-178621243657290", "ILLUN-178621243657291", "ILLUN-178621243657292"
 # paid ₹6,499.92 at 19:32 (the fake AI's screenshot). Native orders are ROUND figures: ₹6,500.
-NATIVE_ONE = [{**GOOD[0], "amount": 6500.0, "gateway": "Native", "order_time": "2026-09-10 19:30:00"}]
+NATIVE_ONE = [{**GOOD[0], "amount": 6500.0, "gateway": "BETIXPAYNATIVE", "order_time": "2026-09-10 19:30:00"}]
 NATIVE_TWO = [
-    {**GOOD[0], "amount": 6500.0, "gateway": "Native", "order_time": "2026-09-10 19:28:00"},
-    {**GOOD[0], "illunise_order_id": "1003", "betex_order_id": B, "amount": 6500.0, "gateway": "Native",
+    {**GOOD[0], "amount": 6500.0, "gateway": "BETIXPAYNATIVE", "order_time": "2026-09-10 19:28:00"},
+    {**GOOD[0], "illunise_order_id": "1003", "betex_order_id": B, "amount": 6500.0, "gateway": "BETIXPAYNATIVE",
      "order_time": "2026-09-10 19:31:00"},
 ]  # fmt: skip
 
@@ -235,20 +235,20 @@ async def test_the_live_card_keeps_the_buttons_while_the_question_is_open(db, fa
 
 
 # ---------------------------------------------------------------- the Native flow
-async def native_case(db) -> str:
-    """Screenshot + mobile in, the operator tapped Native."""
+async def native_case(db, base: int = 0) -> str:
+    """Screenshot + mobile in, the operator tapped Native. `base`: message ids, so a second submission is new."""
     from app.cases.correlation import attach_message
 
     async with db.session_scope() as s:
-        r = await attach_message(s, make_input(1, "photo"))
-        await attach_message(s, make_input(2, "text", MOBILE))
+        r = await attach_message(s, make_input(base + 1, "photo"))
+        await attach_message(s, make_input(base + 2, "text", MOBILE))
         r.case.gateway_choice = GATEWAY_NATIVE
         r.case.progress_chat_id, r.case.progress_message_id = 111, 4242
         return r.case.case_id
 
 
-async def run_native(db, order_search, cands):
-    case_id = await native_case(db)
+async def run_native(db, order_search, cands, base: int = 0):
+    case_id = await native_case(db, base)
     order_search(cands)
     async with db.session_scope() as s:
         outcome = await manager.process_case(s, case_id, force=True)
@@ -307,6 +307,67 @@ async def test_the_native_amount_is_the_rounded_figure_and_betix_orders_never_co
         assert (await get_case(s, case_id)).native_order_ids == [A]
 
 
+async def test_a_plain_betix_gateway_order_is_not_a_native_one_and_the_other_way_round(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    """Live 2026-11-01: Illunise lists a Native order's gateway as BETIXPAYNATIVE - which CONTAINS "BetixPay"."""
+    from app.admin.matcher import match_orders
+    from app.ai.extractor import Extraction
+    from tests.conftest import make_candidates
+
+    cands = make_candidates([{**NATIVE_ONE[0]}, {**NATIVE_ONE[0], "betex_order_id": B, "gateway": "BetixPay"}])
+    ex = Extraction.from_dict(
+        {
+            "amount": {"value": 6500.0, "confidence": 0.9},
+            "payment_time": {"value": "2026-09-10 19:32:12", "confidence": 0.9},
+        }
+    )
+    r = match_orders(ex, MOBILE, cands, weights=get_settings().match_weights, threshold=0.9, ambiguity_gap=0.05,
+                     time_rule=get_settings().time_rule, gateway_name="BetixPay", other_gateways=("BetixPayNative",))  # fmt: skip
+    by_id = {sc.candidate.betex_order_id: sc for sc in r.scored}
+    assert by_id[A].signals["gateway"]["score"] == 0.0 and "another gateway" in by_id[A].signals["gateway"]["how"]
+    assert by_id[B].signals["gateway"]["score"] == 1.0
+    assert by_id[A].score <= 0.5  # a Betix case can never select the Native order
+    # and the Native flow takes the BETIXPAYNATIVE order only
+    case_id, outcome = await run_native(
+        db,
+        order_search,
+        [NATIVE_ONE[0], {**NATIVE_ONE[0], "betex_order_id": B, "illunise_order_id": "1009", "gateway": "BetixPay"}],
+    )
+    assert outcome == "ready"
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == [A]
+
+
+async def test_live_case_an_order_created_the_same_minute_as_the_payment_is_taken(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    """The alert of 2026-11-01 11:34: ₹10,000 paid at 11:34, order ILLUN-179351304657290 of ₹10,000 created at
+    11:34 (Success, gateway BETIXPAYNATIVE) - it was rejected as a "Betix" order. It is THE order."""
+    fake_ai.screenshot = {
+        **fake_ai.screenshot,
+        "amount": {"value": 10000.0, "confidence": 0.97},
+        "payment_time": {"value": "2026-11-01 11:34:20", "confidence": 0.95},
+        "utr": {"value": "219439804510", "confidence": 0.96},
+    }
+    live = [{"illunise_order_id": "ILLUN-179351304657290", "betex_order_id": "ILLUN-179351304657290",
+             "registration_number": MOBILE, "amount": 10000.0, "order_time": "2026-11-01 11:34:00",
+             "status": "Success", "gateway": "BETIXPAYNATIVE", "utr": "219439804510"}]  # fmt: skip
+    case_id, outcome = await run_native(db, order_search, live)
+    # Illunise already shows it Success WITH this payment's UTR: credited, nothing to send - said so, no alert
+    assert outcome == "already_success"
+    assert not any("MANUAL REVIEW" in t for _, t in fake_bot.sent)
+    # the same order NOT yet carrying this UTR: it goes to the Native group
+    fake_ai.screenshot["utr"] = {"value": "111111111111", "confidence": 0.96}
+    case_id, outcome = await run_native(db, order_search, [{**live[0], "status": "Pending", "utr": None}], base=20)
+    assert outcome == "ready"
+    async with db.session_scope() as s:
+        c = await get_case(s, case_id)
+        assert c.native_order_ids == ["ILLUN-179351304657290"]
+        assert await manager.post_case_to_betix(s, case_id, fake_poster) == "posted"
+    assert fake_poster.media[-1] == ("payment_screenshot", "ILLUN-179351304657290")
+
+
 async def test_a_round_payment_matches_the_round_order(db, fake_bot, fake_ai, order_search, no_download, fake_poster):
     fake_ai.screenshot = {**fake_ai.screenshot, "amount": {"value": 6500.0, "confidence": 0.97}}
     case_id, outcome = await run_native(db, order_search, NATIVE_ONE)
@@ -333,6 +394,7 @@ async def test_a_native_order_is_never_asked_with_pi_nor_searched_by_amount(
     holder = order_search([{**NATIVE_ONE[0], "amount": 6000.0}])
     await run_native(db, order_search, [{**NATIVE_ONE[0], "amount": 6000.0}])
     assert holder["query"] == MOBILE  # the mobile only: no UTR / padded-amount fallback search
+    assert holder["kw"] == {"read_all": True}  # every order's View page is read: no "clear match, stop" shortcut
     assert not any(t.startswith("/pi") for t, _ in fake_poster.texts)
 
 
@@ -401,3 +463,32 @@ async def test_add_on_a_native_case_needs_nothing(db, fake_bot, fake_ai, order_s
     input_bot._add_timers.clear()
     add_evidence._sessions.clear()
     assert "already with the Native group" in sink[-1] and "already has everything" in sink[-1]
+
+
+async def test_a_bare_done_in_the_native_group_never_confirms_a_betix_case(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, monkeypatch
+):
+    """Proximity ("one case posted recently, an authoritative sender") stays inside the group the case lives in."""
+    monkeypatch.setenv("CONFIRMATION_MODE", "either")
+    reset_settings_cache()
+
+    async def everyone(chat_id, user_id):
+        return True
+
+    set_membership_checker(everyone)
+    try:
+        case_id = await submit_four_messages(db)
+        order_search(GOOD)
+        async with db.session_scope() as s:
+            assert await manager.process_case(s, case_id, force=True) == "ready"
+            assert await manager.post_case_to_betix(s, case_id, fake_poster) == "posted"  # the Betix group
+            r = await handle_group_message(
+                s, make_group_msg(701, "done", sender_username="wendy", sender_id=5001, chat_id=NATIVE_CHAT)
+            )
+            assert r["action"] == "unlinked"
+            assert (await get_case(s, case_id)).status == CaseStatus.WAITING_FOR_CONFIRMATION.value
+            r = await handle_group_message(s, make_group_msg(702, "done", sender_username="wendy", sender_id=5001))
+            # the same words in the Betix group DO reach the case (by proximity: weak, so the operator is told)
+            assert r["case_id"] == case_id and r["correlation"] == "proximity"
+    finally:
+        set_membership_checker(None)

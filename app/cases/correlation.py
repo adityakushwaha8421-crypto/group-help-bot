@@ -593,8 +593,9 @@ async def correlate_betix_message(
         cases = await find_case_by_order_ids(session, utr=u)
         if cases:
             return Correlation(cases[0].case_id, 0.9, "utr", {"utr": u})
-    # 3. registration number mentioned in text
-    monitoring = await list_monitoring_cases(session)
+    # 3. registration number mentioned in text. Only cases that live in THIS group (a Native group message can
+    # never be about a case posted to the Betix group, and the other way round; a case with no chat id yet counts).
+    monitoring = [c for c in await list_monitoring_cases(session) if c.betix_chat_id in (None, chat_id)]
     for c in monitoring:
         if c.registration_number and c.registration_number.lower() in (text or "").lower():
             return Correlation(c.case_id, 0.85, "registration", {"registration": c.registration_number})
