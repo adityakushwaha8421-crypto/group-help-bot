@@ -18,6 +18,14 @@ log = get_logger("progress")
 S = CaseStatus
 
 
+SENT_STATUSES = {
+    S.POSTED_TO_BETIX.value,
+    S.WAITING_FOR_CONFIRMATION.value,
+    S.FOLLOWUP_1_SENT.value,
+    S.FOLLOWUP_2_SENT.value,
+}
+
+
 def customer_rows(case: Case) -> list[str]:
     """Who the case is for: the customer (clickable) and their Telegram user id, when known."""
     rows = []
@@ -34,10 +42,11 @@ def customer_rows(case: Case) -> list[str]:
 
 def progress_card(case: Case) -> str:
     """The live message in the operator chat, rewritten at every step: heading, short detail lines, next step.
-    Every card names the customer and their user id under the order / case line."""
+    Once the evidence was SENT (the "📤 SENT TO ..." card, while waiting for the answer) the card also names the
+    customer and their user id; the earlier and later cards do not."""
 
     def card(head: str, rows: list[str], foot: str) -> str:
-        return _card(head, rows + customer_rows(case), foot)
+        return _card(head, rows + (customer_rows(case) if case.status in SENT_STATUSES else []), foot)
 
     label = code(case_label(case))
     order = code(case.betex_pay_order_id or case.illunise_order_id or "-")

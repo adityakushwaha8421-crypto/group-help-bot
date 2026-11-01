@@ -89,8 +89,9 @@ def test_card_renders_every_status(env):
         assert "ILLUN-1" in text and len(text) > 20  # the order id is the visible case id
 
 
-async def test_every_card_names_the_customer_and_their_user_id(db):
-    """Operator request 2026-11-01: the live card ("SENT TO BETIX" and the rest) shows the customer's user id."""
+async def test_the_sent_card_names_the_customer_and_their_user_id_the_others_do_not(db):
+    """Operator request 2026-11-01: the user id on the card once the evidence was successfully sent - the
+    "SENT TO BETIX" / "SENT TO NATIVE GROUP" card - and nowhere else."""
     from app.cases.correlation import ForwardOrigin, attach_message
     from app.telegram.progress import progress_card
 
@@ -99,19 +100,20 @@ async def test_every_card_names_the_customer_and_their_user_id(db):
     async with db.session_scope() as s:
         a = (await attach_message(s, make_input(1, "photo", chat_id=111, user_id=111, forward=rahul))).case
         await attach_message(s, make_input(2, "text", "9876543210", chat_id=111, user_id=111, forward=rahul))
-        for st in ("WAITING_FOR_INPUT", "SEARCHING_ORDER", "ORDER_MATCH_FOUND", "WAITING_FOR_CONFIRMATION",
-                   "VERIFIED", "ESCALATED", "ALREADY_SENT"):  # fmt: skip
+        a.betex_pay_order_id = "ILLUN-179351597046463"
+        for st in ("POSTED_TO_BETIX", "WAITING_FOR_CONFIRMATION", "FOLLOWUP_1_SENT", "FOLLOWUP_2_SENT"):
             a.status = st
             text = progress_card(a)
             assert "👤 Customer: @rahul_fa" in text and "🆔 User ID: <code>90001</code>" in text, st
-        a.status = "WAITING_FOR_CONFIRMATION"
-        a.betex_pay_order_id = "ILLUN-179351597046463"
-        text = progress_card(a)
-        assert (
-            text.index("Order: <code>ILLUN-179351597046463</code>")
-            < text.index("Customer")
-            < text.index("Waiting for Betix")
-        )
+            assert (
+                text.index("Order: <code>ILLUN-179351597046463</code>") < text.index("Customer") < text.index("Waiting")
+            )
+        for st in ("WAITING_FOR_INPUT", "SEARCHING_ORDER", "ORDER_MATCH_FOUND", "READY_FOR_BETIX", "VERIFIED",
+                   "ESCALATED", "ALREADY_SENT", "ALREADY_SUCCESS", "FAILED"):  # fmt: skip
+            a.status = st
+            assert "User ID" not in progress_card(a) and "Customer" not in progress_card(a), st
+        a.status, a.gateway_choice = "WAITING_FOR_CONFIRMATION", "native"
+        assert "SENT TO NATIVE GROUP" in progress_card(a) and "🆔 User ID: <code>90001</code>" in progress_card(a)
         b = (await attach_message(s, make_input(3, "photo", chat_id=222, user_id=222, forward=priya))).case
         b.status = "WAITING_FOR_CONFIRMATION"
         text = progress_card(b)
