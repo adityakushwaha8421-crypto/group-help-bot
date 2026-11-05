@@ -289,25 +289,26 @@ python -m pytest -q
   case status before every send.
 * **Secrets** only from the environment; the structured logger redacts token/password/session-like values.
 
-## Betix or Native (the gateway question)
+## Betix or Native (read from Illunise, never asked)
 
-As soon as the payment screenshot and the mobile are on a case, the bot reads the paid amount. **Paise**
-(₹100.20, ₹6,499.92: Betix pads every order with unique paise) make it a **Betix case by itself** - nobody is
-asked. A **round figure** (₹10,000) could be either, so the card asks **Which gateway did the customer pay
-through?** with two buttons, `Betix` and `Native` (shown from the first card on, so a quick tap never waits
-for the read). Nothing is processed until the gateway is known (`ASK_GATEWAY=false` switches all of this off:
-every case is a Betix case, as before).
+Nobody chooses the gateway. When a case is processed the bot looks at the orders created under the customer's
+mobile just before the payment; **the order's gateway in the panel decides the group**:
 
-- **Betix**: the flow above - the statement and video are waited for `FORCE_SEND_SECONDS`, the order is matched
-  (with `/pi` on any doubt), the screenshot goes to the Betix group, reminders follow.
-- **Native**: only the screenshot and the mobile are needed - no statement, video or password, no wait. The
-  order amount is a round figure, so the paid amount is rounded to the rupee and every order created under the
-  mobile just before the payment for that amount counts - the orders of the Native gateway, which Illunise lists
-  as `BETIXPAYNATIVE` (`NATIVE_GATEWAY_NAME`); a Betix case never takes one of those, a Native case takes no
-  other. The screenshot goes to `NATIVE_GROUP_CHAT_ID` captioned with the order id(s), one per
-  line, closest to the payment first - one post, however many orders. No `/pi`, no amount note, no reminders.
-  A member's "done" / "success" as a reply to that post confirms the case like a Betix member's would. No order
-  at the payment time: manual review, nothing posted.
+- **`BetixPay`** -> a Betix case: the flow above - the order is matched (with `/pi` on any doubt), the
+  screenshot goes to the Betix group, reminders follow.
+- **`BETIXPAYNATIVE`** (`NATIVE_GATEWAY_NAME`) -> a Native case: the screenshot goes to `NATIVE_GROUP_CHAT_ID`
+  captioned with the order id(s), one per line, closest to the payment first - every Native order of the
+  rounded paid amount created at the payment time, one post however many. Nothing else is needed (no statement,
+  video or password), and there is no `/pi`, no amount note and no reminder. A member's "done" / "success" as a
+  reply to that post confirms the case like a Betix member's would.
+
+Both gateways have an order at the payment time: a round-figure payment (how a Native order is paid) is Native,
+a payment with paise (Betix pads every order with unique paise) is Betix when a Betix order answers for it.
+No order fits: manual review, nothing posted.
+
+Timing: with only the screenshot and the mobile in, the bot waits `FORCE_SEND_SECONDS` for the statement and
+video as always - but it reads the paid amount right away, and a round figure (a Native payment needs nothing
+more) is processed at once. Without `NATIVE_GROUP_CHAT_ID` every case is a Betix case.
 
 ## Withdrawals
 

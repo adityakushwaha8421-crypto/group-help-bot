@@ -169,16 +169,14 @@ class Settings(BaseSettings):
     betix_amount_note: bool = True
     betix_followup_text: str = "Any update?"  # both follow-ups, sent as replies to the screenshot post
 
-    # GATEWAY CHOICE. Once the payment screenshot and the mobile are in, the operator is asked which gateway the
-    # customer paid through - Betix or Native - and nothing is processed until they tap one. Betix: the flow
-    # above (statement + video waited for, the Betix group, /pi, follow-ups). Native: nothing else is needed,
-    # the order amount is a round figure, and the screenshot goes to NATIVE_GROUP_CHAT_ID captioned with EVERY
-    # order id created under the mobile at the payment time (one or several). ASK_GATEWAY=false: never asked,
-    # every case is a Betix case (the behaviour before the choice existed).
-    ask_gateway: bool = True
+    # BETIX OR NATIVE: never asked, read from Illunise. The orders created under the mobile just before the
+    # payment carry the gateway: a "BetixPay" order -> the Betix flow above (statement + video waited for, the
+    # Betix group, /pi, follow-ups); a Native order (NATIVE_GATEWAY_NAME) -> the screenshot goes to
+    # NATIVE_GROUP_CHAT_ID captioned with EVERY such order id (one or several). No NATIVE_GROUP_CHAT_ID: every
+    # case is a Betix case.
     native_group_chat_id: str = ""  # the Native group; "1003515687583" and "-1003515687583" both work
-    # The Native gateway as the Illunise orders list names it (live 2026-11-01: "BETIXPAYNATIVE"). A Native case
-    # takes only these orders; a Betix case never does. Empty: a Native order is any order that is not a Betix one.
+    # The Native gateway as the Illunise orders list names it (live 2026-11-01: "BETIXPAYNATIVE"). An order of this
+    # gateway makes the case a Native case; a Betix case never takes one.
     native_gateway_name: str = "BetixPayNative"
 
     @property

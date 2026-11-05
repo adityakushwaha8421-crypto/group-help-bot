@@ -7,7 +7,6 @@ from arq import cron
 from arq.connections import RedisSettings
 
 from app.cases import manager
-from app.cases.gateway import gateway_pending
 from app.config import get_settings
 from app.db.models import CaseStatus
 from app.db.repository import get_case, list_evidence, list_open_cases
@@ -50,35 +49,39 @@ async def process_case_job(ctx, case_id: str, version: int = 0, force: bool = Fa
     return outcome
 
 
-async def gateway_job(ctx, case_id: str) -> str:
-    """The screenshot and the mobile are in and the gateway question is open: read the paid amount. Paise -> a
-    Betix case, decided here, processing starts (the FORCE SEND wait or the full run); a round figure or no
-    amount -> the card keeps asking Betix or Native. Returns: chosen | decided | asked | gone"""
-    from app.cases.correlation import missing_items
-    from app.cases.gateway import apply_auto_gateway
+async def amount_job(ctx, case_id: str, version: int = 0) -> str:
+    """The screenshot and the mobile are in and the statement / video are being waited for: read the paid amount
+    now. A ROUND figure is how a Native order is paid, and a Native case needs nothing else - so it is processed
+    at once instead of after FORCE_SEND_SECONDS (the gateway itself is read from the Illunise order, as always).
+    Paise, or an amount that cannot be read: the wait goes on. Returns: now | wait | gone"""
+    from app.cases.gateway import is_round
     from app.db.repository import get_case_for_update
-    from app.telegram.input_bot import kick_off, show_gateway_card
+
+    def current(c) -> bool:
+        return (
+            c is not None
+            and c.status == CaseStatus.WAITING_FOR_INPUT.value
+            and not (version and c.processing_version != version)
+        )
 
     async with session_scope() as session:
         case = await get_case(session, case_id)
-        if case is None or case.status != CaseStatus.WAITING_FOR_INPUT.value:
+        if not current(case):
             return "gone"
-        if case.gateway_choice is not None:
-            return "chosen"  # the operator tapped in the meantime
         if case.amount is None:
             await manager.read_payment_amount(session, case)
+        amount = case.amount
+    if not is_round(amount):
+        return "wait"
     async with session_scope() as session:
         case = await get_case_for_update(session, case_id)
-        if case is None or case.gateway_choice is not None:
-            return "chosen"
-        decided = await apply_auto_gateway(session, case)
-        missing = missing_items(case, await list_evidence(session, case.case_id))
-    if decided:
-        await kick_off(case, missing)
-    await show_gateway_card(case_id)
-    outcome = "decided" if decided else "asked"
-    log.info("gateway", case_id=case_id, outcome=outcome, amount=case.amount)
-    return outcome
+        if not current(case):
+            return "gone"  # a newer file arrived meanwhile: its own job decides
+        case.processing_version += 1
+        new = case.processing_version
+    await enqueue("process_case_job", case_id, new, True, True, job_id=f"round-{case_id}-{new}")
+    log.info("round amount: processed without the wait", case_id=case_id, amount=amount)
+    return "now"
 
 
 async def post_case_job(ctx, case_id: str) -> str:
@@ -204,11 +207,7 @@ async def recover(ctx=None) -> dict:
 
                 missing = missing_items(case, ev)
                 s = get_settings()
-                if gateway_pending(case, missing):
-                    # the amount decides or the card's buttons do: read it again (cached) and show the card
-                    await enqueue("gateway_job", case.case_id, job_id=f"recover-gateway-{case.case_id}")
-                    counts["gateway_pending"] = counts.get("gateway_pending", 0) + 1
-                elif missing and not hard_missing(missing) and s.force_send_seconds > 0:
+                if missing and not hard_missing(missing) and s.force_send_seconds > 0:
                     waited = (utcnow() - case.last_input_at).total_seconds() if case.last_input_at else 1e9
                     case.processing_version += 1
                     await enqueue(
@@ -277,7 +276,7 @@ async def shutdown(ctx) -> None:
 class WorkerSettings:
     functions = [
         process_case_job,
-        gateway_job,
+        amount_job,
         post_case_job,
         reversal_check_job,
         refund_withdrawal_job,

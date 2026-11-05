@@ -13,10 +13,19 @@ from app.admin.browser import AdminError, LayoutChanged, LoginFailed, ManualAuth
 from app.admin.matcher import Candidate, MatchResult, match_orders
 from app.ai.extractor import Extraction, Field, extract_from_text
 from app.cases.correlation import hard_missing, merge_case_extraction, missing_items
-from app.cases.gateway import apply_auto_gateway, gateway_pending, is_native
+from app.cases.gateway import is_native, is_native_gateway, is_round, native_enabled
 from app.cases.state_machine import transition
 from app.config import get_settings
-from app.db.models import KIND_WITHDRAWAL, Case, CaseStatus, EvidenceType, OrderCandidate, OrderMatch
+from app.db.models import (
+    GATEWAY_BETIX,
+    GATEWAY_NATIVE,
+    KIND_WITHDRAWAL,
+    Case,
+    CaseStatus,
+    EvidenceType,
+    OrderCandidate,
+    OrderMatch,
+)
 from app.db.repository import (
     add_verification_event,
     audit,
@@ -527,11 +536,6 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
         return "deferred"
     evidence = await list_evidence(session, case.case_id)
     missing = missing_items(case, evidence)
-    if gateway_pending(case, missing) and case.amount is None:
-        await read_payment_amount(session, case)  # the paid amount may decide the gateway by itself
-    await apply_auto_gateway(session, case)  # paise in the paid amount: a Betix case, nobody is asked
-    if gateway_pending(case, missing):
-        return "gateway_pending"  # the card asks "Betix or Native?": nothing moves until the operator taps
     if force_send and missing and not hard_missing(missing):
         # FORCE SEND: screenshot + mobile are in and the wait for the statement / video ran out. Go with what we have.
         await audit(session, "FORCE_SEND", case_id=case.case_id, result="without " + ", ".join(missing))
@@ -668,8 +672,10 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
     # that day is "before" the payment (the matcher is told so through the time rule).
     date_only = Extraction.from_dict(case.extraction).payment_time.precision == "date"
     search_kw = {"window_minutes": 24 * 60} if date_only else {}
-    if is_native(case):
-        search_kw["read_all"] = True  # several orders may share the payment: every View page is read
+    if native_enabled() and is_round(case.amount):
+        # A round figure is how a Native order is paid, and several Native orders may share one payment: every
+        # candidate's View page is read (no "clear match, stop reading").
+        search_kw["read_all"] = True
     time_rule = {**s.time_rule, "date_only": True, "tz": s.timezone} if date_only else s.time_rule
     try:
         candidates = await _get_order_search()(case.mobile, case.amount, case.payment_time, **search_kw)
@@ -690,11 +696,6 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
         reason, hint = search_error
         await escalate_case(session, case, reason, hint) if hint else await escalate_case(session, case, reason)
         return "escalated"
-    if is_native(case):
-        # NATIVE: the orders under the mobile only - no fallback search, no /pi, no doubt resolution.
-        if await _relock(session, case, version0) is None:
-            return "stale"
-        return await select_native_orders(session, case, merged, candidates, time_rule=time_rule)
 
     # FALLBACK SEARCHES. If nothing under the customer's number was created around the payment, the order may sit
     # under another registered number: the panel can be searched by UTR and by the exact padded amount, both of
@@ -716,6 +717,14 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
         )
 
     first = match_orders(merged, case.mobile, candidates, **_kw())
+    # WHICH GATEWAY? The panel says: the orders created under the mobile just before the payment carry it.
+    # Native orders there (gateway BETIXPAYNATIVE) make it a Native case - when the paid amount is a round figure
+    # (how a Native order is paid), or when no Betix order answers for the payment. Otherwise the Betix flow below.
+    native = native_candidates(first, case.amount) if native_enabled() else []
+    if native and (is_round(case.amount) or first.decision not in ("MATCHED", "AMBIGUOUS")):
+        if await _relock(session, case, version0) is None:
+            return "stale"
+        return await select_native_orders(session, case, first, native, searched=len(candidates))
     fallbacks_tried: list[str] = []
 
     def fits(sc) -> bool:
@@ -954,81 +963,61 @@ def native_amount(paid: float) -> float:
     return float(round(float(paid)))
 
 
-def native_fit(sc, paid: float, tolerance: float, native_gateway: str) -> bool:
-    """A Native candidate: the customer's own order (never another number's), created before the payment inside
-    the window, for the rounded paid amount, and not a Betix order (or, when NATIVE_GATEWAY_NAME is set, one of
-    that gateway)."""
+def native_fit(sc, paid: float, tolerance: float) -> bool:
+    """A Native candidate: an order of the NATIVE gateway (the panel names it), the customer's own (never another
+    number's), created before the payment inside the window, for the rounded paid amount."""
     sig = sc.signals
     c = sc.candidate
+    if not is_native_gateway(c.gateway):
+        return False
     if (sig.get("registration") or {}).get("score") == 0.0:
         return False
     if ((sig.get("time") or {}).get("score") or 0) < 0.7:
         return False
-    if c.amount is None or abs(float(c.amount) - native_amount(paid)) > tolerance + 1e-9:
-        return False
-    gw = (c.gateway or "").lower().replace(" ", "")
-    if native_gateway:
-        # the Native gateway's orders (live: "BETIXPAYNATIVE"); an order whose gateway the panel did not show
-        # is not thrown out for that alone
-        return not gw or native_gateway.lower().replace(" ", "") in gw
-    return (sig.get("gateway") or {}).get("score") != 1.0  # a Betix order is never a Native one
+    return c.amount is not None and abs(float(c.amount) - native_amount(paid)) <= tolerance + 1e-9
 
 
-async def select_native_orders(session: AsyncSession, case: Case, merged, candidates, *, time_rule) -> str:
-    """NATIVE: every order created under the mobile at the payment time for the rounded amount goes out - one or
-    several, closest to the payment first - with the screenshot, to the Native group. None: manual review."""
+def native_candidates(result: MatchResult, paid: float) -> list:
+    """The Native orders that answer for this payment, closest to the payment first."""
     s = get_settings()
-    result: MatchResult = match_orders(
-        merged,
-        case.mobile,
-        candidates,
-        weights=s.match_weights,
-        threshold=s.order_match_threshold,
-        ambiguity_gap=s.order_match_ambiguity_gap,
-        time_window_minutes=s.payment_time_window_minutes,
-        amount_tolerance=s.order_amount_tolerance,
-        time_rule=time_rule,
-        gateway_name=s.betix_gateway_name,
-        other_gateways=s.other_gateways,
-        compatible_statuses=s.compatible_statuses,
-        expired_statuses=s.expired_statuses,
-        success_statuses=s.success_statuses,
-        time_tiebreak_minutes=s.order_time_tiebreak_minutes,
-    )
-    await _record_match(session, case, result, len(candidates))
-    fit = [sc for sc in result.scored if native_fit(sc, case.amount, s.order_amount_tolerance, s.native_gateway_name)]
+    fit = [sc for sc in result.scored if native_fit(sc, paid, s.order_amount_tolerance)]
 
     def lead(sc) -> float:
         v = (sc.signals.get("time") or {}).get("lead_minutes")
         return float(v) if v is not None else 1e9
 
-    fit.sort(key=lead)  # closest to the payment first
-    tz = s.timezone
-    when = fmt_local(case.payment_time, tz, "%d %b %Y %H:%M") if case.payment_time else "?"
+    return sorted(fit, key=lead)
+
+
+async def select_native_orders(
+    session: AsyncSession, case: Case, result: MatchResult, fit: list, *, searched: int
+) -> str:
+    """NATIVE (the panel shows Native-gateway orders for this payment): every one of them goes out - one or
+    several, closest to the payment first - with the screenshot, to the Native group."""
+    s = get_settings()
+    await _record_match(session, case, result, searched)
+    when = fmt_local(case.payment_time, s.timezone, "%d %b %Y %H:%M") if case.payment_time else "?"
     rounded = native_amount(case.amount)
-    if not fit:
-        lines = [candidate_line(sc, tz) for sc in result.scored[:5]]
-        reason = (
-            f"Native: no order of ₹{rounded:,.0f} (₹{case.amount:,.2f} paid, rounded) was created under this number "
-            f"before the payment ({when})."
-        )
-        extra = ("Nearest orders:\n" + "\n".join(lines) + "\n" if lines else "") + "Pick the right one in Illunise."
-        await escalate_case(session, case, reason, extra)
-        return "escalated"
     ids = [sc.candidate.betex_order_id or sc.candidate.illunise_order_id for sc in fit]
     case.native_order_ids = ids
     await audit(
         session,
-        "NATIVE_ORDERS_SELECTED",
+        "GATEWAY_DETECTED",
         case_id=case.case_id,
-        result=", ".join(ids),
+        result=GATEWAY_NATIVE,
         confidence=fit[0].score,
-        source="matcher",
-        details={"count": len(ids), "rounded_amount": rounded, "paid": case.amount},
+        source="illunise_admin",
+        details={"gateway": fit[0].candidate.gateway, "orders": ids, "rounded_amount": rounded, "paid": case.amount},
     )
     reason = f"Native: {len(ids)} order(s) of ₹{rounded:,.0f} created under the mobile just before the payment ({when})"
     return await select_order(
-        session, case, fit[0].candidate, reason=reason, confidence=fit[0].score, signals=fit[0].signals
+        session,
+        case,
+        fit[0].candidate,
+        reason=reason,
+        confidence=fit[0].score,
+        signals=fit[0].signals,
+        route=GATEWAY_NATIVE,
     )
 
 
@@ -1052,10 +1041,23 @@ async def mark_already_sent(session: AsyncSession, case: Case, first: Case) -> N
 
 
 # ------------------------------------------------------------------ order selection + the /pi UPI tie-break
-async def select_order(session: AsyncSession, case: Case, b, *, reason: str, confidence: float | None, signals) -> str:
+async def select_order(
+    session: AsyncSession,
+    case: Case,
+    b,
+    *,
+    reason: str,
+    confidence: float | None,
+    signals,
+    route: str = GATEWAY_BETIX,
+) -> str:
     """The order is identified: record it, then READY_FOR_BETIX (or ALREADY_SUCCESS / ALREADY_SENT).
-    `b` is a matcher Candidate or a stored OrderCandidate row (same attribute names)."""
+    `b` is a matcher Candidate or a stored OrderCandidate row (same attribute names). `route`: the gateway the
+    order belongs to, which decides the group the case is posted to (Betix unless the Native path says so)."""
     s = get_settings()
+    case.gateway_choice = route
+    if route != GATEWAY_NATIVE:
+        case.native_order_ids = None
     case.illunise_order_id = b.illunise_order_id
     case.betex_pay_order_id = b.betex_order_id
     case.order_created_at = b.order_time

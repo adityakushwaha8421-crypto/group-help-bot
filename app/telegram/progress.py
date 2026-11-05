@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.cases.gateway import gateway_pending, is_native
-from app.db.models import GATEWAY_BETIX, GATEWAY_NATIVE, Case, CaseStatus
+from app.cases.gateway import is_native
+from app.db.models import Case, CaseStatus
 from app.telegram.ui import case_label, code, esc, i
 from app.utils.logging import get_logger
 
@@ -179,26 +179,8 @@ def _card(head: str, rows: list[str], foot: str) -> str:
     return "\n\n".join(x for x in blocks if x)
 
 
-def gateway_buttons(case: Case):
-    """[Betix] [Native] - the question the card asks before anything is processed."""
-    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="\U0001f7e6 Betix", callback_data=f"gw:{GATEWAY_BETIX}:{case.case_id}"),
-                InlineKeyboardButton(text="\U0001f7e9 Native", callback_data=f"gw:{GATEWAY_NATIVE}:{case.case_id}"),
-            ]
-        ]
-    )
-
-
-def card_buttons(case: Case, missing: list[str] | None = None):
-    """The buttons under the card: [Betix] [Native] while the gateway question is open (`missing` = what the case
-    still lacks, so the screenshot + mobile are known to be in), FORCE SEND under "ALREADY WITH BETIX". None
-    removes any old button."""
-    if missing is not None and case.status == S.WAITING_FOR_INPUT.value and gateway_pending(case, missing):
-        return gateway_buttons(case)
+def card_buttons(case: Case):
+    """The buttons under the card. Only "ALREADY WITH BETIX" has one: FORCE SEND. None removes any old button."""
     if case.status != S.ALREADY_SENT.value:
         return None
     from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -214,25 +196,8 @@ async def push(session: AsyncSession, case: Case) -> bool:
     """Edit the case's progress message to reflect its current status. Returns True when an edit was sent."""
     if not case.progress_chat_id or not case.progress_message_id:
         return False
-
     try:
-        missing = None
-        if case.status == S.WAITING_FOR_INPUT.value and case.kind != "withdrawal" and case.gateway_choice is None:
-            from app.cases.correlation import missing_items
-            from app.db.repository import list_evidence
-
-            missing = missing_items(case, await list_evidence(session, case.case_id))
-            if gateway_pending(case, missing):
-                # The question is still open: the card keeps asking it (text from input_bot, buttons here).
-                from app.telegram.input_bot import case_card
-
-                text = case_card(
-                    case, await list_evidence(session, case.case_id), missing, created=False, forwarded=False
-                )
-                await _edit(case, text, gateway_buttons(case))
-                return True
-        text = progress_card(case)
-        await _edit(case, text, card_buttons(case))
+        await _edit(case, progress_card(case), card_buttons(case))
         return True
     except Exception as exc:  # noqa: BLE001
         if "not modified" not in str(exc):

@@ -30,7 +30,7 @@ from app.cases.correlation import (
     missing_items,
     statement_needs_password,
 )
-from app.cases.gateway import auto_reason, choose_gateway, gateway_label, gateway_pending, is_native
+from app.cases.gateway import gateway_label, is_native, native_enabled
 from app.config import get_settings
 from app.db.models import KIND_WITHDRAWAL, Case, CaseStatus
 from app.db.repository import (
@@ -112,9 +112,7 @@ def help_text() -> str:
         + "\n"
         + i(f"\u23f1 Everything sent within {q}s becomes one case.")
         + "\n"
-        + i(
-            "\U0001f500 Screenshot + mobile in: I ask Betix or Native. Native needs nothing else and goes to the Native group."
-        )
+        + i("\U0001f500 Betix or Native? I read the order's gateway in Illunise and send to the right group.")
         + "\n"
         + i("\U0001f522 A visible UTR helps the match; it is not required.")
         + "\n"
@@ -684,23 +682,6 @@ def case_card(case, evidence, missing, *, created: bool, forwarded: bool, head: 
     ) + (" (Forwarded)" if forwarded and created else "")
     if case.kind == KIND_WITHDRAWAL and not missing:
         nxt = "\U0001f4e4 Sending the withdrawal to Betix now."
-    elif gateway_pending(case, missing) and case.status == CaseStatus.WAITING_FOR_INPUT.value:
-        if case.amount is None:
-            lead = (
-                "\U0001f4f8 Reading the paid amount \u2014 paise (\u20b9100.20) means Betix by itself, "
-                "a round figure means your choice.\n"
-            )
-        else:
-            lead = f"\U0001f4b0 \u20b9{case.amount:,.0f} is a round figure \u2014 Betix or Native?\n"
-        nxt = (
-            lead
-            + "\U0001f447 Tap "
-            + b("Betix")
-            + " or "
-            + b("Native")
-            + " \u2014 nothing is sent until the gateway is known.\n"
-            + i("Native: only the screenshot and the mobile are needed.")
-        )
     elif is_native(case) and not missing:
         nxt = "\U0001f50e Native \u2014 checking the order(s) in Illunise, then sending to the Native group..."
     elif force_send_pending(case, missing):
@@ -784,7 +765,7 @@ async def flush_chat(chat_id: int) -> list[str]:
             continue
         await kick_off(case, e["missing"])
         text = case_card(case, e["evidence"], e["missing"], created=e["created"], forwarded=e["forwarded"])
-        buttons = card_buttons(case, e["missing"])
+        buttons = card_buttons(case)
         # ONE message per case: created once, edited afterwards (and by every processing step).
         if not e["created"] and case.progress_chat_id == chat_id and case.progress_message_id:
             if await edit_case_message(case.progress_chat_id, case.progress_message_id, text, buttons):
@@ -802,12 +783,6 @@ async def kick_off(case, missing: list[str]) -> str | None:
     case_id = case.case_id
     if case.status != CaseStatus.WAITING_FOR_INPUT.value:
         return None
-    if gateway_pending(case, missing):
-        if case.amount is None:
-            # the amount may decide (paise = Betix): read it now; meanwhile the card's buttons are live too
-            await enqueue("gateway_job", case_id, job_id=f"gateway-{case_id}")
-            return "gateway"
-        return None  # a round figure: only the card's [Betix] [Native] buttons decide
     if not missing:
         async with session_scope() as session:
             c = await get_case_for_update(session, case_id)
@@ -831,46 +806,28 @@ async def kick_off(case, missing: list[str]) -> str | None:
             job_id=f"force-{case_id}-{version}",
             defer_seconds=s.force_send_seconds,
         )
+        if native_enabled():
+            # a round-figure (Native) payment needs nothing more: the amount is read now and such a case is
+            # processed at once instead of after the wait
+            await enqueue("amount_job", case_id, version, job_id=f"amount-{case_id}-{version}")
         return "force"
     return None
 
 
 @router.callback_query(F.data.startswith("gw:"))
 async def on_gateway_button(query: CallbackQuery):
-    """[Betix] / [Native] under a case card: the operator's answer. Betix goes on as before (the statement / video
-    waited for, then the Betix group); Native needs nothing more and goes to the Native group right away."""
-    if query.from_user.id not in get_settings().admin_user_ids:
-        await query.answer("\u26d4 Not authorized", show_alert=True)
-        return
+    """An old card's [Betix] / [Native] button (cards sent before the gateway was read from Illunise): nothing to
+    choose any more. Say so and take the buttons away."""
+    await query.answer(
+        "\u2139\ufe0f No need to choose \u2014 I read the gateway from the Illunise order.", show_alert=True
+    )
     try:
-        _, choice, case_id = query.data.split(":", 2)
-    except ValueError:
-        await query.answer("\u26a0\ufe0f Unknown button")
-        return
-    who = f"@{query.from_user.username}" if query.from_user.username else str(query.from_user.id)
-    async with session_scope() as session:
-        case = await get_case_for_update(session, case_id)
-        if case is None:
-            await query.answer("\U0001f914 I couldn't find that case.", show_alert=True)
-            return
-        if not await choose_gateway(session, case, choice, who):
-            await query.answer(f"Already chosen: {gateway_label(case)}")
-            return
-        ev = await list_evidence(session, case_id)
-        missing = missing_items(case, ev)
-        chosen = gateway_label(case)
-    started = await kick_off(case, missing)
-    await query.answer(f"\u2705 {chosen}")
-    head = f"\U0001f500 {b('Gateway: ' + chosen)} \u2014 {code(case_label(case))}"
-    text = case_card(case, ev, missing, created=False, forwarded=False, head=head)
-    chat_id = query.message.chat.id if query.message else case.progress_chat_id
-    msg_id = query.message.message_id if query.message else case.progress_message_id
-    if chat_id and msg_id and await edit_case_message(chat_id, msg_id, text, None):
-        return
-    if query.message:
-        sent = await query.message.answer(text, parse_mode="HTML")
-        await track_progress(case_id, chat_id, sent)
-    log.info("gateway chosen", case_id=case_id, gateway=choice, by=who, started=started)
+        if query.message:
+            await notifications.get_bot().edit_message_reply_markup(
+                chat_id=query.message.chat.id, message_id=query.message.message_id, reply_markup=None
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.debug("old gateway buttons not removed", error=str(exc)[:120])
 
 
 @router.message(F.chat.type == "private", F.photo | F.video | F.document | F.video_note | F.text)
@@ -955,24 +912,6 @@ async def add_to_case(message: Message, inp: IncomingInput, sess) -> None:
     else:
         watch_add_limit(message, sess)
     await message.answer(para(f"✅ Added the {esc(note)} to case {code(label)}.", tail), parse_mode="HTML")
-
-
-async def show_gateway_card(case_id: str) -> bool:
-    """Rewrite the case card after the amount was read: the question (round figure, buttons stay) or the
-    decision (paise: Betix, no buttons) and what happens next."""
-    async with session_scope() as session:
-        case = await get_case(session, case_id)
-        if case is None or not (case.progress_chat_id and case.progress_message_id):
-            return False
-        ev = await list_evidence(session, case_id)
-        missing = missing_items(case, ev)
-        head = None
-        if case.gateway_choice:
-            head = f"\U0001f500 {b('Gateway: ' + gateway_label(case))} \u2014 {code(case_label(case))}"
-        text = case_card(case, ev, missing, created=False, forwarded=False, head=head)
-        buttons = card_buttons(case, missing)
-        chat_id, msg_id = case.progress_chat_id, case.progress_message_id
-    return await edit_case_message(chat_id, msg_id, text, buttons)
 
 
 async def edit_case_message(chat_id: int, message_id: int, text: str, reply_markup=None) -> bool:
@@ -1060,10 +999,7 @@ def case_status_lines(case, evidence) -> list[str]:
     if statement_needs_password(case, evidence):
         lines.append("\U0001f510 Statement is password protected \u2014 please send the password.")
     if case.gateway_choice:
-        why = auto_reason(case)
-        lines.append("\U0001f500 Gateway: " + b(gateway_label(case)) + (f" \u2014 {esc(why)}" if why else ""))
-    elif get_settings().ask_gateway and "payment_screenshot" in types and case.mobile:
-        lines.append("\U0001f500 Gateway \u2014 waiting for your choice")
+        lines.append("\U0001f500 Gateway: " + b(gateway_label(case)))
     return lines
 
 
