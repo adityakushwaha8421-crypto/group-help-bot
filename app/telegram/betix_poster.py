@@ -24,6 +24,11 @@ class BetixPostError(Exception):
     pass
 
 
+# A Native case with SEVERAL order ids: the screenshot is posted once per id. The first post is the anchor
+# ("evidence_screenshot"); each further one is recorded with this kind and the order id as its text.
+NATIVE_ORDER_POST = "evidence_screenshot_order"
+
+
 def followup_text(case: Case, number: int) -> str:  # noqa: ARG001
     """Short and plain: the follow-up is a REPLY to our screenshot post, so the order id is already in view."""
     return get_settings().betix_followup_text.strip() or "Any update?"
@@ -170,19 +175,41 @@ class BetixPoster:
         case.betix_posted_at = case.betix_posted_at or utcnow()
 
     async def post_native(self, session: AsyncSession, case: Case, evidence: list[Evidence]) -> None:
-        """NATIVE: the payment screenshot goes to the Native group captioned with EVERY order id created under the
-        mobile at the payment time (one per line, closest to the payment first). Nothing else: no statement, no
-        video, no amount note, no reminders. Idempotent."""
+        """NATIVE: the payment screenshot goes to the Native group ONCE PER ORDER ID - one message per order created
+        under the mobile at the payment time, each carrying the screenshot and that single order id as its caption
+        (closest to the payment first; never several ids in one caption). The first is the case's anchor. Nothing
+        else: no statement, no video, no amount note, no reminders. Idempotent per order id."""
         self.bind(case)
         ids = [x for x in (case.native_order_ids or []) if x] or (
             [case.betex_pay_order_id] if case.betex_pay_order_id else []
         )
+        ids = list(dict.fromkeys(ids))
         if not ids:
             raise BetixPostError("case has no order id; refusing to post")
         shots = [e for e in evidence if e.type == EvidenceType.payment_screenshot.value]
         if not shots:
             raise BetixPostError("no payment screenshot to post")
-        await self._post_screenshots(session, case, shots, "\n".join(ids), event="NATIVE_EVIDENCE_POSTED")
+        # the first order id: the anchor (+ the same payment's other screens as its replies)
+        await self._post_screenshots(session, case, shots, ids[0], event="NATIVE_EVIDENCE_POSTED")
+        # every further order id: the screenshot again, as a message of its own, with that id alone
+        sent = {
+            m.text
+            for m in await list_case_betix_messages(session, case.case_id)
+            if m.direction == "out" and m.kind == NATIVE_ORDER_POST
+        }
+        for order_id in ids[1:]:
+            if order_id in sent:
+                continue
+            mid = await self._send_media(shots[0], order_id)
+            await self._record(session, case, mid, NATIVE_ORDER_POST, order_id, has_media=True)
+            await audit(
+                session,
+                "NATIVE_EVIDENCE_POSTED",
+                case_id=case.case_id,
+                result="screenshot_order",
+                details={"message_id": mid, "order_id": order_id},
+            )
+            await session.commit()
         case.betix_posted_at = case.betix_posted_at or utcnow()
 
     async def _post_screenshots(

@@ -172,7 +172,7 @@ class Settings(BaseSettings):
     # BETIX OR NATIVE: never asked, read from Illunise. The orders created under the mobile just before the
     # payment carry the gateway: a "BetixPay" order -> the Betix flow above (statement + video waited for, the
     # Betix group, /pi, follow-ups); a Native order (NATIVE_GATEWAY_NAME) -> the screenshot goes to
-    # NATIVE_GROUP_CHAT_ID captioned with EVERY such order id (one or several). No NATIVE_GROUP_CHAT_ID: every
+    # NATIVE_GROUP_CHAT_ID once per such order id, each with that id alone. No NATIVE_GROUP_CHAT_ID: every
     # case is a Betix case.
     native_group_chat_id: str = ""  # the Native group; "1003515687583" and "-1003515687583" both work
     # The Native gateway as the Illunise orders list names it (live 2026-11-01: "BETIXPAYNATIVE"). An order of this

@@ -3,7 +3,7 @@
 The order(s) created under the customer's mobile around the payment time say which gateway the customer paid
 through: an order of the Betix gateway ("BetixPay") makes it a Betix case - the Betix group, /pi, reminders; an
 order of the Native gateway ("BETIXPAYNATIVE" in the panel) makes it a Native case - the screenshot goes to the
-Native group captioned with every such order id. The answer is kept on the case (Case.gateway_choice)."""
+Native group once per such order id (one id per message). The answer is kept on the case (Case.gateway_choice)."""
 
 from __future__ import annotations
 

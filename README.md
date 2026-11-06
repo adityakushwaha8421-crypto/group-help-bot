@@ -297,8 +297,8 @@ mobile just before the payment; **the order's gateway in the panel decides the g
 - **`BetixPay`** -> a Betix case: the flow above - the order is matched (with `/pi` on any doubt), the
   screenshot goes to the Betix group, reminders follow.
 - **`BETIXPAYNATIVE`** (`NATIVE_GATEWAY_NAME`) -> a Native case: the screenshot goes to `NATIVE_GROUP_CHAT_ID`
-  captioned with the order id(s), one per line, closest to the payment first - every Native order of the
-  rounded paid amount created at the payment time, one post however many. Nothing else is needed (no statement,
+  once per order id - every Native order of the rounded paid amount created at the payment time gets its own
+  message: the screenshot with that single order id as caption, closest to the payment first. Nothing else is needed (no statement,
   video or password), and there is no `/pi`, no amount note and no reminder. A member's "done" / "success" as a
   reply to that post confirms the case like a Betix member's would.
 

@@ -264,9 +264,11 @@ async def test_a_betix_order_sends_the_case_to_the_betix_group(
     assert holder["kw"] == {}  # paise: the usual search, no "read every View page"
 
 
-async def test_several_native_orders_all_go_in_the_caption_closest_first(
+async def test_several_native_orders_get_one_post_each_closest_first(
     db, fake_bot, fake_ai, order_search, no_download, fake_poster
 ):
+    """Two Native orders at the payment time: the screenshot goes out TWICE, each time with ONE order id - never
+    two ids in one caption. Both are messages of their own in the Native group."""
     paid(fake_ai, 6500.0)
     case_id, outcome = await run(db, order_search, NATIVE_TWO)
     assert outcome == "ready"
@@ -275,7 +277,65 @@ async def test_several_native_orders_all_go_in_the_caption_closest_first(
         assert c.native_order_ids == [B, A]  # B was created 1 min before the payment, A 4 min
         assert "ORDERS FOUND" in progress_card(c) and B in progress_card(c) and A in progress_card(c)
         assert await manager.post_case_to_betix(s, case_id, fake_poster) == "posted"
-    assert fake_poster.media == [("payment_screenshot", f"{B}\n{A}")]  # ONE post for the payment
+        c = await get_case(s, case_id)
+        assert c.betix_root_message_id == 501  # the first post is the case's anchor
+    assert fake_poster.media == [("payment_screenshot", B), ("payment_screenshot", A)]
+    assert fake_poster.media_replies == [("payment_screenshot", None), ("payment_screenshot", None)]
+    assert fake_poster.chats == [NATIVE_CHAT, NATIVE_CHAT] and fake_poster.texts == []
+    assert not any("\n" in (cap or "") for _, cap in fake_poster.media)
+
+
+async def test_posting_again_never_repeats_an_order(db, fake_bot, fake_ai, order_search, no_download, fake_poster):
+    paid(fake_ai, 6500.0)
+    case_id, _ = await run(db, order_search, NATIVE_TWO)
+    async with db.session_scope() as s:
+        await manager.post_case_to_betix(s, case_id, fake_poster)
+        c = await get_case(s, case_id)
+        await fake_poster.post_native(s, c, await list_evidence(s, case_id))  # a retry / restart recovery
+    assert fake_poster.media == [("payment_screenshot", B), ("payment_screenshot", A)]
+
+
+async def test_a_done_on_the_second_orders_post_confirms_the_case(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, monkeypatch
+):
+    monkeypatch.setenv("CONFIRMATION_MODE", "either")
+    reset_settings_cache()
+    paid(fake_ai, 6500.0)
+
+    async def everyone(chat_id, user_id):
+        return True
+
+    set_membership_checker(everyone)
+    try:
+        case_id, _ = await run(db, order_search, NATIVE_TWO)
+        async with db.session_scope() as s:
+            assert await manager.post_case_to_betix(s, case_id, fake_poster) == "posted"
+            r = await handle_group_message(  # 502: the second order's own post
+                s,
+                make_group_msg(710, "done", sender_username="wendy", sender_id=5001, reply_to=502, chat_id=NATIVE_CHAT),
+            )
+            assert r["action"] == "verified" and r["correlation"] == "reply_chain"
+    finally:
+        set_membership_checker(None)
+
+
+async def test_two_screens_of_one_payment_follow_the_first_order_only(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    """The receipt and its details page (2 screenshots, 1 payment) with 2 orders: the first order's post carries
+    both screens (the second as its reply, as always); the second order gets the screenshot once."""
+    from app.cases.correlation import attach_message
+
+    paid(fake_ai, 6500.0)
+    case_id = await two_items(db)
+    async with db.session_scope() as s:
+        await attach_message(s, make_input(3, "photo"))
+    order_search(NATIVE_TWO)
+    async with db.session_scope() as s:
+        assert await manager.process_case(s, case_id, force=True, force_send=True) == "ready"
+        assert await manager.post_case_to_betix(s, case_id, fake_poster) == "posted"
+    assert [cap for _, cap in fake_poster.media] == [B, B, A]
+    assert [r for _, r in fake_poster.media_replies] == [None, 501, None]
 
 
 async def test_a_round_figure_search_reads_every_view_page(db, fake_bot, fake_ai, order_search, no_download):
