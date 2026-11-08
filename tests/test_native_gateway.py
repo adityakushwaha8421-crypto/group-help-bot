@@ -641,3 +641,135 @@ async def test_the_live_order_once_success_with_this_utr_is_already_credited(
     cands = [{**LIVE_1107[0], "status": "Success", "utr": "667778178327"}, *LIVE_1107[1:]]
     _, outcome = await run(db, order_search, cands)
     assert outcome == "already_success" and fake_poster.media == []
+
+
+# ---------------------------------------------------------------- the 5-minute window and the order's UPI
+SHOT_UPI = "ci26102159-4@ypbiz"  # the payee UPI printed on the Amazon Pay screenshot of 2026-11-07
+
+
+def test_the_upi_is_found_inside_the_creation_response_json():
+    from app.admin.orders import upi_from_json
+
+    creation = {"status": "ok", "data": {"orderId": "X1", "payee": {"name": "Cartzuno", "vpa": SHOT_UPI},
+                "customer": {"email": "someone@gmail.com"}}}  # fmt: skip
+    assert upi_from_json(creation) == SHOT_UPI
+    assert upi_from_json({"data": {"intent": "pay to merchant", "upiId": "abc-1@ybl"}}) == "abc-1@ybl"
+    assert upi_from_json({"note": "pay merchant-99@okaxis now", "value": "merchant-99@okaxis"}) == "merchant-99@okaxis"
+    assert upi_from_json({"message": "ok", "email": "x@gmail.com"}) is None
+
+
+def test_the_view_page_upi_lands_on_the_candidate():
+    from app.admin.matcher import Candidate
+    from app.admin.orders import apply_view_fields
+
+    c = apply_view_fields(
+        Candidate("1", A), {"gateway.upi": SHOT_UPI, "Status": "Pending"}, {"status": ["Status"]}, "Asia/Kolkata"
+    )
+    assert c.upi_id == SHOT_UPI and c.status == "Pending"
+
+
+async def test_a_native_order_older_than_five_minutes_never_counts(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    paid(fake_ai, 6500.0)  # paid 19:32:12
+    six_min = [{**NATIVE_ONE[0], "order_time": "2026-09-10 19:26:00"}]
+    case_id, outcome = await run(db, order_search, six_min)
+    assert outcome == "escalated" and fake_poster.media == []
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).gateway_choice is None
+    four_min = [{**NATIVE_ONE[0], "order_time": "2026-09-10 19:28:00"}]
+    case_id, outcome = await run(db, order_search, four_min, base=20)
+    assert outcome == "ready"
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == [A]
+
+
+async def test_the_order_paid_to_the_screenshots_upi_is_the_one(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    """Two Native orders created together; the panel's creation JSON gives each its UPI. The screenshot was paid to
+    B's UPI: B alone goes out, although A was created closer to the payment."""
+    paid(fake_ai, 6500.0)
+    fake_ai.receiver_upi = SHOT_UPI
+    cands = [
+        {**NATIVE_ONE[0], "order_time": "2026-09-10 19:31:00", "upi_id": "ci26102159-9@ypbiz"},
+        {**NATIVE_ONE[0], "betex_order_id": B, "illunise_order_id": "1003", "order_time": "2026-09-10 19:30:00",
+         "upi_id": SHOT_UPI},
+    ]  # fmt: skip
+    case_id, outcome = await run(db, order_search, cands)
+    assert outcome == "ready"
+    async with db.session_scope() as s:
+        c = await get_case(s, case_id)
+        assert c.native_order_ids == [B]
+        rows = (await s.execute(select(AuditLog).where(AuditLog.action == "NATIVE_UPI_CHECK"))).scalars().all()
+        assert len(rows) == 1 and rows[0].result == "matched" and rows[0].details["screenshot_upi"] == SHOT_UPI
+        assert await manager.post_case_to_betix(s, case_id, fake_poster) == "posted"
+    assert fake_poster.media == [("payment_screenshot", B)]
+    assert fake_ai.ocr_calls == 1
+
+
+async def test_a_masked_screenshot_upi_still_picks_the_order(db, fake_bot, fake_ai, order_search, no_download):
+    paid(fake_ai, 6500.0)
+    fake_ai.receiver_upi = "••••2159-4@ypbiz"
+    cands = [
+        {**NATIVE_ONE[0], "order_time": "2026-09-10 19:31:00", "upi_id": "ci26102159-9@ypbiz"},
+        {**NATIVE_ONE[0], "betex_order_id": B, "illunise_order_id": "1003", "upi_id": SHOT_UPI},
+    ]  # fmt: skip
+    case_id, outcome = await run(db, order_search, cands)
+    assert outcome == "ready"
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == [B]
+
+
+async def test_no_native_order_paid_to_the_screenshots_upi_is_manual_review(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    paid(fake_ai, 6500.0)
+    fake_ai.receiver_upi = SHOT_UPI
+    cands = [{**NATIVE_ONE[0], "upi_id": "ci26102159-9@ypbiz"}]
+    case_id, outcome = await run(db, order_search, cands)
+    assert outcome == "escalated" and fake_poster.media == []
+    alert = [t for _, t in fake_bot.sent if "MANUAL REVIEW" in t][-1]
+    assert "none was paid to the UPI on the screenshot" in alert and SHOT_UPI in alert and "ci26102159-9@ypbiz" in alert
+    async with db.session_scope() as s:
+        c = await get_case(s, case_id)
+        assert c.status == CaseStatus.ESCALATED.value and c.gateway_choice is None
+
+
+async def test_orders_without_a_upi_in_the_panel_go_by_time_and_no_ocr_runs(
+    db, fake_bot, fake_ai, order_search, no_download
+):
+    paid(fake_ai, 6500.0)
+    fake_ai.receiver_upi = SHOT_UPI
+    case_id, outcome = await run(db, order_search, NATIVE_ONE)  # no upi_id on the order
+    assert outcome == "ready" and fake_ai.ocr_calls == 0
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == [A]
+
+
+async def test_a_screenshot_without_a_readable_upi_falls_back_to_the_time_rule(
+    db, fake_bot, fake_ai, order_search, no_download
+):
+    paid(fake_ai, 6500.0)
+    fake_ai.receiver_upi = None
+    cands = [{**NATIVE_ONE[0], "upi_id": "ci26102159-9@ypbiz"}]
+    case_id, outcome = await run(db, order_search, cands)
+    assert outcome == "ready"
+    async with db.session_scope() as s:
+        c = await get_case(s, case_id)
+        assert c.native_order_ids == [A]
+        rows = (await s.execute(select(AuditLog).where(AuditLog.action == "NATIVE_UPI_CHECK"))).scalars().all()
+        assert rows[0].result == "no screenshot upi"
+
+
+async def test_the_utr_on_the_order_beats_the_upi_check(db, fake_bot, fake_ai, order_search, no_download):
+    paid_live(fake_ai)
+    fake_ai.receiver_upi = SHOT_UPI
+    cands = [
+        {**LIVE_1107[0], "upi_id": "ci26102159-9@ypbiz", "utr": "667778178327"},
+        {**LIVE_1107[1], "order_time": "2026-11-07 22:01:00", "upi_id": SHOT_UPI},
+    ]
+    case_id, outcome = await run(db, order_search, cands)
+    assert outcome == "ready" and fake_ai.ocr_calls == 0
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == [LIVE_1107[0]["betex_order_id"]]

@@ -297,10 +297,13 @@ mobile just before the payment; **the order's gateway in the panel decides the g
 - **`BetixPay`** -> a Betix case: the flow above - the order is matched (with `/pi` on any doubt), the
   screenshot goes to the Betix group, reminders follow.
 - **`BETIXPAYNATIVE`** (`NATIVE_GATEWAY_NAME`) -> a Native case: the screenshot goes to `NATIVE_GROUP_CHAT_ID`
-  once per order id: the Native order of the rounded paid amount created closest to the payment, plus any
-  created together with it (within `NATIVE_SAME_TIME_MINUTES`), each as its own message - the screenshot with
-  that single order id as caption, closest first. An order already carrying this payment's UTR goes alone; an
-  order Success under another UTR never goes. Nothing else is needed (no statement,
+  once per order id: the Native order of the rounded paid amount created within `NATIVE_WINDOW_MINUTES` (5)
+  before the payment, each as its own message - the screenshot with that single order id as caption, closest
+  first. Which one: an order already carrying this payment's UTR goes alone; else, when the screenshot shows the
+  payee UPI and the order's View page ("View full creation response JSON", Native orders only) shows the order's
+  UPI, the order paid to that UPI goes and nothing goes when none was; else the order created closest to the
+  payment plus any created together with it (within `NATIVE_SAME_TIME_MINUTES`). An order Success under another
+  UTR never goes. Nothing else is needed (no statement,
   video or password), and there is no `/pi`, no amount note and no reminder. A member's "done" / "success" as a
   reply to that post confirms the case like a Betix member's would.
 

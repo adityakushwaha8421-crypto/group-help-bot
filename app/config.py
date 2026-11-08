@@ -236,6 +236,9 @@ class Settings(BaseSettings):
     # NATIVE: with several Native orders of the amount before the payment, only the one created closest to the
     # payment goes out - plus the ones created together with it, within this many minutes of it.
     native_same_time_minutes: int = 3
+    # NATIVE: an order counts only when created within this many minutes before the payment - never the wider
+    # Betix search window.
+    native_window_minutes: int = 5
     # Kept for compatibility with older configs; the before-payment window above is what is used.
     payment_time_window_minutes: int = 15
     # Order search narrowing: only orders created within this many minutes BEFORE the payment (and a couple

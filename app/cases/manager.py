@@ -4,6 +4,7 @@ All external effects (browser, AI, Telegram) are injectable so the flow is unit-
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Awaitable, Callable
 
@@ -720,11 +721,48 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
     # WHICH GATEWAY? The panel says: the orders created under the mobile just before the payment carry it.
     # Native orders there (gateway BETIXPAYNATIVE) make it a Native case - when the paid amount is a round figure
     # (how a Native order is paid), or when no Betix order answers for the payment. Otherwise the Betix flow below.
-    native = native_candidates(first, case.amount) if native_enabled() else []
-    if native and (is_round(case.amount) or first.decision not in ("MATCHED", "AMBIGUOUS")):
+    pick = native_candidates(first, case.amount) if native_enabled() else NativePick([])
+    if pick.orders and not pick.by_utr and any(sc.candidate.upi_id for sc in pick.orders):
+        # The panel shows the Native orders' UPI (the creation JSON): the payee UPI on the screenshot decides
+        shot_upi, how = await read_screenshot_upi(session, case)
+        pick = native_candidates(first, case.amount, screenshot_upi=shot_upi)
+        await audit(
+            session,
+            "NATIVE_UPI_CHECK",
+            case_id=case.case_id,
+            result=("matched" if pick.orders else "no match") if shot_upi else "no screenshot upi",
+            source="payment_screenshot",
+            details={
+                "screenshot_upi": shot_upi,
+                "how": how,
+                "orders": [sc.candidate.upi_id for sc in pick.upi_rejected],
+            },
+        )
+    native_way = is_round(case.amount) or first.decision not in ("MATCHED", "AMBIGUOUS")
+    if pick.orders and native_way:
         if await _relock(session, case, version0) is None:
             return "stale"
-        return await select_native_orders(session, case, first, native, searched=len(candidates))
+        return await select_native_orders(session, case, first, pick, searched=len(candidates))
+    if pick.upi_rejected and native_way:
+        # Native orders sit at the payment time, but none of them was paid to the UPI on the screenshot
+        if await _relock(session, case, version0) is None:
+            return "stale"
+        await _record_match(session, case, first, len(candidates))
+        tz = s.timezone
+        when = fmt_local(case.payment_time, tz, "%d %b %Y %H:%M") if case.payment_time else "?"
+        lines = [
+            f"- {sc.candidate.betex_order_id}: ₹{(sc.candidate.amount or 0):,.2f} · created "
+            f"{fmt_local(sc.candidate.order_time, tz, '%d %b %H:%M')} · UPI {sc.candidate.upi_id}"
+            for sc in pick.upi_rejected
+        ]
+        await escalate_case(
+            session,
+            case,
+            f"Native: {len(pick.upi_rejected)} order(s) of ₹{native_amount(case.amount):,.0f} were created just before "
+            f"the payment ({when}), but none was paid to the UPI on the screenshot ({pick.note.split()[-1]}).",
+            "Native orders at the payment time (closest first):\n" + "\n".join(lines) + "\nNot sent anywhere.",
+        )
+        return "escalated"
     fallbacks_tried: list[str] = []
 
     def fits(sc) -> bool:
@@ -963,9 +1001,10 @@ def native_amount(paid: float) -> float:
     return float(round(float(paid)))
 
 
-def native_fit(sc, paid: float, tolerance: float) -> bool:
+def native_fit(sc, paid: float, tolerance: float, window: float) -> bool:
     """A Native candidate: an order of the NATIVE gateway (the panel names it), the customer's own (never another
-    number's), created before the payment inside the window, for the rounded paid amount."""
+    number's), created before the payment and within `window` minutes of it (NATIVE_WINDOW_MINUTES, not the wider
+    Betix search window), for the rounded paid amount."""
     sig = sc.signals
     c = sc.candidate
     if not is_native_gateway(c.gateway):
@@ -974,20 +1013,35 @@ def native_fit(sc, paid: float, tolerance: float) -> bool:
         return False
     if ((sig.get("time") or {}).get("score") or 0) < 0.7:
         return False
+    lead = (sig.get("time") or {}).get("lead_minutes")
+    if lead is None or float(lead) > window + 1e-9:
+        return False
     return c.amount is not None and abs(float(c.amount) - native_amount(paid)) <= tolerance + 1e-9
 
 
-def native_candidates(result: MatchResult, paid: float) -> list:
+@dataclass
+class NativePick:
+    """Which Native order(s) answer for the payment - and, when none does although some fit, why."""
+
+    orders: list
+    upi_rejected: list = field(default_factory=list)  # fit by time and amount, but their UPI is not the screenshot's
+    note: str = ""
+    by_utr: bool = False  # the panel already holds the payment's UTR on the order: nothing else is asked
+
+
+def native_candidates(result: MatchResult, paid: float, screenshot_upi: str | None = None) -> NativePick:
     """The Native order(s) that answer for this payment, closest to the payment first.
 
-    One order is THE order when the panel already holds this payment's UTR on it: that one alone, whatever else
-    sits nearby. Otherwise the order created closest to the payment, and only the orders created together with it
-    (within NATIVE_SAME_TIME_MINUTES of it) - never every same-amount order of the whole search window. An order
-    the panel shows as Success under ANOTHER UTR was paid by another payment and never counts.
+    Within NATIVE_WINDOW_MINUTES of the payment only. One order is THE order when the panel already holds this
+    payment's UTR on it: that one alone. When the screenshot shows the payee UPI and the panel shows the orders'
+    UPI (the Native creation JSON), the UPI decides: the order whose UPI is the screenshot's, and nothing when none
+    is. Otherwise the order created closest to the payment, and only the orders created together with it (within
+    NATIVE_SAME_TIME_MINUTES) - never every same-amount order of the window. An order the panel shows as Success
+    under ANOTHER UTR was paid by another payment and never counts.
     Live 2026-11-07 22:02: ₹10,000 paid, the order created 22:02 - and four ₹10,000 Native orders from 21:47
     went out with it. Only the 22:02 one should have."""
     s = get_settings()
-    fit = [sc for sc in result.scored if native_fit(sc, paid, s.order_amount_tolerance)]
+    fit = [sc for sc in result.scored if native_fit(sc, paid, s.order_amount_tolerance, s.native_window_minutes)]
 
     def lead(sc) -> float:
         v = (sc.signals.get("time") or {}).get("lead_minutes")
@@ -1001,20 +1055,32 @@ def native_candidates(result: MatchResult, paid: float) -> list:
 
     same_utr = sorted((sc for sc in fit if utr_score(sc) == 1.0), key=lead)
     if same_utr:
-        return same_utr[:1]
+        return NativePick(same_utr[:1], note="the panel already holds this payment's UTR on it", by_utr=True)
     fit = sorted((sc for sc in fit if not paid_by_another(sc)), key=lead)
     if not fit:
-        return []
+        return NativePick([])
+    if screenshot_upi:
+        with_upi = [sc for sc in fit if sc.candidate.upi_id]
+        if with_upi:
+            matched = [
+                sc
+                for sc in with_upi
+                if upi_ending_match(screenshot_upi, sc.candidate.upi_id, min_chars=s.upi_ending_min_chars)[0]
+            ]
+            if matched:
+                return NativePick(matched, note=f"its UPI {matched[0].candidate.upi_id} is the one on the screenshot")
+            return NativePick([], upi_rejected=with_upi, note=f"the screenshot shows {screenshot_upi}")
     closest = lead(fit[0])
-    return [sc for sc in fit if lead(sc) - closest <= s.native_same_time_minutes + 1e-9]
+    return NativePick([sc for sc in fit if lead(sc) - closest <= s.native_same_time_minutes + 1e-9])
 
 
 async def select_native_orders(
-    session: AsyncSession, case: Case, result: MatchResult, fit: list, *, searched: int
+    session: AsyncSession, case: Case, result: MatchResult, pick: NativePick, *, searched: int
 ) -> str:
     """NATIVE (the panel shows Native-gateway orders for this payment): every one of them goes out - one or
     several, closest to the payment first - with the screenshot, to the Native group."""
     s = get_settings()
+    fit = pick.orders
     await _record_match(session, case, result, searched)
     when = fmt_local(case.payment_time, s.timezone, "%d %b %Y %H:%M") if case.payment_time else "?"
     rounded = native_amount(case.amount)
@@ -1027,9 +1093,17 @@ async def select_native_orders(
         result=GATEWAY_NATIVE,
         confidence=fit[0].score,
         source="illunise_admin",
-        details={"gateway": fit[0].candidate.gateway, "orders": ids, "rounded_amount": rounded, "paid": case.amount},
+        details={
+            "gateway": fit[0].candidate.gateway,
+            "orders": ids,
+            "rounded_amount": rounded,
+            "paid": case.amount,
+            "why": pick.note,
+        },
     )
     reason = f"Native: {len(ids)} order(s) of ₹{rounded:,.0f} created under the mobile just before the payment ({when})"
+    if pick.note:
+        reason += f"; {pick.note}"
     return await select_order(
         session,
         case,

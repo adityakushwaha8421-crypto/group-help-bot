@@ -141,7 +141,34 @@ async def read_view_fields(browser: AdminBrowser, order_id: str) -> dict[str, st
         for key in ("platOrderNo", "merchantOrderNo", "refNo", "paidAmount", "orderAmount", "status", "fee", "method"):
             if key in data and data[key] not in (None, ""):
                 fields.setdefault(f"gateway.{key}", str(data[key]))
+        upi = upi_from_json(data)
+        if upi:
+            fields.setdefault("gateway.upi", upi)  # a Native order: the UPI the customer paid to (creation JSON)
     return fields
+
+
+UPI_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{1,60}@[A-Za-z][A-Za-z0-9]{1,30}$")
+
+
+def upi_from_json(data) -> str | None:
+    """The payee UPI (VPA) inside a gateway JSON block. A NATIVE order's "View full creation response JSON" carries
+    the UPI the customer was told to pay to; the key naming it is not fixed, so a key that says upi / vpa / payee
+    wins, else any value shaped like a UPI (never an e-mail: a UPI handle has no dot). Nested objects are searched."""
+    keyed: list[str] = []
+    shaped: list[str] = []
+
+    def walk(node, key: str = "") -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, str(k))
+        elif isinstance(node, list):
+            for v in node:
+                walk(v, key)
+        elif isinstance(node, str) and UPI_VALUE.match(node.strip()):
+            (keyed if re.search(r"upi|vpa|payee", key, re.I) else shaped).append(node.strip())
+
+    walk(data)
+    return (keyed or shaped or [None])[0]
 
 
 def apply_view_fields(cand: Candidate, fields: dict[str, str], view_map: dict[str, list[str]], tz: str) -> Candidate:
@@ -175,6 +202,7 @@ def apply_view_fields(cand: Candidate, fields: dict[str, str], view_map: dict[st
     if padded is not None:
         cand.padded_amount = padded
     cand.utr = get("utr") or cand.utr
+    cand.upi_id = fields.get("gateway.upi") or cand.upi_id
     cand.status = get("status") or cand.status
     amt = normalize_amount(get("amount"))
     if amt is not None:
