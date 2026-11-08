@@ -233,6 +233,9 @@ class Settings(BaseSettings):
     payment_time_tolerance_minutes: int = 3
     # Two orders both created before the payment: the closer one wins when it is at least this much closer.
     order_time_tiebreak_minutes: int = 2
+    # NATIVE: with several Native orders of the amount before the payment, only the one created closest to the
+    # payment goes out - plus the ones created together with it, within this many minutes of it.
+    native_same_time_minutes: int = 3
     # Kept for compatibility with older configs; the before-payment window above is what is used.
     payment_time_window_minutes: int = 15
     # Order search narrowing: only orders created within this many minutes BEFORE the payment (and a couple

@@ -978,7 +978,14 @@ def native_fit(sc, paid: float, tolerance: float) -> bool:
 
 
 def native_candidates(result: MatchResult, paid: float) -> list:
-    """The Native orders that answer for this payment, closest to the payment first."""
+    """The Native order(s) that answer for this payment, closest to the payment first.
+
+    One order is THE order when the panel already holds this payment's UTR on it: that one alone, whatever else
+    sits nearby. Otherwise the order created closest to the payment, and only the orders created together with it
+    (within NATIVE_SAME_TIME_MINUTES of it) - never every same-amount order of the whole search window. An order
+    the panel shows as Success under ANOTHER UTR was paid by another payment and never counts.
+    Live 2026-11-07 22:02: ₹10,000 paid, the order created 22:02 - and four ₹10,000 Native orders from 21:47
+    went out with it. Only the 22:02 one should have."""
     s = get_settings()
     fit = [sc for sc in result.scored if native_fit(sc, paid, s.order_amount_tolerance)]
 
@@ -986,7 +993,20 @@ def native_candidates(result: MatchResult, paid: float) -> list:
         v = (sc.signals.get("time") or {}).get("lead_minutes")
         return float(v) if v is not None else 1e9
 
-    return sorted(fit, key=lead)
+    def utr_score(sc):
+        return (sc.signals.get("utr") or {}).get("score")
+
+    def paid_by_another(sc) -> bool:
+        return (sc.candidate.status or "").strip().lower() in s.success_statuses and utr_score(sc) == 0.0
+
+    same_utr = sorted((sc for sc in fit if utr_score(sc) == 1.0), key=lead)
+    if same_utr:
+        return same_utr[:1]
+    fit = sorted((sc for sc in fit if not paid_by_another(sc)), key=lead)
+    if not fit:
+        return []
+    closest = lead(fit[0])
+    return [sc for sc in fit if lead(sc) - closest <= s.native_same_time_minutes + 1e-9]
 
 
 async def select_native_orders(

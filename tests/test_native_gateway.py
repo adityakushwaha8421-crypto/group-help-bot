@@ -557,3 +557,87 @@ async def test_add_on_a_native_case_needs_nothing(db, fake_bot, fake_ai, order_s
     input_bot._add_timers.clear()
     add_evidence._sessions.clear()
     assert "already with the Native group" in sink[-1] and "already has everything" in sink[-1]
+
+
+# ---------------------------------------------------------------- which Native orders, exactly
+LIVE_1107 = [  # 2026-11-07 22:02: ₹10,000 paid; five ₹10,000 Native orders inside the window, one at 22:02
+    {"illunise_order_id": "ILLUN-17940691595864", "betex_order_id": "ILLUN-17940691595864", "registration_number": MOBILE,
+     "amount": 10000.0, "order_time": "2026-11-07 22:02:00", "status": "Pending", "gateway": "BETIXPAYNATIVE"},
+    {"illunise_order_id": "ILLUN-17940682845864", "betex_order_id": "ILLUN-17940682845864", "registration_number": MOBILE,
+     "amount": 10000.0, "order_time": "2026-11-07 21:48:00", "status": "Expired", "gateway": "BETIXPAYNATIVE"},
+    {"illunise_order_id": "ILLUN-17940682715864", "betex_order_id": "ILLUN-17940682715864", "registration_number": MOBILE,
+     "amount": 10000.0, "order_time": "2026-11-07 21:47:00", "status": "Expired", "gateway": "BETIXPAYNATIVE"},
+    {"illunise_order_id": "ILLUN-17940682565864", "betex_order_id": "ILLUN-17940682565864", "registration_number": MOBILE,
+     "amount": 10000.0, "order_time": "2026-11-07 21:47:00", "status": "Expired", "gateway": "BETIXPAYNATIVE"},
+    {"illunise_order_id": "ILLUN-17940682325864", "betex_order_id": "ILLUN-17940682325864", "registration_number": MOBILE,
+     "amount": 10000.0, "order_time": "2026-11-07 21:47:00", "status": "Expired", "gateway": "BETIXPAYNATIVE"},
+]  # fmt: skip
+
+
+def paid_live(fake_ai, utr="667778178327"):
+    fake_ai.screenshot = {
+        **fake_ai.screenshot,
+        "amount": {"value": 10000.0, "confidence": 0.97},
+        "payment_time": {"value": "2026-11-07 22:02:30", "confidence": 0.95},
+        "utr": {"value": utr, "confidence": 0.96},
+    }
+
+
+async def test_live_1107_only_the_order_created_with_the_payment_goes_out(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    """Five ₹10,000 Native orders inside the window - four from 21:47, one at 22:02 like the payment. Only the
+    22:02 one is the payment's order; the 21:47 ones were not created together with it."""
+    paid_live(fake_ai)
+    case_id, outcome = await run(db, order_search, LIVE_1107)
+    assert outcome == "ready"
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == ["ILLUN-17940691595864"]
+        assert await manager.post_case_to_betix(s, case_id, fake_poster) == "posted"
+    assert fake_poster.media == [("payment_screenshot", "ILLUN-17940691595864")]
+
+
+async def test_orders_created_together_still_go_out_together(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    paid_live(fake_ai)
+    together = [LIVE_1107[0], {**LIVE_1107[1], "order_time": "2026-11-07 22:00:00"}]  # 2 min apart
+    case_id, _ = await run(db, order_search, together)
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == ["ILLUN-17940691595864", "ILLUN-17940682845864"]
+
+
+async def test_the_order_holding_this_payments_utr_goes_alone(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    """The panel already shows the payment's bank reference on one order (Pending, not yet Success): that is the
+    order - the one created together with it is not sent."""
+    paid_live(fake_ai)
+    cands = [LIVE_1107[0], {**LIVE_1107[1], "order_time": "2026-11-07 22:01:00", "utr": "667778178327"}]
+    case_id, outcome = await run(db, order_search, cands)
+    assert outcome == "ready"
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == ["ILLUN-17940682845864"]
+
+
+async def test_an_order_success_under_another_utr_never_goes(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    paid_live(fake_ai)
+    cands = [
+        LIVE_1107[0],
+        {**LIVE_1107[1], "order_time": "2026-11-07 22:01:00", "status": "Success", "utr": "111111111111"},
+    ]
+    case_id, _ = await run(db, order_search, cands)
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == ["ILLUN-17940691595864"]
+
+
+async def test_the_live_order_once_success_with_this_utr_is_already_credited(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    """The panel as it looked later: the 22:02 order Success with UTR 667778178327 - nothing to send."""
+    paid_live(fake_ai)
+    cands = [{**LIVE_1107[0], "status": "Success", "utr": "667778178327"}, *LIVE_1107[1:]]
+    _, outcome = await run(db, order_search, cands)
+    assert outcome == "already_success" and fake_poster.media == []
