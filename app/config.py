@@ -239,6 +239,9 @@ class Settings(BaseSettings):
     # NATIVE: an order counts only when created within this many minutes before the payment - never the wider
     # Betix search window.
     native_window_minutes: int = 5
+    # NATIVE, optional and only when several orders are in question: the payee NAME in the order's creation JSON
+    # against the "Paid to" name on the screenshot. A match narrows the choice; no match decides nothing.
+    native_name_check: bool = True
     # Kept for compatibility with older configs; the before-payment window above is what is used.
     payment_time_window_minutes: int = 15
     # Order search narrowing: only orders created within this many minutes BEFORE the payment (and a couple

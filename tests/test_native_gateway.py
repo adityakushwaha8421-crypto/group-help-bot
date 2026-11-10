@@ -773,3 +773,109 @@ async def test_the_utr_on_the_order_beats_the_upi_check(db, fake_bot, fake_ai, o
     assert outcome == "ready" and fake_ai.ocr_calls == 0
     async with db.session_scope() as s:
         assert (await get_case(s, case_id)).native_order_ids == [LIVE_1107[0]["betex_order_id"]]
+
+
+# ---------------------------------------------------------------- the payee name (optional, Native only)
+SHOT_NAME = "CARTZUNO INNOVATIONS PRIVA..."  # as the Amazon Pay screenshot of 2026-11-07 prints it (cut off)
+ORDER_NAME = "Cartzuno Innovations Private Limited"
+
+
+def named(fake_ai, name=SHOT_NAME):
+    fake_ai.screenshot = {**fake_ai.screenshot, "receiver_name": {"value": name, "confidence": 0.9}}
+
+
+def test_the_payee_name_is_found_in_the_creation_response_json():
+    from app.admin.orders import payee_name_from_json, upi_from_json
+
+    link = {"data": {"qr": "upi://pay?pa=ci26102159-4@ypbiz&pn=CARTZUNO%20INNOVATIONS&am=10000.00&cu=INR"}}
+    assert payee_name_from_json(link) == "CARTZUNO INNOVATIONS" and upi_from_json(link) == SHOT_UPI
+    obj = {"customer": {"name": "Rohit Tiwari", "mobile": "9876543210"}, "payee": {"name": ORDER_NAME, "vpa": SHOT_UPI}}
+    assert payee_name_from_json(obj) == ORDER_NAME  # the name beside the UPI, never the customer's
+    assert payee_name_from_json({"upiId": SHOT_UPI, "payeeName": ORDER_NAME, "name": "Rohit"}) == ORDER_NAME
+    assert payee_name_from_json({"customerName": "Rohit Tiwari", "status": "created"}) is None
+
+
+def test_names_match_when_cut_off_or_written_with_another_company_form():
+    from app.telegram.upi_check import name_match
+
+    assert name_match(SHOT_NAME, ORDER_NAME)[0]
+    assert name_match("Cartzuno Innovations Pvt. Ltd.", ORDER_NAME)[0]
+    assert name_match("CARTZUNO INNOVATIONS", "cartzuno innovations private limited")[0]
+    assert not name_match("CARTZUNO INNOVATIONS", "Zentro Payments Private Limited")[0]
+    assert not name_match("CAR", ORDER_NAME)[0]  # too little to go on
+    assert not name_match(None, ORDER_NAME)[0] and not name_match(SHOT_NAME, "")[0]
+
+
+def test_the_view_page_payee_name_lands_on_the_candidate():
+    from app.admin.matcher import Candidate
+    from app.admin.orders import apply_view_fields
+
+    c = apply_view_fields(
+        Candidate("1", A), {"gateway.upi": SHOT_UPI, "gateway.upi_name": ORDER_NAME}, {}, "Asia/Kolkata"
+    )
+    assert c.upi_id == SHOT_UPI and c.payee_name == ORDER_NAME
+
+
+TWO_TOGETHER = [  # created together, no UPI shown by the panel: time alone cannot say which
+    {**NATIVE_ONE[0], "order_time": "2026-09-10 19:31:00", "payee_name": "Zentro Payments Private Limited"},
+    {**NATIVE_ONE[0], "betex_order_id": B, "illunise_order_id": "1003", "order_time": "2026-09-10 19:30:00",
+     "payee_name": ORDER_NAME},
+]  # fmt: skip
+
+
+async def test_the_payee_name_picks_the_order_when_several_are_in_question(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    paid(fake_ai, 6500.0)
+    named(fake_ai)
+    case_id, outcome = await run(db, order_search, TWO_TOGETHER)
+    assert outcome == "ready"
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == [B]  # paid to Cartzuno, although A is closer
+        row = (await s.execute(select(AuditLog).where(AuditLog.action == "GATEWAY_DETECTED"))).scalars().one()
+        assert row.details["name_check"] == "matched" and "the name on the screenshot" in row.details["why"]
+        assert await manager.post_case_to_betix(s, case_id, fake_poster) == "posted"
+    assert fake_poster.media == [("payment_screenshot", B)]
+
+
+async def test_no_name_fits_decides_nothing(db, fake_bot, fake_ai, order_search, no_download):
+    """Names are cut off and spelled freely: a name that fits no order throws no order out."""
+    paid(fake_ai, 6500.0)
+    named(fake_ai, "SOME OTHER SHOP")
+    case_id, outcome = await run(db, order_search, TWO_TOGETHER)
+    assert outcome == "ready"
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == [A, B]  # the time rule, as without a name
+        row = (await s.execute(select(AuditLog).where(AuditLog.action == "GATEWAY_DETECTED"))).scalars().one()
+        assert row.details["name_check"] == "no match"
+
+
+async def test_one_order_needs_no_name_check(db, fake_bot, fake_ai, order_search, no_download):
+    paid(fake_ai, 6500.0)
+    named(fake_ai, "SOME OTHER SHOP")
+    case_id, outcome = await run(db, order_search, [TWO_TOGETHER[0]])
+    assert outcome == "ready"
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == [A]
+        row = (await s.execute(select(AuditLog).where(AuditLog.action == "GATEWAY_DETECTED"))).scalars().one()
+        assert row.details["name_check"] == ""
+
+
+async def test_the_upi_decides_before_the_name(db, fake_bot, fake_ai, order_search, no_download):
+    paid(fake_ai, 6500.0)
+    named(fake_ai)
+    fake_ai.receiver_upi = SHOT_UPI
+    cands = [{**TWO_TOGETHER[0], "upi_id": SHOT_UPI}, {**TWO_TOGETHER[1], "upi_id": "ci26102159-9@ypbiz"}]
+    case_id, _ = await run(db, order_search, cands)
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == [A]  # A's UPI is the screenshot's; B has the name
+
+
+async def test_the_name_check_can_be_switched_off(db, fake_bot, fake_ai, order_search, no_download, monkeypatch):
+    monkeypatch.setenv("NATIVE_NAME_CHECK", "false")
+    reset_settings_cache()
+    paid(fake_ai, 6500.0)
+    named(fake_ai)
+    case_id, _ = await run(db, order_search, TWO_TOGETHER)
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == [A, B]

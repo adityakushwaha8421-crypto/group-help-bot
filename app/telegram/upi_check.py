@@ -79,3 +79,28 @@ def upi_ending_match(screenshot_upi: str | None, order_upi: str | None, *, min_c
         shown = f"{head}…{tail}" if head else tail
         return True, f"the order's UPI fits the visible part {shown}@{ha}"
     return False, f"visible part differs: {la}@{ha} on the screenshot, {lb}@{hb} on the order"
+
+
+COMPANY_WORDS = {"PVT", "PRIVATE", "LTD", "LIMITED", "LLP", "INC", "CO", "COMPANY", "OPC", "CORP", "CORPORATION"}
+
+
+def _name_words(value: str | None) -> list[str]:
+    """Upper-case words of a name, punctuation and the "..." of a cut-off line dropped, company suffixes removed."""
+    words = re.sub(r"[^A-Z0-9 ]+", " ", (value or "").upper()).split()
+    return [w for w in words if w not in COMPANY_WORDS]
+
+
+def name_match(screenshot_name: str | None, order_name: str | None, *, min_chars: int = 5) -> tuple[bool, str]:
+    """Is the payee name printed on the screenshot the order's payee name? Screens cut names short
+    ("CARTZUNO INNOVATIONS PRIVA...") and write the company form differently (Pvt Ltd / Private Limited), so: the
+    same words, or one name the beginning of the other (at least `min_chars` letters), company suffixes aside."""
+    a, b = _name_words(screenshot_name), _name_words(order_name)
+    if not a or not b:
+        return False, "no name to compare"
+    ja, jb = "".join(a), "".join(b)
+    short, long = (ja, jb) if len(ja) <= len(jb) else (jb, ja)
+    if ja == jb:
+        return True, "same name"
+    if len(short) >= min_chars and long.startswith(short):
+        return True, "one name is the beginning of the other"
+    return False, f"different names ({' '.join(a)} / {' '.join(b)})"

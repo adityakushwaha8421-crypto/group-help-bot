@@ -144,6 +144,9 @@ async def read_view_fields(browser: AdminBrowser, order_id: str) -> dict[str, st
         upi = upi_from_json(data)
         if upi:
             fields.setdefault("gateway.upi", upi)  # a Native order: the UPI the customer paid to (creation JSON)
+        name = payee_name_from_json(data)
+        if name:
+            fields.setdefault("gateway.upi_name", name)  # ... and whose UPI it is
     return fields
 
 
@@ -168,7 +171,67 @@ def upi_from_json(data) -> str | None:
             (keyed if re.search(r"upi|vpa|payee", key, re.I) else shaped).append(node.strip())
 
     walk(data)
-    return (keyed or shaped or [None])[0]
+    intent = _upi_intent(data)  # "upi://pay?pa=<upi>&pn=<name>...": the address in a payment link is the payee
+    return ([intent["pa"]] if intent.get("pa") and UPI_VALUE.match(intent["pa"]) else keyed or shaped or [None])[0]
+
+
+def _strings(node):
+    if isinstance(node, dict):
+        for v in node.values():
+            yield from _strings(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _strings(v)
+    elif isinstance(node, str):
+        yield node
+
+
+def _upi_intent(data) -> dict[str, str]:
+    """The parameters of the first UPI payment link ("upi://pay?pa=...&pn=...") found anywhere in the JSON."""
+    from urllib.parse import parse_qs, urlsplit
+
+    for text in _strings(data):
+        m = re.search(r"upi://pay\?[^\s\"'<>]+", text)
+        if m:
+            q = parse_qs(urlsplit(m.group(0)).query)
+            return {k: v[0].strip() for k, v in q.items() if v and v[0].strip()}
+    return {}
+
+
+PAYEE_NAME_KEY = re.compile(
+    r"payee.?name|upi.?name|vpa.?name|beneficiary.?name|bene.?name|account.?(holder|name)|holder.?name"
+    r"|merchant.?name|receiver.?name|^pn$",
+    re.I,
+)
+
+
+def payee_name_from_json(data) -> str | None:
+    """Whose UPI the Native order was paid to: the name in the creation-response JSON. From the payment link's
+    `pn`, else a key that names the payee / account holder / merchant, else a plain "name" sitting right next to
+    the UPI in the same object. Never the customer's own name fields."""
+    intent = _upi_intent(data)
+    if intent.get("pn"):
+        return intent["pn"]
+    keyed: list[str] = []
+    beside: list[str] = []
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            has_upi = any(isinstance(v, str) and UPI_VALUE.match(v.strip()) for v in node.values())
+            for k, v in node.items():
+                if isinstance(v, str) and v.strip() and not UPI_VALUE.match(v.strip()):
+                    if PAYEE_NAME_KEY.search(str(k)):
+                        keyed.append(v.strip())
+                    elif has_upi and str(k).lower() == "name":
+                        beside.append(v.strip())
+                else:
+                    walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(data)
+    return (keyed or beside or [None])[0]
 
 
 def apply_view_fields(cand: Candidate, fields: dict[str, str], view_map: dict[str, list[str]], tz: str) -> Candidate:
@@ -203,6 +266,7 @@ def apply_view_fields(cand: Candidate, fields: dict[str, str], view_map: dict[st
         cand.padded_amount = padded
     cand.utr = get("utr") or cand.utr
     cand.upi_id = fields.get("gateway.upi") or cand.upi_id
+    cand.payee_name = fields.get("gateway.upi_name") or cand.payee_name
     cand.status = get("status") or cand.status
     amt = normalize_amount(get("amount"))
     if amt is not None:

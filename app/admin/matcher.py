@@ -31,6 +31,8 @@ class Candidate:
     # different one proves nothing.
     gateway_ref: str | None = None
     upi_id: str | None = None
+    # NATIVE: who the order's UPI belongs to (the name in the creation-response JSON, next to the UPI)
+    payee_name: str | None = None
     payer_name: str | None = None
     gateway: str | None = None
     # Betix's own order id (platOrderNo), read from the "raw BetixPay response" JSON on the View page.

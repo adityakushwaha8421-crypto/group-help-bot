@@ -55,7 +55,7 @@ from app.telegram.notifications import (
     get_bot,
     notify_admin,
 )
-from app.telegram.upi_check import ocr_upi, parse_pi_answer, upi_ending_match
+from app.telegram.upi_check import name_match, ocr_upi, parse_pi_answer, upi_ending_match
 from app.utils.logging import get_logger
 from app.utils.timeutil import fmt_local, utcnow
 from app.workers.queue import enqueue
@@ -721,11 +721,12 @@ async def process_case(session: AsyncSession, case_id: str, *, force: bool = Fal
     # WHICH GATEWAY? The panel says: the orders created under the mobile just before the payment carry it.
     # Native orders there (gateway BETIXPAYNATIVE) make it a Native case - when the paid amount is a round figure
     # (how a Native order is paid), or when no Betix order answers for the payment. Otherwise the Betix flow below.
-    pick = native_candidates(first, case.amount) if native_enabled() else NativePick([])
+    shot_name = merged.receiver_name.value  # the "Paid to" name on the screenshot (Native name check)
+    pick = native_candidates(first, case.amount, screenshot_name=shot_name) if native_enabled() else NativePick([])
     if pick.orders and not pick.by_utr and any(sc.candidate.upi_id for sc in pick.orders):
         # The panel shows the Native orders' UPI (the creation JSON): the payee UPI on the screenshot decides
         shot_upi, how = await read_screenshot_upi(session, case)
-        pick = native_candidates(first, case.amount, screenshot_upi=shot_upi)
+        pick = native_candidates(first, case.amount, screenshot_upi=shot_upi, screenshot_name=shot_name)
         await audit(
             session,
             "NATIVE_UPI_CHECK",
@@ -1027,9 +1028,12 @@ class NativePick:
     upi_rejected: list = field(default_factory=list)  # fit by time and amount, but their UPI is not the screenshot's
     note: str = ""
     by_utr: bool = False  # the panel already holds the payment's UTR on the order: nothing else is asked
+    name_check: str = ""  # "" not run | matched | no match (never decisive on its own)
 
 
-def native_candidates(result: MatchResult, paid: float, screenshot_upi: str | None = None) -> NativePick:
+def native_candidates(
+    result: MatchResult, paid: float, screenshot_upi: str | None = None, screenshot_name: str | None = None
+) -> NativePick:
     """The Native order(s) that answer for this payment, closest to the payment first.
 
     Within NATIVE_WINDOW_MINUTES of the payment only. One order is THE order when the panel already holds this
@@ -1070,8 +1074,20 @@ def native_candidates(result: MatchResult, paid: float, screenshot_upi: str | No
             if matched:
                 return NativePick(matched, note=f"its UPI {matched[0].candidate.upi_id} is the one on the screenshot")
             return NativePick([], upi_rejected=with_upi, note=f"the screenshot shows {screenshot_upi}")
+    # Still more than one order in question and the UPI could not say which: the payee NAME may. The Native
+    # creation JSON names whose UPI the order was paid to; the screenshot prints who was paid. Orders paid to that
+    # name are kept - an aid only: when no name fits (names are cut off and spelled freely) nothing is thrown out.
+    name_check, note = "", ""
+    named = [sc for sc in fit if getattr(sc.candidate, "payee_name", None)]
+    if s.native_name_check and screenshot_name and len(fit) > 1 and named:
+        same_name = [sc for sc in named if name_match(screenshot_name, sc.candidate.payee_name)[0]]
+        name_check = "matched" if same_name else "no match"
+        if same_name:
+            fit = same_name
+            note = f"paid to {same_name[0].candidate.payee_name}, the name on the screenshot"
     closest = lead(fit[0])
-    return NativePick([sc for sc in fit if lead(sc) - closest <= s.native_same_time_minutes + 1e-9])
+    together = [sc for sc in fit if lead(sc) - closest <= s.native_same_time_minutes + 1e-9]
+    return NativePick(together, note=note, name_check=name_check)
 
 
 async def select_native_orders(
@@ -1099,6 +1115,7 @@ async def select_native_orders(
             "rounded_amount": rounded,
             "paid": case.amount,
             "why": pick.note,
+            "name_check": pick.name_check,
         },
     )
     reason = f"Native: {len(ids)} order(s) of ₹{rounded:,.0f} created under the mobile just before the payment ({when})"

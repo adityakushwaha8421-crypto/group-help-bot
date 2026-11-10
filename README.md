@@ -302,8 +302,10 @@ mobile just before the payment; **the order's gateway in the panel decides the g
   first. Which one: an order already carrying this payment's UTR goes alone; else, when the screenshot shows the
   payee UPI and the order's View page ("View full creation response JSON", Native orders only) shows the order's
   UPI, the order paid to that UPI goes and nothing goes when none was; else the order created closest to the
-  payment plus any created together with it (within `NATIVE_SAME_TIME_MINUTES`). An order Success under another
-  UTR never goes. Nothing else is needed (no statement,
+  payment plus any created together with it (within `NATIVE_SAME_TIME_MINUTES`). When several are still in
+  question, the payee name in the creation JSON against the "Paid to" name on the screenshot keeps the ones paid
+  to that name (`NATIVE_NAME_CHECK`; an aid only - no name fits, nothing is thrown out). An order Success under
+  another UTR never goes. Nothing else is needed (no statement,
   video or password), and there is no `/pi`, no amount note and no reminder. A member's "done" / "success" as a
   reply to that post confirms the case like a Betix member's would.
 
