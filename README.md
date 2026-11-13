@@ -301,7 +301,8 @@ mobile just before the payment; **the order's gateway in the panel decides the g
   before the payment, each as its own message - the screenshot with that single order id as caption, closest
   first. Which one: an order already carrying this payment's UTR goes alone; else, when the screenshot shows the
   payee UPI and the order's View page ("View full creation response JSON", Native orders only) shows the order's
-  UPI, the order paid to that UPI goes and nothing goes when none was; else the order created closest to the
+  UPI, the order paid to that UPI goes and nothing goes when none was (the screenshot is read by OCR, so a UPI
+  up to `UPI_OCR_MAX_EDITS` = 3 characters off still counts when none matches exactly); else the order created closest to the
   payment plus any created together with it (within `NATIVE_SAME_TIME_MINUTES`). When several are still in
   question, the payee name in the creation JSON against the "Paid to" name on the screenshot keeps the ones paid
   to that name (`NATIVE_NAME_CHECK`; an aid only - no name fits, nothing is thrown out). An order Success under
@@ -316,6 +317,18 @@ No order fits: manual review, nothing posted.
 Timing: with only the screenshot and the mobile in, the bot waits `FORCE_SEND_SECONDS` for the statement and
 video as always - but it reads the paid amount right away, and a round figure (a Native payment needs nothing
 more) is processed at once. Without `NATIVE_GROUP_CHAT_ID` every case is a Betix case.
+
+### The UTR comes first; a missing or misread UPI is no obstacle
+
+When several orders look alike the bot asks Betix about each (`/pi <ORDER-ID>`). The answer carries the order's
+UPI and the UTR Betix holds on it:
+
+- **Betix holds this payment's UTR on the order** -> that is the order, whatever the UPI reads.
+- **The screenshot prints no payee UPI** (a bank app's own receipt - Kotak, for one): the orders are still asked
+  about and the UTR decides. Only when there is neither a UPI nor a UTR on the screenshot is nothing asked.
+- **The payee UPI is read by OCR**: when no order's UPI fits letter for letter, one that is at most
+  `UPI_OCR_MAX_EDITS` (3) characters off is that UPI, misread. An exact fit always wins; the same tolerance
+  applies to the Native UPI check.
 
 ## Withdrawals
 

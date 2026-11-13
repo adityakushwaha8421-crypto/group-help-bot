@@ -202,6 +202,9 @@ async def test_followups_and_escalation(db, fake_bot, fake_ai, order_search, no_
 
 
 async def test_ambiguous_match_stops_and_alerts(db, fake_bot, fake_ai, order_search, no_download, fake_poster):
+    # Twin orders and NOTHING to tell them apart: no payee UPI on the screenshot and no UTR either. (With a UTR the
+    # orders are asked about with /pi and Betix's answer decides - tests/test_pi_utr.py.)
+    fake_ai.screenshot = {**fake_ai.screenshot, "utr": {"value": None, "confidence": 0.0}}
     twins = [dict(GOOD[0]), dict(GOOD[0])]
     twins[1]["betex_order_id"] = "ILLUN-178621243657291"
     twins[1]["illunise_order_id"] = "1003"

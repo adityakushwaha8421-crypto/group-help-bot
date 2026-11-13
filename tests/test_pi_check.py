@@ -218,10 +218,13 @@ def test_the_order_closest_to_the_payment_is_asked_first():
     assert manager.close_candidates(r)[0].candidate.betex_order_id == "HOLDS-UTR"
 
 
-async def test_unreadable_screenshot_upi_skips_pi_and_alerts(
+async def test_no_upi_and_no_utr_on_the_screenshot_skips_pi_and_alerts(
     db, fake_bot, fake_ai, order_search, no_download, fake_poster, setup
 ):
+    """Nothing to compare with at all - neither a payee UPI nor a UTR was read: no /pi noise, the operator is told.
+    (With a UTR the check runs all the same: tests/test_pi_utr.py.)"""
     fake_ai.receiver_upi = None
+    fake_ai.screenshot = {**fake_ai.screenshot, "utr": {"value": None, "confidence": 0.0}}
     case_id, outcome = await run_until_ready(db, order_search, TWINS)
     assert outcome == "ambiguous" and fake_poster.texts == []  # no /pi noise in the group
     assert any("UPI check not possible: no payee UPI printed on the screenshot" in t for _, t in fake_bot.sent)

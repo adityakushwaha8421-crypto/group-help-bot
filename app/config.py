@@ -242,6 +242,9 @@ class Settings(BaseSettings):
     # NATIVE, optional and only when several orders are in question: the payee NAME in the order's creation JSON
     # against the "Paid to" name on the screenshot. A match narrows the choice; no match decides nothing.
     native_name_check: bool = True
+    # The screenshot's payee UPI is read by OCR: up to this many characters off still count as the order's UPI - in
+    # the Native check and in the /pi check alike (an order whose UPI matches exactly is preferred). 0 = exact only.
+    upi_ocr_max_edits: int = 3
     # Kept for compatibility with older configs; the before-payment window above is what is used.
     payment_time_window_minutes: int = 15
     # Order search narrowing: only orders created within this many minutes BEFORE the payment (and a couple

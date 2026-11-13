@@ -25,6 +25,15 @@ def parse_pi_answer(text: str | None) -> tuple[str | None, str | None]:
     return (om.group(1).upper() if om else None), (um.group(1).strip() if um else None)
 
 
+PI_UTR = re.compile(r"UTR\s*:\s*([A-Za-z0-9]{6,})", re.I)
+
+
+def parse_pi_utr(text: str | None) -> str | None:
+    """The UTR the Betix bot shows on the order in its `/pi` answer ("🧾UTR: 611532946151"); None for "UTR: NA"."""
+    m = PI_UTR.search(text or "")
+    return m.group(1) if m else None
+
+
 UPI_SHAPE = re.compile(r"^[A-Za-z0-9.\-_*•·]+@[A-Za-z][A-Za-z0-9.]*$")
 
 
@@ -104,3 +113,35 @@ def name_match(screenshot_name: str | None, order_name: str | None, *, min_chars
     if len(short) >= min_chars and long.startswith(short):
         return True, "one name is the beginning of the other"
     return False, f"different names ({' '.join(a)} / {' '.join(b)})"
+
+
+def _edit_distance(a: str, b: str) -> int:
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def upi_reading_slip(
+    screenshot_upi: str | None, order_upi: str | None, *, max_edits: int = 3, min_length: int = 10
+) -> tuple[bool, str]:
+    """The SAME UPI, read off the screenshot with a slip of up to `max_edits` characters (a letter misread, dropped
+    or added - anywhere, name or bank handle). The screenshot is read by OCR and real payments went to Manual
+    Review over one letter - live 2026-11-13: SK26101181@nsdlpbbpay read for SK26101181@nsdlpbpay,
+    ci26102159-4@yblz for ci26102159-4@ypbiz. The screenshot's UPI must be printed in full (a masked one is the
+    ending check's business) and the UPI long enough that three characters are a slip, not another UPI."""
+    a, b = _split(screenshot_upi), _split(order_upi)
+    if a is None or b is None:
+        return False, "no UPI to compare"
+    if ANY_MASK.search(a[0]):
+        return False, "the screenshot's UPI is masked"
+    full_a, full_b = f"{a[0]}@{a[1]}", f"{b[0]}@{b[1]}"
+    if len(full_b) < min_length:
+        return False, "the UPI is too short to allow for a reading slip"
+    edits = _edit_distance(full_a, full_b)
+    if 0 < edits <= max_edits:
+        return True, f"{edits} character(s) differ between {full_a} on the screenshot and {full_b} on the order"
+    return False, f"different UPI ({full_a} on the screenshot, {full_b} on the order)"

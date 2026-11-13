@@ -692,7 +692,7 @@ async def test_the_order_paid_to_the_screenshots_upi_is_the_one(
     paid(fake_ai, 6500.0)
     fake_ai.receiver_upi = SHOT_UPI
     cands = [
-        {**NATIVE_ONE[0], "order_time": "2026-09-10 19:31:00", "upi_id": "ci26102159-9@ypbiz"},
+        {**NATIVE_ONE[0], "order_time": "2026-09-10 19:31:00", "upi_id": "merchant-77@okhdfc"},
         {**NATIVE_ONE[0], "betex_order_id": B, "illunise_order_id": "1003", "order_time": "2026-09-10 19:30:00",
          "upi_id": SHOT_UPI},
     ]  # fmt: skip
@@ -712,7 +712,7 @@ async def test_a_masked_screenshot_upi_still_picks_the_order(db, fake_bot, fake_
     paid(fake_ai, 6500.0)
     fake_ai.receiver_upi = "••••2159-4@ypbiz"
     cands = [
-        {**NATIVE_ONE[0], "order_time": "2026-09-10 19:31:00", "upi_id": "ci26102159-9@ypbiz"},
+        {**NATIVE_ONE[0], "order_time": "2026-09-10 19:31:00", "upi_id": "merchant-77@okhdfc"},
         {**NATIVE_ONE[0], "betex_order_id": B, "illunise_order_id": "1003", "upi_id": SHOT_UPI},
     ]  # fmt: skip
     case_id, outcome = await run(db, order_search, cands)
@@ -726,11 +726,11 @@ async def test_no_native_order_paid_to_the_screenshots_upi_is_manual_review(
 ):
     paid(fake_ai, 6500.0)
     fake_ai.receiver_upi = SHOT_UPI
-    cands = [{**NATIVE_ONE[0], "upi_id": "ci26102159-9@ypbiz"}]
+    cands = [{**NATIVE_ONE[0], "upi_id": "merchant-77@okhdfc"}]
     case_id, outcome = await run(db, order_search, cands)
     assert outcome == "escalated" and fake_poster.media == []
     alert = [t for _, t in fake_bot.sent if "MANUAL REVIEW" in t][-1]
-    assert "none was paid to the UPI on the screenshot" in alert and SHOT_UPI in alert and "ci26102159-9@ypbiz" in alert
+    assert "none was paid to the UPI on the screenshot" in alert and SHOT_UPI in alert and "merchant-77@okhdfc" in alert
     async with db.session_scope() as s:
         c = await get_case(s, case_id)
         assert c.status == CaseStatus.ESCALATED.value and c.gateway_choice is None
@@ -752,7 +752,7 @@ async def test_a_screenshot_without_a_readable_upi_falls_back_to_the_time_rule(
 ):
     paid(fake_ai, 6500.0)
     fake_ai.receiver_upi = None
-    cands = [{**NATIVE_ONE[0], "upi_id": "ci26102159-9@ypbiz"}]
+    cands = [{**NATIVE_ONE[0], "upi_id": "merchant-77@okhdfc"}]
     case_id, outcome = await run(db, order_search, cands)
     assert outcome == "ready"
     async with db.session_scope() as s:
@@ -766,7 +766,7 @@ async def test_the_utr_on_the_order_beats_the_upi_check(db, fake_bot, fake_ai, o
     paid_live(fake_ai)
     fake_ai.receiver_upi = SHOT_UPI
     cands = [
-        {**LIVE_1107[0], "upi_id": "ci26102159-9@ypbiz", "utr": "667778178327"},
+        {**LIVE_1107[0], "upi_id": "merchant-77@okhdfc", "utr": "667778178327"},
         {**LIVE_1107[1], "order_time": "2026-11-07 22:01:00", "upi_id": SHOT_UPI},
     ]
     case_id, outcome = await run(db, order_search, cands)
@@ -865,7 +865,7 @@ async def test_the_upi_decides_before_the_name(db, fake_bot, fake_ai, order_sear
     paid(fake_ai, 6500.0)
     named(fake_ai)
     fake_ai.receiver_upi = SHOT_UPI
-    cands = [{**TWO_TOGETHER[0], "upi_id": SHOT_UPI}, {**TWO_TOGETHER[1], "upi_id": "ci26102159-9@ypbiz"}]
+    cands = [{**TWO_TOGETHER[0], "upi_id": SHOT_UPI}, {**TWO_TOGETHER[1], "upi_id": "merchant-77@okhdfc"}]
     case_id, _ = await run(db, order_search, cands)
     async with db.session_scope() as s:
         assert (await get_case(s, case_id)).native_order_ids == [A]  # A's UPI is the screenshot's; B has the name
@@ -879,3 +879,98 @@ async def test_the_name_check_can_be_switched_off(db, fake_bot, fake_ai, order_s
     case_id, _ = await run(db, order_search, TWO_TOGETHER)
     async with db.session_scope() as s:
         assert (await get_case(s, case_id)).native_order_ids == [A, B]
+
+
+# ---------------------------------------------------------------- the screenshot's UPI is read by OCR
+def test_up_to_three_characters_off_is_still_the_same_upi():
+    from app.telegram.upi_check import upi_reading_slip
+
+    assert upi_reading_slip("SK26101181@nsdlpbbpay", "SK26101181@nsdlpbpay")[0]  # live 2026-11-13: 1 letter doubled
+    assert upi_reading_slip("OS26091170@nsdlpbbpay", "OS26091170@nsdlpbpay")[0]
+    assert upi_reading_slip("ci26102159-4@yblz", "ci26102159-4@ypbiz")[0]  # live 2026-11-13: 2 in the handle
+    assert upi_reading_slip("ci26l02l59-4@ypbiz", "ci26102159-4@ypbiz")[0]  # 1 read as l, twice: in the name
+    assert upi_reading_slip("ci26l02l59-4@ypbz", "ci26102159-4@ypbiz")[0]  # 3 in all
+    assert not upi_reading_slip("ci26l02l59-4@yblz", "ci26102159-4@ypbiz")[0]  # 4: no longer a slip
+    assert not upi_reading_slip("ci26102159-4@okaxis", "ci26102159-4@ypbiz")[0]  # another bank altogether
+    assert not upi_reading_slip("OS26091170@nsdlpbbpay", "ci26102159-4@ypbiz")[0]  # another UPI altogether
+    assert not upi_reading_slip("a1@ibl", "a1@ybl")[0]  # too short a UPI to allow for slips
+    assert not upi_reading_slip("••••2159-4@yblz", "ci26102159-4@ypbiz")[0]  # masked: the ending check's business
+    assert not upi_reading_slip(None, "ci26102159-4@ypbiz")[0]
+    assert not upi_reading_slip("ci26102159-4@ypbiz", "ci26102159-4@ypbiz")[0]  # identical is not a "slip"
+
+
+def live_1113(fake_ai, amount, when, upi):
+    fake_ai.screenshot = {
+        **fake_ai.screenshot,
+        "amount": {"value": amount, "confidence": 0.97},
+        "payment_time": {"value": when, "confidence": 0.95},
+    }
+    fake_ai.receiver_upi = upi
+
+
+async def test_live_1113_case_44_one_letter_misread_no_longer_stops_the_payment(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    """CASE-20261113-000044: ₹5,000 paid 15:48, ONE order created 15:48 with UPI SK26101181@nsdlpbpay; the
+    screenshot was read as SK26101181@nsdlpbbpay (a doubled b) and the case went to Manual Review."""
+    live_1113(fake_ai, 5000.0, "2026-11-13 15:48:30", "SK26101181@nsdlpbbpay")
+    order = {**NATIVE_ONE[0], "amount": 5000.0, "order_time": "2026-11-13 15:48:00", "upi_id": "SK26101181@nsdlpbpay"}
+    case_id, outcome = await run(db, order_search, [order])
+    assert outcome == "ready" and not any("MANUAL REVIEW" in t for _, t in fake_bot.sent)
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == [A]
+        row = (await s.execute(select(AuditLog).where(AuditLog.action == "GATEWAY_DETECTED"))).scalars().one()
+        assert "a reading slip" in row.details["why"]
+        assert await manager.post_case_to_betix(s, case_id, fake_poster) == "posted"
+    assert fake_poster.media == [("payment_screenshot", A)]
+
+
+async def test_live_1113_case_47_the_misread_upi_still_picks_its_own_order(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    """CASE-20261113-000047: ₹2,500 paid 16:32; two orders - 16:32 with UPI ci26102159-4@ypbiz and 16:31 with
+    OS26091170@nsdlpbpay. The screenshot reads OS26091170@nsdlpbbpay: the 16:31 order, alone - not the closer one."""
+    live_1113(fake_ai, 2500.0, "2026-11-13 16:32:40", "OS26091170@nsdlpbbpay")
+    cands = [
+        {**NATIVE_ONE[0], "amount": 2500.0, "order_time": "2026-11-13 16:32:00", "upi_id": "ci26102159-4@ypbiz"},
+        {**NATIVE_ONE[0], "betex_order_id": B, "illunise_order_id": "1003", "amount": 2500.0,
+         "order_time": "2026-11-13 16:31:00", "upi_id": "OS26091170@nsdlpbpay"},
+    ]  # fmt: skip
+    case_id, outcome = await run(db, order_search, cands)
+    assert outcome == "ready" and not any("MANUAL REVIEW" in t for _, t in fake_bot.sent)
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == [B]
+        assert await manager.post_case_to_betix(s, case_id, fake_poster) == "posted"
+    assert fake_poster.media == [("payment_screenshot", B)]
+
+
+async def test_an_exact_upi_beats_one_that_is_a_character_off(db, fake_bot, fake_ai, order_search, no_download):
+    """Two orders, UPIs one character apart; the screenshot shows B's exactly: B, not both."""
+    paid(fake_ai, 6500.0)
+    fake_ai.receiver_upi = SHOT_UPI
+    cands = [
+        {**NATIVE_ONE[0], "order_time": "2026-09-10 19:31:00", "upi_id": "ci26102159-9@ypbiz"},
+        {**NATIVE_ONE[0], "betex_order_id": B, "illunise_order_id": "1003", "order_time": "2026-09-10 19:30:00",
+         "upi_id": SHOT_UPI},
+    ]  # fmt: skip
+    case_id, _ = await run(db, order_search, cands)
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == [B]
+
+
+async def test_a_really_different_upi_is_still_manual_review(db, fake_bot, fake_ai, order_search, no_download):
+    """Four characters off, or another UPI altogether: not a reading slip - nothing is sent."""
+    paid(fake_ai, 6500.0)
+    fake_ai.receiver_upi = "ci26l02l59-4@yblz"  # 4 characters from ci26102159-4@ypbiz
+    _, outcome = await run(db, order_search, [{**NATIVE_ONE[0], "upi_id": SHOT_UPI}])
+    assert outcome == "escalated"
+    assert "none was paid to the UPI on the screenshot" in [t for _, t in fake_bot.sent if "MANUAL REVIEW" in t][-1]
+
+
+async def test_the_tolerance_can_be_switched_off(db, fake_bot, fake_ai, order_search, no_download, monkeypatch):
+    monkeypatch.setenv("UPI_OCR_MAX_EDITS", "0")
+    reset_settings_cache()
+    live_1113(fake_ai, 5000.0, "2026-11-13 15:48:30", "SK26101181@nsdlpbbpay")
+    order = {**NATIVE_ONE[0], "amount": 5000.0, "order_time": "2026-11-13 15:48:00", "upi_id": "SK26101181@nsdlpbpay"}
+    _, outcome = await run(db, order_search, [order])
+    assert outcome == "escalated"

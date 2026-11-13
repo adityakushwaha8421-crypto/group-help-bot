@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin.browser import AdminError, LayoutChanged, LoginFailed, ManualAuthRequired
 from app.admin.matcher import Candidate, MatchResult, match_orders
-from app.ai.extractor import Extraction, Field, extract_from_text
+from app.ai.extractor import Extraction, Field, extract_from_text, normalize_utr
 from app.cases.correlation import hard_missing, merge_case_extraction, missing_items
 from app.cases.gateway import is_native, is_native_gateway, is_round, native_enabled
 from app.cases.state_machine import transition
@@ -55,7 +55,14 @@ from app.telegram.notifications import (
     get_bot,
     notify_admin,
 )
-from app.telegram.upi_check import name_match, ocr_upi, parse_pi_answer, upi_ending_match
+from app.telegram.upi_check import (
+    name_match,
+    ocr_upi,
+    parse_pi_answer,
+    parse_pi_utr,
+    upi_ending_match,
+    upi_reading_slip,
+)
 from app.utils.logging import get_logger
 from app.utils.timeutil import fmt_local, utcnow
 from app.workers.queue import enqueue
@@ -1073,6 +1080,20 @@ def native_candidates(
             ]
             if matched:
                 return NativePick(matched, note=f"its UPI {matched[0].candidate.upi_id} is the one on the screenshot")
+            # No order's UPI is the screenshot's letter for letter. The screenshot is read by OCR: an order whose
+            # UPI is only a character or three off (UPI_OCR_MAX_EDITS) is that UPI, misread.
+            slips = [
+                sc
+                for sc in with_upi
+                if s.upi_ocr_max_edits > 0
+                and upi_reading_slip(screenshot_upi, sc.candidate.upi_id, max_edits=s.upi_ocr_max_edits)[0]
+            ]
+            if slips:
+                return NativePick(
+                    slips,
+                    note=f"its UPI {slips[0].candidate.upi_id} is the one on the screenshot "
+                    f"(read as {screenshot_upi}: a reading slip)",
+                )
             return NativePick([], upi_rejected=with_upi, note=f"the screenshot shows {screenshot_upi}")
     # Still more than one order in question and the UPI could not say which: the payee NAME may. The Native
     # creation JSON names whose UPI the order was paid to; the screenshot prints who was paid. Orders paid to that
@@ -1326,8 +1347,10 @@ async def _ask_pi(session: AsyncSession, case: Case, order_id: str) -> None:
 async def start_pi_check(session: AsyncSession, case: Case, close: list, why: str) -> tuple[bool, str]:
     """Begin the one-by-one /pi check with the best candidate. Returns (started, note-for-the-alert)."""
     shot, how = await read_screenshot_upi(session, case)
-    if shot is None:
+    if shot is None and not case.utr:
         return False, f"UPI check not possible: {how}."
+    # No payee UPI on the screenshot (a bank app's receipt - Kotak, for one - prints none): the check still runs.
+    # The Betix bot's answer carries the UTR it holds on each order, and this payment's UTR decides.
     order_ids = [sc.candidate.betex_order_id for sc in close]
     case.pi_check_orders = order_ids
     await transition(session, case, CaseStatus.CHECKING_ORDER_UPI, reason=f"{why}; checking each order's UPI (/pi)")
@@ -1336,7 +1359,12 @@ async def start_pi_check(session: AsyncSession, case: Case, close: list, why: st
         "PI_CHECK_STARTED",
         case_id=case.case_id,
         result=order_ids[0],
-        details={"orders_in_order": order_ids, "screenshot_upi": shot},
+        details={
+            "orders_in_order": order_ids,
+            "screenshot_upi": shot,
+            "utr": case.utr,
+            "by": "upi+utr" if shot else "utr",
+        },
     )
     try:
         await _ask_pi(session, case, order_ids[0])
@@ -1413,6 +1441,42 @@ async def cleanup_pi_messages(session: AsyncSession, case: Case, order_id: str) 
     return {"deleted": deleted, "failed": failed}
 
 
+async def pi_answer_utrs(session: AsyncSession, case: Case) -> dict[str, str | None]:
+    """{order id: the UTR the Betix bot shows on that order in its /pi answer} - None when it shows none ("NA")."""
+    s = get_settings()
+    msgs = await list_case_betix_messages(session, case.case_id)
+    asked: dict[int, str] = {}
+    for m in msgs:
+        if m.direction == "out" and m.kind == "pi_query":
+            found = s.betex_order_id_pattern.search(m.text or "")
+            if found:
+                asked[m.message_id] = found.group(0).upper()
+    out: dict[str, str | None] = {}
+    for m in msgs:
+        if m.direction == "in" and m.reply_to_message_id in asked and m.sender_is_bot:
+            oid, _ = parse_pi_answer(m.text)
+            out[oid or asked[m.reply_to_message_id]] = parse_pi_utr(m.text)
+    return out
+
+
+def judge_pi_answer(
+    case: Case, shot: str | None, order_upi: str | None, order_utr: str | None
+) -> tuple[bool, str, str]:
+    """Is the order the Betix bot just described this payment's order? (ok, why, by).
+
+    The UTR first: Betix holding THIS payment's UTR on the order settles it, whatever the UPI reads and even when
+    the screenshot prints no UPI at all. Otherwise the payee UPI on the screenshot against the order's UPI. (A UPI
+    that is only a few characters off is not accepted here: it waits until every order has been asked, so an order
+    that fits exactly can still win - see resolve_pi_check.)"""
+    mine, theirs = normalize_utr(case.utr), normalize_utr(order_utr)
+    if mine and theirs and mine == theirs:
+        return True, f"Betix holds this payment's UTR {case.utr} on the order", "utr"
+    if shot is None:
+        return False, "no payee UPI on the screenshot, and Betix does not hold this payment's UTR on the order", ""
+    ok, why = upi_ending_match(shot, order_upi, min_chars=get_settings().upi_ending_min_chars)
+    return ok, why, "upi" if ok else ""
+
+
 async def resolve_pi_check(session: AsyncSession, case_id: str, *, timed_out: str | None = None) -> str:
     """Advance the one-by-one /pi check.
 
@@ -1428,6 +1492,7 @@ async def resolve_pi_check(session: AsyncSession, case_id: str, *, timed_out: st
     asked, answers = await pi_answers(session, case)
     if not asked:
         return "waiting"
+    utrs = await pi_answer_utrs(session, case)
     current = asked[-1]
     shot, _ = await read_screenshot_upi(session, case)
 
@@ -1442,8 +1507,8 @@ async def resolve_pi_check(session: AsyncSession, case_id: str, *, timed_out: st
             )
             if oid in answers:
                 out.append(
-                    f"- {oid}{when}: Order's UPI {answers[oid] or '-'} - "
-                    f"{upi_ending_match(shot, answers[oid], min_chars=s.upi_ending_min_chars)[1]}"
+                    f"- {oid}{when}: Order's UPI {answers[oid] or '-'} · UTR at Betix {utrs.get(oid) or 'NA'} - "
+                    f"{judge_pi_answer(case, shot, answers[oid], utrs.get(oid))[1]}"
                 )
             else:
                 out.append(f"- {oid}{when}: (no answer from Betix)")
@@ -1455,57 +1520,80 @@ async def resolve_pi_check(session: AsyncSession, case_id: str, *, timed_out: st
             return "waiting" if timed_out is None else "stale"
         # No answer for THIS order: that is not a reason to give up on the others. Move on to the next candidate;
         # manual review only when every one of them has been asked.
-        ok, why = False, "no answer from Betix"
+        ok, why, by = False, "no answer from Betix", ""
         await audit(session, "PI_CHECK_RESULT", case_id=case.case_id, result=f"{current}: no answer")
     elif timed_out is not None:
         return "stale"  # that order was answered in time; the answer already moved the check on
     else:
-        ok, why = upi_ending_match(shot, answers[current], min_chars=s.upi_ending_min_chars)
+        ok, why, by = judge_pi_answer(case, shot, answers[current], utrs.get(current))
         await audit(
             session,
             "PI_CHECK_RESULT",
             case_id=case.case_id,
             result=f"{current}: {'match' if ok else 'no match'}",
-            details={"order": current, "order_upi": answers[current], "screenshot_upi": shot, "why": why},
+            details={
+                "order": current,
+                "order_upi": answers[current],
+                "order_utr": utrs.get(current),
+                "screenshot_upi": shot,
+                "utr": case.utr,
+                "by": by,
+                "why": why,
+            },
         )
     if s.pi_cleanup == "each":
         await cleanup_pi_messages(session, case, current)  # this order's check is finished: tidy its /pi exchange
+
+    async def accept(order: str, why: str, by: str) -> str | None:
+        """`order` is the payment's order: record it and move on to posting. None when its row is gone."""
+        row = await latest_candidate(session, case.case_id, order)
+        if row is None:
+            return None
+        if by == "utr":
+            reason = f"UTR check (/pi): Betix holds this payment's UTR {case.utr} on {order}"
+            proof = f"🧾 UTR: {case.utr} is the one Betix holds on this order."
+        else:
+            reason = f"UPI check (/pi): {order}'s UPI {answers[order]} fits the screenshot UPI {shot}"
+            proof = f"🏦 UPI: {answers[order]} fits the screenshot."
+            if by == "upi_slip":
+                reason += f" ({why})"
+        if s.pi_cleanup != "each":
+            await cleanup_pi_messages(session, case, order)  # the order is confirmed: remove the /pi exchange
+        session.add(
+            OrderMatch(
+                case_id=case.case_id,
+                candidate_id=row.id,
+                decision="MATCHED_BY_UTR" if by == "utr" else "MATCHED_BY_UPI",
+                confidence=row.score,
+                illunise_order_id=row.illunise_order_id,
+                betex_order_id=row.betex_order_id,
+                details={"reason": reason, "checked": asked},
+            )
+        )
+        paid, ordered = case.amount, row.amount
+        if paid is not None and ordered is not None and abs(paid - ordered) > s.order_amount_tolerance:
+            # the customer paid another amount than the order's: matched all the same, and the operator is told
+            reason += f"; order amount ₹{ordered:,.2f}, paid ₹{paid:,.2f}"
+            await notify_admin(
+                session,
+                kind="amount_differs",
+                case=case,
+                dedupe_suffix=order,
+                text=format_info(
+                    case,
+                    "Order matched by UPI \u2014 amount differs",
+                    f"🧾 Order: {order}\n💵 Order amount: ₹{ordered:,.2f}\n💰 Paid: ₹{paid:,.2f}\n"
+                    f"{proof}\nSent to Betix with this order id.",
+                ),
+            )
+        return await select_order(
+            session, case, row, reason=reason, confidence=row.score, signals={"pi_checked": asked, "why": why}
+        )
+
     if ok:
-        row = await latest_candidate(session, case.case_id, current)
-        if row is not None:
-            reason = f"UPI check (/pi): {current}'s UPI {answers[current]} fits the screenshot UPI {shot}"
-            if s.pi_cleanup != "each":
-                await cleanup_pi_messages(session, case, current)  # the order is confirmed: remove the /pi exchange
-            session.add(
-                OrderMatch(
-                    case_id=case.case_id,
-                    candidate_id=row.id,
-                    decision="MATCHED_BY_UPI",
-                    confidence=row.score,
-                    illunise_order_id=row.illunise_order_id,
-                    betex_order_id=row.betex_order_id,
-                    details={"reason": reason, "checked": asked},
-                )
-            )
-            paid, ordered = case.amount, row.amount
-            if paid is not None and ordered is not None and abs(paid - ordered) > s.order_amount_tolerance:
-                # the customer paid another amount than the order's: matched by UPI, and the operator is told
-                reason += f"; order amount ₹{ordered:,.2f}, paid ₹{paid:,.2f}"
-                await notify_admin(
-                    session,
-                    kind="amount_differs",
-                    case=case,
-                    dedupe_suffix=current,
-                    text=format_info(
-                        case,
-                        "Order matched by UPI \u2014 amount differs",
-                        f"🧾 Order: {current}\n💵 Order amount: ₹{ordered:,.2f}\n💰 Paid: ₹{paid:,.2f}\n"
-                        f"🏦 UPI: {answers[current]} fits the screenshot.\nSent to Betix with this order id.",
-                    ),
-                )
-            return await select_order(
-                session, case, row, reason=reason, confidence=row.score, signals={"pi_checked": asked, "why": why}
-            )
+        done = await accept(current, why, by)
+        if done is not None:
+            return done
     remaining = [oid for oid in (case.pi_check_orders or []) if oid not in asked]
     if remaining:
         try:
@@ -1515,8 +1603,31 @@ async def resolve_pi_check(session: AsyncSession, case_id: str, *, timed_out: st
             log.exception("pi query failed", case_id=case.case_id)
             reason = f"Several close orders; could not send /pi for {remaining[0]}: {str(exc)[:80]}"
     else:
+        # Every order has been asked and none fits letter for letter. The screenshot's UPI is read by OCR: an order
+        # whose UPI is only a character or three off (UPI_OCR_MAX_EDITS) is that UPI, misread - the closest such
+        # order is the payment's.
+        if shot and s.upi_ocr_max_edits > 0:
+            for oid in asked:
+                if answers.get(oid):
+                    slipped, slip_why = upi_reading_slip(shot, answers[oid], max_edits=s.upi_ocr_max_edits)
+                    if slipped:
+                        await audit(
+                            session,
+                            "PI_CHECK_RESULT",
+                            case_id=case.case_id,
+                            result=f"{oid}: match (reading slip)",
+                            details={"order": oid, "order_upi": answers[oid], "screenshot_upi": shot, "why": slip_why},
+                        )
+                        done = await accept(oid, slip_why, "upi_slip")
+                        if done is not None:
+                            return done
         silent = [oid for oid in asked if oid not in answers]
-        reason = f"UPI check (/pi): all {len(asked)} close order(s) checked, none fits the screenshot UPI" + (
+        what = (
+            "none fits the screenshot UPI"
+            if shot
+            else ("the screenshot shows no payee UPI and Betix holds this payment's UTR on none of them")
+        )
+        reason = f"UPI check (/pi): all {len(asked)} close order(s) checked, {what}" + (
             f" ({len(silent)} got no answer from Betix)" if silent else ""
         )
     await transition(session, case, CaseStatus.ORDER_MATCH_AMBIGUOUS, reason=reason)
@@ -1524,7 +1635,9 @@ async def resolve_pi_check(session: AsyncSession, case_id: str, *, timed_out: st
         session,
         case,
         reason,
-        f"Screenshot UPI (OCR): {shot or '-'}\n" + "\n".join(checked_lines()) + "\nCheck them in the Illunise panel.",
+        f"Screenshot UPI (OCR): {shot or '-'} · UTR: {case.utr or '-'}\n"
+        + "\n".join(checked_lines())
+        + "\nCheck them in the Illunise panel.",
     )
     return "ambiguous"
 
