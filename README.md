@@ -328,7 +328,10 @@ UPI and the UTR Betix holds on it:
   about and the UTR decides. Only when there is neither a UPI nor a UTR on the screenshot is nothing asked.
 - **The payee UPI is read by OCR**: when no order's UPI fits letter for letter, one that is at most
   `UPI_OCR_MAX_EDITS` (3) characters off is that UPI, misread. An exact fit always wins; the same tolerance
-  applies to the Native UPI check.
+  applies to the Native UPI check. A UPI printed shortened or masked ("••••82-3@ypbiz") and read with a slip
+  ("82-3@yphbiz") counts too: the visible ending must be the order's, the slips stay within the same limit.
+- **Native: the name verifies when the UPI cannot.** No order's UPI can be matched, but the screenshot's "Paid to"
+  name is an order's payee name (creation JSON): that order is the payment's. Neither fits: manual review.
 
 ## Withdrawals
 

@@ -121,3 +121,17 @@ async def test_four_characters_off_is_another_upi(db, fake_bot, fake_ai, order_s
     r = await answer(db, 901, pi_answer(second, "rahul-7788@ptyes"), q)
     assert r["action"] == "pi_ambiguous"
     assert any("none fits the screenshot UPI" in t for _, t in fake_bot.sent)
+
+
+async def test_a_shortened_upi_read_with_a_slip_is_accepted_when_nothing_fits_exactly(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, setup
+):
+    """The screenshot prints the UPI shortened and the handle was misread: "5011@ptyez" for shoriful-5011@ptyes."""
+    fake_ai.receiver_upi = "5011@ptyez"
+    case_id, _ = await run_until_ready(db, order_search, TWINS)
+    first, q = await asked_now(db, case_id, fake_poster)
+    await answer(db, 900, pi_answer(first, "rahul-7788@ptyes"), q)
+    second, q = await asked_now(db, case_id, fake_poster)
+    r = await answer(db, 901, pi_answer(second, "shoriful-5011@ptyes"), q)
+    assert r["action"] == "pi_ready"
+    assert await chosen(db, case_id) == (CaseStatus.READY_FOR_BETIX.value, second)

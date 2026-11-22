@@ -974,3 +974,75 @@ async def test_the_tolerance_can_be_switched_off(db, fake_bot, fake_ai, order_se
     order = {**NATIVE_ONE[0], "amount": 5000.0, "order_time": "2026-11-13 15:48:00", "upi_id": "SK26101181@nsdlpbpay"}
     _, outcome = await run(db, order_search, [order])
     assert outcome == "escalated"
+
+
+# ---------------------------------------------------------------- a shortened UPI read with a slip; the name verifies
+def test_a_shortened_upi_read_with_a_slip_is_still_that_upi():
+    from app.telegram.upi_check import upi_ending_match, upi_near_match, upi_shortened_slip
+
+    order = "zc26112382-3@ypbiz"
+    assert upi_shortened_slip("82-3@yphbiz", order)[0]  # live 2026-11-22: the mask dropped, a letter too many
+    assert upi_shortened_slip("••••82-3@yphbiz", order)[0]  # the mask kept, the handle misread
+    assert upi_shortened_slip("••••82-3@ypbz", order)[0]
+    assert upi_near_match("82-3@yphbiz", order)[0]
+    assert not upi_near_match("82-3@yphbiz", "EXOLAVARIO.mdpy@rbl")[0]  # the other order of that case
+    assert not upi_shortened_slip("82-3@ypbiz", order)[0] and upi_ending_match("82-3@ypbiz", order)[0]  # exact
+    assert not upi_shortened_slip("3@yphbiz", order)[0]  # one character proves nothing
+    assert not upi_shortened_slip("99-9@yphbiz", order)[0]  # another ending
+    assert not upi_shortened_slip("82-3@okaxis", order)[0]  # another bank altogether
+    assert not upi_shortened_slip(None, order)[0]
+
+
+LIVE_1122 = [  # CASE-20261122-000036: ₹5,000 paid 10:28 to ZYMARA COMMERCE PRIVATE LIMITED, ••••82-3@ypbiz
+    {**NATIVE_ONE[0], "amount": 5000.0, "order_time": "2026-11-22 10:28:00", "upi_id": "zc26112382-3@ypbiz",
+     "payee_name": "ZYMARA COMMERCE PRIVATE LIMITED"},
+    {**NATIVE_ONE[0], "betex_order_id": B, "illunise_order_id": "1003", "amount": 5000.0,
+     "order_time": "2026-11-22 10:27:00", "upi_id": "EXOLAVARIO.mdpy@rbl", "payee_name": "EXOLAVARIO TRADERS"},
+]  # fmt: skip
+
+
+def paid_1122(fake_ai, upi, name="ZYMARA COMMERCE PRIVATE LIM..."):
+    fake_ai.screenshot = {
+        **fake_ai.screenshot,
+        "amount": {"value": 5000.0, "confidence": 0.97},
+        "payment_time": {"value": "2026-11-22 10:28:20", "confidence": 0.95},
+        "receiver_name": {"value": name, "confidence": 0.9},
+    }
+    fake_ai.receiver_upi = upi
+
+
+async def test_live_1122_the_masked_upi_read_with_a_slip_finds_its_order(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    """Google Pay printed "••••82-3@ypbiz"; it was read as "82-3@yphbiz" and the case went to Manual Review with
+    the right order sitting first in the list. It is that order's UPI."""
+    paid_1122(fake_ai, "82-3@yphbiz")
+    case_id, outcome = await run(db, order_search, LIVE_1122)
+    assert outcome == "ready" and not any("MANUAL REVIEW" in t for _, t in fake_bot.sent)
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == [A]
+        assert await manager.post_case_to_betix(s, case_id, fake_poster) == "posted"
+    assert fake_poster.media == [("payment_screenshot", A)]
+
+
+async def test_the_name_verifies_the_order_when_the_upi_cannot_be_matched(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    """The UPI on the screenshot reads as nothing like either order's - but it says who was paid: ZYMARA COMMERCE
+    PRIVATE LIM..., the payee of the first order (its creation JSON). Native only: the name verifies it."""
+    paid_1122(fake_ai, "qq11-7@okxyz")
+    case_id, outcome = await run(db, order_search, LIVE_1122)
+    assert outcome == "ready" and not any("MANUAL REVIEW" in t for _, t in fake_bot.sent)
+    async with db.session_scope() as s:
+        assert (await get_case(s, case_id)).native_order_ids == [A]
+        row = (await s.execute(select(AuditLog).where(AuditLog.action == "GATEWAY_DETECTED"))).scalars().one()
+        assert row.details["name_check"] == "matched" and "the name on the screenshot" in row.details["why"]
+
+
+async def test_neither_the_upi_nor_the_name_fits_is_manual_review(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    paid_1122(fake_ai, "qq11-7@okxyz", name="SOME OTHER SHOP")
+    _, outcome = await run(db, order_search, LIVE_1122)
+    assert outcome == "escalated" and fake_poster.media == []
+    assert "none was paid to the UPI on the screenshot" in [t for _, t in fake_bot.sent if "MANUAL REVIEW" in t][-1]

@@ -61,7 +61,7 @@ from app.telegram.upi_check import (
     parse_pi_answer,
     parse_pi_utr,
     upi_ending_match,
-    upi_reading_slip,
+    upi_near_match,
 )
 from app.utils.logging import get_logger
 from app.utils.timeutil import fmt_local, utcnow
@@ -1086,7 +1086,7 @@ def native_candidates(
                 sc
                 for sc in with_upi
                 if s.upi_ocr_max_edits > 0
-                and upi_reading_slip(screenshot_upi, sc.candidate.upi_id, max_edits=s.upi_ocr_max_edits)[0]
+                and upi_near_match(screenshot_upi, sc.candidate.upi_id, max_edits=s.upi_ocr_max_edits)[0]
             ]
             if slips:
                 return NativePick(
@@ -1094,6 +1094,24 @@ def native_candidates(
                     note=f"its UPI {slips[0].candidate.upi_id} is the one on the screenshot "
                     f"(read as {screenshot_upi}: a reading slip)",
                 )
+            # The UPI could not be matched to any order, not even allowing for a misreading. The NAME can still
+            # verify it (Native only): the order's creation JSON names whose UPI it was paid to, the screenshot
+            # prints who was paid - the order(s) paid to that name are the payment's.
+            if s.native_name_check and screenshot_name:
+                by_name = [
+                    sc
+                    for sc in fit
+                    if getattr(sc.candidate, "payee_name", None)
+                    and name_match(screenshot_name, sc.candidate.payee_name)[0]
+                ]
+                if by_name:
+                    first = lead(by_name[0])
+                    return NativePick(
+                        [sc for sc in by_name if lead(sc) - first <= s.native_same_time_minutes + 1e-9],
+                        note=f"paid to {by_name[0].candidate.payee_name}, the name on the screenshot "
+                        f"(its UPI could not be matched: read as {screenshot_upi})",
+                        name_check="matched",
+                    )
             return NativePick([], upi_rejected=with_upi, note=f"the screenshot shows {screenshot_upi}")
     # Still more than one order in question and the UPI could not say which: the payee NAME may. The Native
     # creation JSON names whose UPI the order was paid to; the screenshot prints who was paid. Orders paid to that
@@ -1609,7 +1627,7 @@ async def resolve_pi_check(session: AsyncSession, case_id: str, *, timed_out: st
         if shot and s.upi_ocr_max_edits > 0:
             for oid in asked:
                 if answers.get(oid):
-                    slipped, slip_why = upi_reading_slip(shot, answers[oid], max_edits=s.upi_ocr_max_edits)
+                    slipped, slip_why = upi_near_match(shot, answers[oid], max_edits=s.upi_ocr_max_edits)
                     if slipped:
                         await audit(
                             session,

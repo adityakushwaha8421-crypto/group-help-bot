@@ -145,3 +145,48 @@ def upi_reading_slip(
     if 0 < edits <= max_edits:
         return True, f"{edits} character(s) differ between {full_a} on the screenshot and {full_b} on the order"
     return False, f"different UPI ({full_a} on the screenshot, {full_b} on the order)"
+
+
+def upi_shortened_slip(
+    screenshot_upi: str | None, order_upi: str | None, *, max_edits: int = 3, min_chars: int = 3
+) -> tuple[bool, str]:
+    """The order's UPI, printed SHORTENED or masked on the screenshot AND read with a slip. Live 2026-11-22: Google
+    Pay prints "••••82-3@ypbiz" for zc26112382-3@ypbiz; it was read as "82-3@yphbiz" - the dots gone and a letter
+    too many in the handle. The ending check wants the handle letter for letter; the whole-UPI tolerance cannot
+    see a shortened name. Here: the visible piece(s) must be the end (and start) of the order's UPI name, and the
+    slips in them and in the handle together stay within `max_edits` - with at most one slip per four visible
+    characters of the name, so a short ending still has to be that ending."""
+    a, b = _split(screenshot_upi), _split(order_upi)
+    if a is None or b is None:
+        return False, "no UPI to compare"
+    (la, ha), (lb, hb) = a, b
+    parts = [x for x in ANY_MASK.split(la) if x]
+    if not ANY_MASK.search(la):
+        head, tail = "", la  # a plain shortened form ("82-3") is an ending
+    else:
+        head = parts[0] if parts and la.startswith(parts[0]) else ""
+        tail = parts[-1] if parts and la.endswith(parts[-1]) and not (len(parts) == 1 and head) else ""
+    visible = len(head) + len(tail)
+    if visible < min_chars or visible > len(lb):
+        return False, f"only {visible} usable character(s) of the UPI name on the screenshot"
+    in_name = (_edit_distance(head, lb[: len(head)]) if head else 0) + (
+        _edit_distance(tail, lb[len(lb) - len(tail) :]) if tail else 0
+    )
+    in_handle = _edit_distance(ha, hb)
+    edits = in_name + in_handle
+    if edits == 0:
+        return False, "fits exactly (the ending check's business)"
+    if in_name > visible // 4 or edits > max_edits:
+        return False, f"different UPI ({la}@{ha} on the screenshot, {lb}@{hb} on the order)"
+    shown = f"{head}…{tail}" if head and tail else (tail or head)
+    return True, f"{shown}@{ha} on the screenshot is {lb}@{hb} read with {edits} character(s) off"
+
+
+def upi_near_match(
+    screenshot_upi: str | None, order_upi: str | None, *, max_edits: int = 3, min_chars: int = 3
+) -> tuple[bool, str]:
+    """The order's UPI, misread: the whole UPI a few characters off, or a shortened / masked one with a slip."""
+    ok, why = upi_reading_slip(screenshot_upi, order_upi, max_edits=max_edits)
+    if ok:
+        return ok, why
+    return upi_shortened_slip(screenshot_upi, order_upi, max_edits=max_edits, min_chars=min_chars)
