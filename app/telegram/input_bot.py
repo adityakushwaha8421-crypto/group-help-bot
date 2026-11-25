@@ -720,8 +720,36 @@ async def _flush_later(chat_id: int, delay: float) -> None:
     try:
         await asyncio.sleep(delay)
         await flush_chat(chat_id)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         log.exception("collection flush failed", chat_id=chat_id)
+        await tell_intake_failed(chat_id, None, [("these messages", exc)])
+
+
+def _what(inp: IncomingInput) -> str:
+    """One held message in a few words, for the operator."""
+    if inp.kind == "text":
+        return f"the text \u201c{(inp.text or '')[:40]}\u201d"
+    return {"photo": "the screenshot", "video": "the video"}.get(inp.kind, f"the file {inp.filename or ''}".strip())
+
+
+async def tell_intake_failed(chat_id: int, message: Message | None, failures: list[tuple[str, Exception]]) -> None:
+    """The bot NEVER stays silent: when a message could not be taken in, the operator is told which one and why.
+    (Before, a failure here was only logged - the operator saw no reply at all and could not know why.)"""
+    lines = [f"\u2022 {esc(what)} \u2014 {code(type(exc).__name__)}: {esc(str(exc)[:160])}" for what, exc in failures]
+    text = para(
+        "\u26a0\ufe0f " + b("COULD NOT PROCESS"),
+        lines,
+        "\U0001f501 Please send it again. If this repeats, forward this message to the developer.",
+    )
+    try:
+        if message is not None:
+            await message.answer(text, parse_mode="HTML")
+        else:
+            await get_throttle().run(
+                chat_id, lambda: notifications.get_bot().send_message(chat_id, text, parse_mode="HTML")
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not report the intake failure", chat_id=chat_id, error=str(exc)[:160])
 
 
 def force_send_pending(case, missing: list[str]) -> bool:
@@ -743,9 +771,18 @@ async def flush_chat(chat_id: int) -> list[str]:
     # handled before its own screenshot would go looking for an older case to join.
     items.sort(key=lambda mi: 0 if mi[1].kind == "photo" else 1)
     touched: dict[str, dict[str, Any]] = {}
+    failures: list[tuple[str, Exception]] = []
+    duplicates = 0
     for message, inp in items:
-        r = await ingest(inp)
+        try:
+            r = await ingest(inp)
+        except Exception as exc:  # noqa: BLE001  one bad message must not drop the rest of the batch
+            log.exception("could not take a message in", chat_id=chat_id, message_id=inp.message_id, kind=inp.kind)
+            failures.append((_what(inp), exc))
+            continue
         if r["duplicate"]:
+            # a FILE that is already on a case is worth a word; plain chatter ("ok", "please check") stays unanswered
+            duplicates += 1 if inp.file_id else 0
             continue
         case = r["case"]
         entry = touched.setdefault(
@@ -755,25 +792,71 @@ async def flush_chat(chat_id: int) -> list[str]:
         entry["created"] = entry["created"] or r["created"]
         entry["forwarded"] = entry["forwarded"] or inp.forward is not None
         entry["late_post"] = entry["late_post"] or r["late_post"]
+    last = items[-1][0] if items else None
+    if failures:
+        await tell_intake_failed(chat_id, last, failures)
+    elif items and not touched and duplicates:
+        # the file(s) sent are already on a case (forwarded again): say so, never nothing
+        try:
+            await last.answer(
+                "\u21a9\ufe0f Already received \u2014 this file is on a case already, nothing new was added.",
+                parse_mode="HTML",
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("could not acknowledge duplicates", chat_id=chat_id, error=str(exc)[:160])
     for case_id, e in touched.items():
-        case = e["case"]
-        if case.betix_root_message_id:
-            # Late statement / video for a case already in Betix: no new message, the live card is refreshed.
-            if e["late_post"]:
-                await enqueue("late_evidence_job", case_id, job_id=f"late-{case_id}-{e['message'].message_id}")
-            await refresh_progress(case_id)
-            continue
-        await kick_off(case, e["missing"])
-        text = case_card(case, e["evidence"], e["missing"], created=e["created"], forwarded=e["forwarded"])
-        buttons = card_buttons(case)
-        # ONE message per case: created once, edited afterwards (and by every processing step).
-        if not e["created"] and case.progress_chat_id == chat_id and case.progress_message_id:
-            if await edit_case_message(case.progress_chat_id, case.progress_message_id, text, buttons):
-                continue
-        kw = {"reply_markup": buttons} if buttons is not None else {}
-        sent = await e["message"].answer(text, parse_mode="HTML", **kw)
-        await track_progress(case_id, chat_id, sent)
+        try:
+            await _answer_case(chat_id, case_id, e)
+        except Exception as exc:  # noqa: BLE001  one case's card failing must not hide the others
+            log.exception("could not answer for a case", chat_id=chat_id, case_id=case_id)
+            await tell_intake_failed(chat_id, e.get("message"), [(f"case {case_id}", exc)])
     return list(touched)
+
+
+async def _answer_case(chat_id: int, case_id: str, e: dict[str, Any]) -> None:
+    """Start what the case allows and show (or refresh) its one card. The operator ALWAYS gets something at the
+    bottom of the chat: the new card, or - when the messages joined a case whose card sits further up - one line
+    saying which case took them and where it stands."""
+    case = e["case"]
+    label = code(case_label(case))
+    stage = esc(case.status.replace("_", " ").lower())
+    if case.betix_root_message_id:
+        # Late statement / video for a case already posted: the live card is refreshed, the file goes as a reply.
+        if e["late_post"]:
+            await enqueue("late_evidence_job", case_id, job_id=f"late-{case_id}-{e['message'].message_id}")
+        await refresh_progress(case_id)
+        note = (
+            "\U0001f4e4 Sending it as a reply to the original post."
+            if e["late_post"]
+            else "\u2139\ufe0f Nothing new was sent for it."
+        )
+        await _ack(e["message"], f"\u21aa\ufe0f Case {label} is already posted \u2014 {stage}.\n{note}")
+        return
+    await kick_off(case, e["missing"])
+    text = case_card(case, e["evidence"], e["missing"], created=e["created"], forwarded=e["forwarded"])
+    buttons = card_buttons(case)
+    # ONE message per case: created once, edited afterwards (and by every processing step).
+    if not e["created"] and case.progress_chat_id == chat_id and case.progress_message_id:
+        outcome = await edit_case_message(case.progress_chat_id, case.progress_message_id, text, buttons)
+        if outcome == "same":
+            # the card did not change at all: without a word the operator would see no reaction whatsoever
+            await _ack(
+                e["message"],
+                f"\u21a9\ufe0f Nothing new for case {label} \u2014 it is {stage}.\n"
+                f"\U0001f50e {code('/status ' + case_label(case))} shows it.",
+            )
+        if outcome:
+            return
+    kw = {"reply_markup": buttons} if buttons is not None else {}
+    sent = await e["message"].answer(text, parse_mode="HTML", **kw)
+    await track_progress(case_id, chat_id, sent)
+
+
+async def _ack(message, text: str) -> None:
+    try:
+        await message.answer(text, parse_mode="HTML")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not acknowledge", error=str(exc)[:160])
 
 
 async def kick_off(case, missing: list[str]) -> str | None:
@@ -914,7 +997,8 @@ async def add_to_case(message: Message, inp: IncomingInput, sess) -> None:
     await message.answer(para(f"✅ Added the {esc(note)} to case {code(label)}.", tail), parse_mode="HTML")
 
 
-async def edit_case_message(chat_id: int, message_id: int, text: str, reply_markup=None) -> bool:
+async def edit_case_message(chat_id: int, message_id: int, text: str, reply_markup=None) -> str:
+    """Edit a case's card. "edited" | "same" (Telegram: the text is already exactly this) | "" (could not edit)."""
     try:
         await get_throttle().run(
             chat_id,
@@ -922,12 +1006,12 @@ async def edit_case_message(chat_id: int, message_id: int, text: str, reply_mark
                 text, chat_id=chat_id, message_id=message_id, parse_mode="HTML", reply_markup=reply_markup
             ),
         )
-        return True
+        return "edited"
     except Exception as exc:  # noqa: BLE001
         if "not modified" in str(exc):
-            return True
+            return "same"
         log.warning("case message edit failed; sending a new one", error=str(exc)[:160])
-        return False
+        return ""
 
 
 async def refresh_progress(case_id: str) -> None:
