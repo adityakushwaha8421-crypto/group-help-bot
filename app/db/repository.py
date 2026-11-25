@@ -88,7 +88,20 @@ async def find_case_by_order_id(session: AsyncSession, order_id: str) -> Case | 
         .order_by(Case.betix_root_message_id.is_(None), Case.id.desc())
         .limit(1)
     )
-    return res.scalar_one_or_none()
+    return res.scalar_one_or_none() or await find_native_case_by_order_id(session, oid)
+
+
+async def find_native_case_by_order_id(session: AsyncSession, order_id: str) -> Case | None:
+    """A Native case answers for SEVERAL orders (one post each) but keeps only the first as its main order id:
+    the newest case that carries this id among its Native order ids."""
+    oid = (order_id or "").strip().upper()
+    if not oid:
+        return None
+    res = await session.execute(select(Case).where(Case.gateway_choice == "native").order_by(Case.id.desc()).limit(500))
+    for c in res.scalars():
+        if oid in [str(x).strip().upper() for x in (c.native_order_ids or [])]:
+            return c
+    return None
 
 
 # A case in one of these statuses has sent its order id to the Betix group, or is about to.

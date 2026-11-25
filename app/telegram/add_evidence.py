@@ -140,7 +140,12 @@ async def find_case(session: AsyncSession, query: str) -> Case | None:
     res = await session.execute(
         select(Case).where(or_(*conds)).order_by(Case.betix_root_message_id.is_(None), Case.id.desc()).limit(1)
     )
-    return res.scalar_one_or_none()
+    found = res.scalar_one_or_none()
+    if found is None:
+        from app.db.repository import find_native_case_by_order_id
+
+        found = await find_native_case_by_order_id(session, up)  # any of a Native case's order ids
+    return found
 
 
 async def attach(session: AsyncSession, case: Case, inp: IncomingInput) -> tuple[Evidence | None, str]:

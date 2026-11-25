@@ -1749,9 +1749,12 @@ async def post_added_evidence(session: AsyncSession, case: Case, poster) -> int:
     ]
     if not pending:
         return 0
-    n = await poster.post_late_evidence(session, case, pending)
-    if await post_statement_password(session, case, poster):
-        n += 1
+    if is_native(case):
+        n = await poster.post_native_added(session, case, pending)  # under every order's own post
+    else:
+        n = await poster.post_late_evidence(session, case, pending)
+        if await post_statement_password(session, case, poster):
+            n += 1
     from app.telegram.progress import push
 
     await push(session, case)

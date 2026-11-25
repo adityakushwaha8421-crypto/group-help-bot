@@ -556,7 +556,7 @@ async def test_add_on_a_native_case_needs_nothing(db, fake_bot, fake_ai, order_s
         t.cancel()
     input_bot._add_timers.clear()
     add_evidence._sessions.clear()
-    assert "already with the Native group" in sink[-1] and "already has everything" in sink[-1]
+    assert "already with the Native group" in sink[-1] and "needs nothing more" in sink[-1]
 
 
 # ---------------------------------------------------------------- which Native orders, exactly
@@ -1046,3 +1046,69 @@ async def test_neither_the_upi_nor_the_name_fits_is_manual_review(
     _, outcome = await run(db, order_search, LIVE_1122)
     assert outcome == "escalated" and fake_poster.media == []
     assert "none was paid to the UPI on the screenshot" in [t for _, t in fake_bot.sent if "MANUAL REVIEW" in t][-1]
+
+
+# ---------------------------------------------------------------- /add on a Native case
+async def native_two_posted(db, fake_ai, order_search, fake_poster) -> str:
+    paid(fake_ai, 6500.0)
+    case_id, _ = await run(db, order_search, NATIVE_TWO)
+    async with db.session_scope() as s:
+        assert await manager.post_case_to_betix(s, case_id, fake_poster) == "posted"
+    return case_id
+
+
+async def test_add_finds_a_native_case_by_any_of_its_order_ids(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    """A Native case with two orders: /add with the SECOND order id used to answer "Case not found"."""
+    from app.db.repository import find_case_by_order_id
+    from app.telegram import add_evidence
+
+    case_id = await native_two_posted(db, fake_ai, order_search, fake_poster)
+    async with db.session_scope() as s:
+        for q in (A, B, B.lower(), MOBILE, case_id):
+            found = await add_evidence.find_case(s, q)
+            assert found is not None and found.case_id == case_id, q
+        assert (await find_case_by_order_id(s, A)).case_id == case_id  # /status works with either id too
+        assert (await find_case_by_order_id(s, B)).case_id == case_id
+        assert await add_evidence.find_case(s, "XX-000000000000") is None
+
+
+async def test_a_file_added_to_a_native_case_goes_under_every_orders_post(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster, monkeypatch
+):
+    from app.cases.correlation import attach_message
+    from app.telegram import add_evidence
+    from tests.test_add_evidence import Msg
+
+    case_id = await native_two_posted(db, fake_ai, order_search, fake_poster)
+    assert fake_poster.media == [("payment_screenshot", B), ("payment_screenshot", A)]  # posts 501 and 502
+    jobs = []
+
+    async def fake_enqueue(name, *args, job_id=None, defer_seconds=0):
+        jobs.append((name, args))
+
+    monkeypatch.setattr(input_bot, "enqueue", fake_enqueue)
+    manager.set_poster_factory(lambda: fake_poster)
+    add_evidence._sessions.clear()
+    sink = []
+    try:
+        await input_bot.cmd_add(Msg(make_input(100, "text", chat_id=111, user_id=111), sink), SimpleNamespace(args=A))
+        assert "already with the Native group" in sink[-1] and "a file you send now is added" in sink[-1]
+        inp = make_input(110, "document")
+        await input_bot.add_to_case(Msg(inp, sink), inp, add_evidence.active(111))
+        assert "Sending it to the Native group now, as a reply under each order's post" in sink[-1]
+        assert jobs == [("added_evidence_job", (case_id,))]
+        assert await tasks.added_evidence_job({}, case_id) == 1
+        assert await tasks.added_evidence_job({}, case_id) == 0  # a retry never posts it again
+    finally:
+        for t in input_bot._add_timers.values():
+            t.cancel()
+        input_bot._add_timers.clear()
+        add_evidence._sessions.clear()
+        manager.set_poster_factory(None)
+    # the statement, once under each order's post, captioned with that post's order id - in the Native group
+    assert fake_poster.media[2:] == [("bank_statement", B), ("bank_statement", A)]
+    assert fake_poster.media_replies[2:] == [("bank_statement", 501), ("bank_statement", 502)]
+    assert set(fake_poster.chats) == {NATIVE_CHAT}
+    del attach_message

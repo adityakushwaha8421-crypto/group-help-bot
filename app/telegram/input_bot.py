@@ -324,6 +324,8 @@ async def cmd_add(message: Message, command: CommandObject):
         group = "the Native group" if is_native(case) else "Betix"
         where = f"already with {group}" if case.betix_root_message_id else f"not with {group} yet"
         need = f"Still missing the {join_and(pending)}." if pending else "It already has everything."
+        if is_native(case):
+            need = "A Native case needs nothing more, but a file you send now is added to it."
         limit = get_settings().add_session_seconds
         await message.answer(
             para(
@@ -977,6 +979,7 @@ async def add_to_case(message: Message, inp: IncomingInput, sess) -> None:
             return
         ev, note = await add_evidence.attach(session, case, inp)
         posted = bool(case.betix_root_message_id)
+        native = is_native(case)
         label, case_id = case_label(case), case.case_id
         done = ev is not None and add_evidence.complete(case, await list_evidence(session, case_id))
     if ev is None:
@@ -986,7 +989,11 @@ async def add_to_case(message: Message, inp: IncomingInput, sess) -> None:
     sess.started_at = utcnow()  # each file that gets in restarts the time limit for the next one
     if posted:
         await enqueue("added_evidence_job", case_id, job_id=f"added-{case_id}-{inp.message_id}")
-        tail = "📤 Sending it to Betix now, as a reply to the original screenshot."
+        tail = (
+            "📤 Sending it to the Native group now, as a reply under each order's post."
+            if native
+            else "📤 Sending it to Betix now, as a reply to the original screenshot."
+        )
     else:
         tail = "📩 It will go out with the case."
     if done:

@@ -295,6 +295,47 @@ class BetixPoster:
         case.betix_posted_at = case.betix_posted_at or utcnow()
         await self.post_late_evidence(session, case, evidence)  # the bank statement, as a reply
 
+    async def post_native_added(self, session: AsyncSession, case: Case, evidence: list[Evidence]) -> int:
+        """NATIVE, evidence added with /add: every order of the case has its OWN post, and each one is looked at on
+        its own - so the file goes as a reply under each of them, captioned with that post's order id. Returns the
+        number of files added."""
+        self.bind(case)
+        if not case.betix_root_message_id:
+            raise BetixPostError("no post to reply to; refusing to send extra evidence")
+        out = [m for m in await list_case_betix_messages(session, case.case_id) if m.direction == "out"]
+        ids = [x for x in (case.native_order_ids or []) if x] or [case.betex_pay_order_id]
+        posts: list[tuple[int, str | None]] = [(case.betix_root_message_id, ids[0] if ids else None)]
+        for m in out:
+            if m.kind == "evidence_screenshot_order" and m.message_id != case.betix_root_message_id:
+                posts.append((m.message_id, (m.text or "").strip() or None))
+        n = 0
+        for ev in evidence:
+            if ev.posted_to_betix_message_id or ev.type == EvidenceType.other.value:
+                continue
+            first = None
+            for root_id, order_id in posts:
+                cap = order_id
+                if ev.type == EvidenceType.bank_statement.value and case.statement_password:
+                    cap = (
+                        f"{order_id}\nPassword:- {case.statement_password}"
+                        if order_id
+                        else f"Password:- {case.statement_password}"
+                    )
+                mid = await self._send_media(ev, cap, reply_to=root_id)
+                first = first or mid
+                await self._record(session, case, mid, ev.type, cap, root_id, True)
+                await audit(
+                    session,
+                    "NATIVE_EVIDENCE_POSTED",
+                    case_id=case.case_id,
+                    result=ev.type + "_added",
+                    details={"message_id": mid, "reply_to": root_id, "order_id": order_id},
+                )
+            ev.posted_to_betix_message_id = first
+            await session.commit()
+            n += 1
+        return n
+
     async def post_late_evidence(self, session: AsyncSession, case: Case, evidence: list[Evidence]) -> int:
         """Statement / video are ONLY ever sent as replies to the screenshot post (never standalone)."""
         self.bind(case)
