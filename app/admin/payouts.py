@@ -27,6 +27,9 @@ LABELS = {
     "AMOUNT": "amount",
     "STATUS": "status",
     "CREATED": "created",
+    # WITHDRAWAL block of the page (live 2026-11-26): "Gateway | BetixPay", "Vendor Order | BXWD-50663-89662"
+    "GATEWAY": "gateway",
+    "VENDOR ORDER": "vendor_order",
 }
 
 
@@ -41,6 +44,8 @@ class Payout:
     amount: float | None = None
     status: str | None = None
     created: str | None = None  # TIMELINE / CREATED as printed, panel-local (IST): "20 Sep 2026 12:52"
+    gateway: str | None = None  # which payout gateway paid it: "BetixPay" / "BetixPay Native"
+    vendor_order: str | None = None  # the id the gateway knows the withdrawal by ("BXWD-...")
 
     @property
     def created_date(self):

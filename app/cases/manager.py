@@ -345,11 +345,14 @@ async def ask_for_a_newer_statement(session: AsyncSession, case: Case, wd_date, 
     return "statement_outdated"
 
 
-async def ready_withdrawal(session: AsyncSession, case: Case) -> str:
+async def ready_withdrawal(session: AsyncSession, case: Case, payout=None) -> str:
     """WITHDRAWAL: nothing to read or match - the withdrawal id and the statement are all Betix needs. The case
     is labelled by the id the group will see ("BXWD-..."), which also makes the one-post-per-id guard, /status
     and /add work for it exactly as for an order id."""
     label = f"BX{case.withdrawal_id}"
+    vendor = (getattr(payout, "vendor_order", None) or "").strip()
+    if vendor and vendor.upper().endswith(str(case.withdrawal_id).upper()):
+        label = vendor  # the id the gateway itself knows the withdrawal by, as the payout page prints it
     case.betex_pay_order_id = label
     first = await find_case_that_sent_order(session, label, exclude_case_id=case.case_id)
     if first is not None:
@@ -432,6 +435,19 @@ async def process_withdrawal(session: AsyncSession, case: Case, evidence, *, for
         return "escalated"
     if payout.amount is not None and case.amount is None:
         case.amount = payout.amount
+    # WHICH GATEWAY PAID IT OUT? The payout page says, exactly as an order's page does for a deposit: a withdrawal
+    # paid through the Native gateway goes to the Native group, any other to the Betix group.
+    case.gateway = payout.gateway or case.gateway
+    native_payout = native_enabled() and is_native_gateway(payout.gateway)
+    case.gateway_choice = GATEWAY_NATIVE if native_payout else GATEWAY_BETIX
+    await audit(
+        session,
+        "GATEWAY_DETECTED",
+        case_id=case.case_id,
+        result=case.gateway_choice,
+        source="illunise_admin",
+        details={"gateway": payout.gateway, "withdrawal": wd, "vendor_order": payout.vendor_order},
+    )
     details = {"payout": {**payout.as_dict(), "account": mask_account(payout.account)}}
     details["check"] = (
         {"result": check.result, "how": check.how, "seen": mask_account(check.seen), "note": check.note}
@@ -452,7 +468,7 @@ async def process_withdrawal(session: AsyncSession, case: Case, evidence, *, for
         if ev.id in too_old:
             ev.analysis = {**(ev.analysis or {}), "outdated": {"ends": too_old[ev.id], "needed": wd_date.isoformat()}}
     if accepted is not None:
-        return await ready_withdrawal(session, case)
+        return await ready_withdrawal(session, case, payout)
     if too_old:
         return await ask_for_a_newer_statement(session, case, wd_date, max(too_old.values()))
     if undated:
@@ -465,7 +481,7 @@ async def process_withdrawal(session: AsyncSession, case: Case, evidence, *, for
         )
         return "escalated"
     if check is not None and check.result == MATCH:
-        return await ready_withdrawal(session, case)
+        return await ready_withdrawal(session, case, payout)
     if check is not None and check.result == MISMATCH:
         await escalate_case(
             session,

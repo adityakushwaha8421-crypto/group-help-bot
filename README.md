@@ -343,6 +343,11 @@ The Betix group receives `BXWD-84425-67115` as a plain message (the case's ancho
 to it. Confirmation, reminders and `/status` / `/add BXWD-84425-67115` work exactly as for a payment; one
 withdrawal id is posted once.
 
+A withdrawal is routed like a deposit. The payout page in Illunise names the gateway that paid it out
+(`Gateway`) and the id that gateway knows it by (`Vendor Order`, e.g. `BXWD-84425-67115`): a payout of the Native
+gateway is posted to `NATIVE_GROUP_CHAT_ID`, any other to the Betix group. The vendor order is what is posted;
+without one, `BX` + the withdrawal id. Reminders run in either group.
+
 ## Running on the Mac (launchd)
 
 Everything lives in this folder. The bot and its own PostgreSQL run as user launch agents (start at login,

@@ -282,6 +282,7 @@ def payout(env):
         return Payout(
             withdraw_id=wd, account=holder["account"], ifsc="KKBK0001770", beneficiary="Test User",
             bank="Kotak Mahindra Bank", amount=926.25, status=holder["status"], created=holder["created"],
+            gateway=holder.get("gateway", "BetixPay"), vendor_order=holder.get("vendor_order"),
         )  # fmt: skip
 
     async def _check(path, account):

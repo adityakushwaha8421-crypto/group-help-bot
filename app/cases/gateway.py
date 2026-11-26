@@ -37,3 +37,9 @@ def is_round(amount: float | None) -> bool:
     """A round figure: whole rupees, no paise (₹10,000.00 yes; ₹100.20 and ₹6,499.92 no). Betix pads every order
     with unique paise, a Native order is paid as a round figure."""
     return amount is not None and abs(float(amount) - round(float(amount))) < 0.005
+
+
+def goes_to_native(case: Case) -> bool:
+    """Is this case posted to the Native group? A payment whose order is a Native one, or a WITHDRAWAL paid out
+    through the Native gateway (the payout page names the gateway, exactly as an order's page does)."""
+    return case.gateway_choice == GATEWAY_NATIVE

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.cases.gateway import is_native
+from app.cases.gateway import goes_to_native
 from app.config import get_settings
 from app.db.models import BetixMessage, Case, Evidence, EvidenceType
 from app.db.repository import add_betix_message, audit, case_has_out_kind, list_case_betix_messages
@@ -48,7 +48,7 @@ class BetixPoster:
     def choose_group(self, case: Case) -> int | str:
         """Which group a NEW case is posted to: the Native group for a Native case, else the default (first
         configured) Betix group. This is the one place to put any further routing rule."""
-        if is_native(case):
+        if goes_to_native(case):  # a Native payment, or a withdrawal paid out through the Native gateway
             chat = self.s.native_chat
             if chat is None:
                 raise BetixPostError("NATIVE_GROUP_CHAT_ID not configured")
@@ -277,7 +277,7 @@ class BetixPoster:
         self.bind(case)
         if not case.withdrawal_id:
             raise BetixPostError("case has no withdrawal id; refusing to post")
-        text = f"BX{case.withdrawal_id}"
+        text = case.betex_pay_order_id or f"BX{case.withdrawal_id}"  # the gateway's own id for it (payout page)
         root = await case_has_out_kind(session, case.case_id, "withdrawal_root")
         if root is None:
             mid = await self._send_text(text)

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.cases.gateway import is_native
+from app.cases.gateway import goes_to_native, is_native
 from app.db.models import Case, CaseStatus
 from app.telegram.ui import case_label, code, esc, i
 from app.utils.logging import get_logger
@@ -87,10 +87,11 @@ def progress_card(case: Case) -> str:
         )
     if st in (S.ORDER_MATCH_FOUND.value, S.READY_FOR_BETIX.value):
         if case.kind == "withdrawal":
+            where = "Native" if goes_to_native(case) else "Betix"
             return card(
                 "\U0001f4b8 WITHDRAWAL READY",
-                [f"\U0001f9fe Withdrawal: {order}"],
-                "\U0001f4e4 Sending it to the Betix group...",
+                [f"\U0001f9fe Withdrawal: {order}"] + (["\U0001f500 Gateway: Native"] if where == "Native" else []),
+                f"\U0001f4e4 Sending it to the {where} group...",
             )
         if is_native(case):
             return card(
@@ -125,6 +126,9 @@ def progress_card(case: Case) -> str:
         rows = [f"\U0001f9fe Order: {order}"]
         if sent:
             rows.append(f"\U0001f504 Follow-ups sent: {sent}")
+        if goes_to_native(case):  # a withdrawal paid out through the Native gateway
+            rows.append("\U0001f500 Gateway: Native")
+            return card("\U0001f4e4 SENT TO NATIVE GROUP", rows, "\U0001f440 Waiting for the Native group to answer...")
         return card("\U0001f4e4 SENT TO BETIX", rows, "\U0001f440 Waiting for Betix to confirm...")
     if st == S.VERIFIED.value and case.confirmation_type == "reversed":
         rows = [ident]
