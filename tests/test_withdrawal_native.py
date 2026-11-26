@@ -117,7 +117,7 @@ async def test_a_page_without_a_vendor_order_still_posts_the_bx_id(
     assert fake_poster.texts[0] == ("BXWD-50663-89662", None) and set(fake_poster.chats) == {BETIX_CHAT}
 
 
-async def test_without_a_native_group_a_native_payout_stays_with_betix(
+async def test_without_a_native_group_a_native_payout_is_never_sent_to_betix(
     db, fake_bot, fake_ai, no_download, payout, fake_poster, monkeypatch
 ):
     monkeypatch.setenv("NATIVE_GROUP_CHAT_ID", "")
@@ -125,6 +125,17 @@ async def test_without_a_native_group_a_native_payout_stays_with_betix(
     payout(gateway="BetixPay Native", created="23 Nov 2026 17:45", statement_ends="2026-11-24")
     case_id = await withdrawal(db)
     async with db.session_scope() as s:
+        assert await manager.process_case(s, case_id, force=True) == "escalated"
+        assert await manager.post_case_to_betix(s, case_id, fake_poster) == "already"
+        assert "NATIVE_GROUP_CHAT_ID" in ((await get_case(s, case_id)).failure_reason or "")
+    assert not fake_poster.chats
+
+
+async def test_the_card_names_the_gateway_the_panel_showed(db, fake_bot, fake_ai, no_download, payout, fake_poster):
+    from app.telegram.progress import payout_gateway_rows
+
+    payout(gateway="BetixPay Native", created="23 Nov 2026 17:45", statement_ends="2026-11-24")
+    case_id = await withdrawal(db)
+    async with db.session_scope() as s:
         assert await manager.process_case(s, case_id, force=True) == "ready"
-        assert await manager.post_case_to_betix(s, case_id, fake_poster) == "posted"
-    assert set(fake_poster.chats) == {BETIX_CHAT}
+        assert payout_gateway_rows(await get_case(s, case_id)) == ["\U0001f500 Gateway: Native (BetixPay Native)"]

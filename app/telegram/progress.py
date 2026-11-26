@@ -90,7 +90,7 @@ def progress_card(case: Case) -> str:
             where = "Native" if goes_to_native(case) else "Betix"
             return card(
                 "\U0001f4b8 WITHDRAWAL READY",
-                [f"\U0001f9fe Withdrawal: {order}"] + (["\U0001f500 Gateway: Native"] if where == "Native" else []),
+                [f"\U0001f9fe Withdrawal: {order}"] + payout_gateway_rows(case),
                 f"\U0001f4e4 Sending it to the {where} group...",
             )
         if is_native(case):
@@ -126,8 +126,9 @@ def progress_card(case: Case) -> str:
         rows = [f"\U0001f9fe Order: {order}"]
         if sent:
             rows.append(f"\U0001f504 Follow-ups sent: {sent}")
+        if case.kind == "withdrawal":
+            rows += payout_gateway_rows(case)
         if goes_to_native(case):  # a withdrawal paid out through the Native gateway
-            rows.append("\U0001f500 Gateway: Native")
             return card("\U0001f4e4 SENT TO NATIVE GROUP", rows, "\U0001f440 Waiting for the Native group to answer...")
         return card("\U0001f4e4 SENT TO BETIX", rows, "\U0001f440 Waiting for Betix to confirm...")
     if st == S.VERIFIED.value and case.confirmation_type == "reversed":
@@ -162,6 +163,16 @@ def progress_card(case: Case) -> str:
     if st == S.ESCALATED.value:
         return card("\U0001f6a8 MANUAL REVIEW NEEDED", [ident], f"\u2757 {i(reason)}" if reason else "")
     return card("\u26d4 CASE CLOSED", [ident], f"\u2757 {i(reason)}" if reason else "")
+
+
+def payout_gateway_rows(case: Case) -> list[str]:
+    """WITHDRAWAL: which gateway the payout page named, and so which group it goes to - always shown, so a
+    withdrawal in the wrong group can be told apart from one the panel named differently."""
+    where = "Native" if goes_to_native(case) else "Betix"
+    named = f" ({esc(case.gateway)})" if case.gateway else ""
+    if where == "Betix" and not named:
+        return []
+    return [f"\U0001f500 Gateway: {where}{named}"]
 
 
 def native_ids(case: Case) -> list[str]:

@@ -448,6 +448,16 @@ async def process_withdrawal(session: AsyncSession, case: Case, evidence, *, for
         source="illunise_admin",
         details={"gateway": payout.gateway, "withdrawal": wd, "vendor_order": payout.vendor_order},
     )
+    if is_native_gateway(payout.gateway) and not native_enabled():
+        # A Native payout with no Native group to send it to: never the Betix group instead.
+        await escalate_case(
+            session,
+            case,
+            f"Withdrawal {wd} was paid out through the Native gateway ({payout.gateway}), but no Native group is "
+            "configured (NATIVE_GROUP_CHAT_ID).",
+            "Nothing was sent to the Betix group. Set NATIVE_GROUP_CHAT_ID in .env, /restart, then send it again.",
+        )
+        return "escalated"
     details = {"payout": {**payout.as_dict(), "account": mask_account(payout.account)}}
     details["check"] = (
         {"result": check.result, "how": check.how, "seen": mask_account(check.seen), "note": check.note}
