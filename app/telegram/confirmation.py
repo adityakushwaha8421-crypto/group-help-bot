@@ -38,6 +38,20 @@ REVERSED = [
     re.compile(r"STATUS\s*:\s*Revers(?:ed|al)\b", re.I),
     re.compile(r"\brevers(?:ed|al)\b", re.I),
 ]
+# "After multiple reviews, we confirm that the payment has not been received ... we have decided to make an
+# exception and close this order." (live 2026-11-28): Betix settles the order although it never saw the payment.
+# Not a failure and not a confirmation: the operator is asked to approve marking the order Success in Illunise.
+EXCEPTION_CLOSED = [
+    re.compile(r"\bexception\b.{0,60}\bclos(?:e|ed|ing)\s+(?:this|the)\s+order\b", re.I | re.S),
+    re.compile(r"\bclos(?:e|ed|ing)\s+(?:this|the)\s+order\b.{0,60}\bas\s+an\s+exception\b", re.I | re.S),
+]
+OUTCOME_EXCEPTION = "EXCEPTION_CLOSED"
+
+
+def is_exception_close(text: str) -> re.Match | None:
+    return _first(EXCEPTION_CLOSED, text or "")
+
+
 WITHDRAWAL_ID_RE = re.compile(r"\b(?:BX)?WD-\d{3,6}-\d{3,6}\b", re.I)
 
 
@@ -164,6 +178,9 @@ def extract_ids(
 def classify_system_message(text: str, betex_pattern: re.Pattern[str], plat_pattern: re.Pattern[str]) -> Classification:
     t = text or ""
     orders, plats, utrs = extract_ids(t, betex_pattern, plat_pattern)
+    exc = is_exception_close(t)
+    if exc:  # carries "payment has not been received" too: it must never read as a plain failure
+        return Classification(OUTCOME_EXCEPTION, 0.97, "regex", exc.group(0)[:80], orders, plats, utrs)
     rev = is_reversed(t, status_line_only=True)
     if rev:  # before everything else: "OrderStatus: Reversed" is neither a failed nor a pending order
         return Classification("FAILED", 0.97, "regex", rev.group(0)[:80], orders, plats, utrs, {"reversed": True})
@@ -191,6 +208,9 @@ def classify_human_message(
 ) -> Classification:
     t = (text or "").strip()
     orders, plats, utrs = extract_ids(t, betex_pattern, plat_pattern)
+    exc = is_exception_close(t)
+    if exc:
+        return Classification(OUTCOME_EXCEPTION, 0.95, "regex", exc.group(0)[:80], orders, plats, utrs)
     if has_media and not HUMAN_SUCCESS.match(t) and not (t and HUMAN_FAILED.search(t) and len(t) < 300):
         # A person posting a file (statement PDF, video, screenshot) is SHARING evidence, not asking for it.
         return Classification("IRRELEVANT", 0.9, "regex", "media post", orders, plats, utrs)

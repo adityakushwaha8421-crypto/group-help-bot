@@ -232,6 +232,43 @@ async def on_push_button(query: CallbackQuery):
         await query.message.answer(text, parse_mode="HTML")
 
 
+@router.callback_query(F.data.startswith("marksuccess:"))
+async def on_mark_success_button(query: CallbackQuery):
+    """ "Approve: mark as Success" under a BETIX CLOSED THE ORDER message: the operator's approval. The panel work
+    runs as a job and the result (Verified, or Manual Review) arrives as its own message."""
+    if query.from_user.id not in get_settings().admin_user_ids:
+        await query.answer("\u26d4 Not authorized", show_alert=True)
+        return
+    who = f"@{query.from_user.username}" if query.from_user.username else str(query.from_user.id)
+    case_id = query.data.split(":", 1)[1]
+    async with session_scope() as session:
+        outcome = await manager.approve_mark_success(session, case_id, who)
+    async with session_scope() as session:  # the button goes from EVERY admin's copy: nobody can press it again
+        removed = await notifications.remove_buttons(session, case_id, "mark_success_request")
+    await query.answer(
+        {
+            "queued": "\u2705 Approved. Marking it Success in Illunise...",
+            "already": "Already approved \u2014 it is being marked.",
+        }.get(outcome, "Nothing to mark: this case is already closed."),
+        show_alert=outcome != "queued",
+    )
+    if query.message:
+        try:
+            if not removed:
+                await query.message.edit_reply_markup(reply_markup=None)
+            if outcome == "queued":
+                await query.message.answer(
+                    para(
+                        "\u23f3 " + b("MARKING AS SUCCESS"),
+                        f"\U0001f464 Approved by: {esc(who)}",
+                        "Waiting for the panel to show Success...",
+                    ),
+                    parse_mode="HTML",
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("mark success button cleanup failed", error=str(exc)[:160])
+
+
 @router.callback_query(F.data.startswith("refund:"))
 async def on_refund_button(query: CallbackQuery):
     """ "Refund now" under a BETIX REVERSED message: the operator's approval. The refund runs as a job and the

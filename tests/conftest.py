@@ -59,6 +59,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(app.admin.orders, "find_candidates", _no_real_panel)
     monkeypatch.setattr(app.admin.payouts, "find_payout", _no_real_panel)
     monkeypatch.setattr(app.admin.payouts, "refund_payout", _no_real_panel)
+    import app.admin.mark_success
+
+    monkeypatch.setattr(app.admin.mark_success, "mark_success_order", _no_real_panel)
     reset_settings_cache()
     yield
     reset_settings_cache()

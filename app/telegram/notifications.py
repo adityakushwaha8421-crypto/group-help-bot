@@ -159,6 +159,36 @@ def format_withdrawal_reversed(case: Case, actor: str, extra: str = "") -> str:
     )
 
 
+def format_mark_success_request(case: Case, actor: str, order_id: str) -> str:
+    """Betix closed the order as an exception: ask the operator before the order is marked Success in Illunise."""
+    rows = [f"\U0001f5c2 Case: {code(case_label(case))}", f"\U0001f9fe Order: {code(order_id)}"]
+    if case.mobile:
+        rows.append(f"\U0001f4f1 Mobile: {code(case.mobile)}")
+    if case.amount is not None:
+        rows.append(f"\U0001f4b0 Amount: {_money(case.amount, case.currency)}")
+    if case.utr:
+        rows.append(f"\U0001f522 UTR: {code(case.utr)}")
+    rows.append(f"\U0001f4e3 Reported by: {_esc(actor)}")
+    return para(
+        "\U0001f91d " + b("BETIX CLOSED THE ORDER \u2014 APPROVAL NEEDED"),
+        rows,
+        [
+            "Betix did not receive the payment but closes the order as an exception.",
+            "\U0001f447 Tap to mark it Success in Illunise and send the callback.",
+        ],
+    )
+
+
+def mark_success_button(case: Case):
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="\u2705 Approve: mark as Success", callback_data=f"marksuccess:{case.case_id}")]
+        ]
+    )
+
+
 def format_refund_request(case: Case, actor: str, payout) -> str:
     """Betix reversed a withdrawal and the payout is still Success: ask the operator before any refund."""
     rows = [f"\U0001f5c2 Case: {code(case_label(case))}", f"\U0001f4b8 Withdrawal: {code(payout.withdraw_id)}"]

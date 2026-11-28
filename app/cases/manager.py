@@ -1907,6 +1907,269 @@ async def verify_case(
     return True
 
 
+# ------------------------------------------------------------------ order closed by Betix as an exception
+# Betix: "the payment has not been received ... we have decided to make an exception and close this order."
+# The operator is asked ONCE; only their tap makes the bot open the order in Illunise, click Mark as Success (which
+# fires the callback) and - once the panel SHOWS Success - close the case as verified.
+_marker = None
+
+
+def set_marker(fn) -> None:
+    global _marker
+    _marker = fn
+
+
+async def _mark_success(order_id: str, utr: str | None):
+    if _marker is not None:
+        return await _marker(order_id, utr)
+    from app.admin.mark_success import mark_success_order
+
+    return await mark_success_order(order_id, utr)
+
+
+def case_order_ids(case: Case) -> list[str]:
+    ids = [x for x in (case.native_order_ids or []) if x]
+    if case.betex_pay_order_id and case.betex_pay_order_id not in ids:
+        ids.insert(0, case.betex_pay_order_id)
+    return ids
+
+
+async def _audit_row(session: AsyncSession, case_id: str, action: str):
+    from sqlalchemy import select
+
+    from app.db.models import AuditLog
+
+    res = await session.execute(
+        select(AuditLog)
+        .where(AuditLog.case_id == case_id, AuditLog.action == action)
+        .order_by(AuditLog.id.desc())
+        .limit(1)
+    )
+    return res.scalars().first()
+
+
+def _exception_open(case: Case | None) -> bool:
+    return bool(
+        case
+        and case.kind != KIND_WITHDRAWAL
+        and case.status not in TERMINAL_OK
+        and case.status != CaseStatus.FAILED.value
+    )
+
+
+async def start_exception_close(
+    session: AsyncSession, case: Case, cls: Classification, *, actor: str, betix_message_id, sender_id, sender_username
+) -> str:
+    """Betix closes the order as an exception. Which order: the one the message names (it must be this case's own);
+    a reply that names none means the case's order. Nothing is touched in the panel here - the operator is asked."""
+    from app.telegram.notifications import format_mark_success_request, mark_success_button
+
+    own = case_order_ids(case)
+    named = [x for x in (cls.order_ids or []) if not x.upper().startswith("BXWD")]
+    order_id = next((x for x in own if x.upper() in {n.upper() for n in named}), None)
+    if order_id is None and not named and own:
+        order_id = own[0]
+    if order_id is None:
+        await escalate_case(
+            session,
+            case,
+            f"Betix closed an order as an exception ({actor}), but it names "
+            f"{', '.join(named) or 'no order'} - not this case's order.",
+            "Nothing was marked. Check the order in Illunise by hand.",
+        )
+        return "escalated"
+    await cancel_case_followups(session, case, "Betix closed the order as an exception")  # Betix has answered
+    await audit(
+        session,
+        "BETIX_EXCEPTION_CLOSED",
+        case_id=case.case_id,
+        actor=actor,
+        result=order_id,
+        source="betix_group",
+        details={
+            "order_id": order_id,
+            "betix_message_id": betix_message_id,
+            "sender_id": sender_id,
+            "sender_username": sender_username,
+            "quote": (cls.matched or "")[:200],
+        },
+    )
+    await notify_admin(
+        session,
+        kind="mark_success_request",
+        case=case,  # ONE request per case, however many times Betix repeats the notice
+        text=format_mark_success_request(case, actor, order_id),
+        reply_markup=mark_success_button(case),
+    )
+    return "approval_asked"
+
+
+async def approve_mark_success(session: AsyncSession, case_id: str, approver: str) -> str:
+    """The operator tapped "Approve: mark as Success". Recorded once; the panel work runs as a job.
+    Returns: queued | already | not_applicable"""
+    case = await get_case_for_update(session, case_id)
+    if not _exception_open(case) or await _audit_row(session, case_id, "BETIX_EXCEPTION_CLOSED") is None:
+        return "not_applicable"
+    if await _audit_row(session, case_id, "MARK_SUCCESS_APPROVED") is not None:
+        return "already"
+    await audit(session, "MARK_SUCCESS_APPROVED", case_id=case_id, actor=approver, result="approved")
+    await enqueue("mark_success_job", case_id, job_id=f"marksuccess-{case_id}")
+    return "queued"
+
+
+async def mark_success_approved(case_id: str) -> str:
+    """Runs only after MARK_SUCCESS_APPROVED: mark the exact order Success in Illunise (the callback goes with it)
+    and close the case once the panel shows Success. Returns: verified | escalated | skipped"""
+    from app.db.session import session_scope
+
+    async with session_scope() as session:
+        case = await get_case_for_update(session, case_id)
+        notice = await _audit_row(session, case_id, "BETIX_EXCEPTION_CLOSED") if _exception_open(case) else None
+        approval = await _audit_row(session, case_id, "MARK_SUCCESS_APPROVED")
+        if notice is None or approval is None:
+            return "skipped"  # no notice from Betix, or no approval from the operator: never mark
+        info, betix_actor, approver = dict(notice.details or {}), notice.actor, approval.actor
+        order_id = info.get("order_id")
+        if not order_id or order_id not in case_order_ids(case):
+            return "skipped"
+        utr = case.utr  # read off the customer's screenshot; blank when unknown - never invented
+    problem, result = None, None
+    try:
+        result = await _mark_success(order_id, utr)  # the browser works: no database transaction is held meanwhile
+    except Exception as exc:  # noqa: BLE001
+        log.exception("mark as success crashed", case_id=case_id)
+        problem = f"the panel could not be used ({exc})."
+    async with session_scope() as session:
+        case = await get_case_for_update(session, case_id)
+        if not _exception_open(case):
+            return "skipped"
+        await audit(
+            session,
+            "ORDER_MARKED_SUCCESS",
+            case_id=case_id,
+            actor=approver,
+            result=result.outcome if result else "error",
+            source="illunise_admin",
+            details={
+                "order_id": order_id,
+                "before": result.status_before if result else None,
+                "after": result.status_after if result else None,
+                "callback": result.callback if result else None,
+                "callback_resent": result.callback_resent if result else None,
+                "detail": result.detail if result else problem,
+            },
+        )
+        if result is not None and result.ok:
+            await notify_admin(
+                session,
+                kind="marked_success",
+                case=case,
+                text=format_info(
+                    case,
+                    "Order marked Success in Illunise",
+                    f"Order: {order_id}\nPanel: {result.status_before or '-'} \u2192 {result.status_after or '-'}\n"
+                    f"Callback: {result.callback or 'sent'}{' (resent)' if result.callback_resent else ''}\n"
+                    f"Approved by: {approver}",
+                ),
+            )
+            await verify_case(
+                session,
+                case,
+                confirmed_by=betix_actor,
+                confirmation_message_id=info.get("betix_message_id"),
+                confirmation_user_id=info.get("sender_id"),
+                confirmation_username=info.get("sender_username"),
+            )
+            return "verified"
+        why = problem or {
+            "not_found": f"order {order_id} was not found in Illunise.",
+            "no_button": "the order page has no Mark as Success button.",
+            "mark_failed": f"Mark as Success did not go through ({result.detail}).",
+            "not_confirmed": f"Mark as Success was clicked, but the panel does not show Success ({result.detail}).",
+        }.get(result.outcome, result.detail)
+        await escalate_case(
+            session,
+            case,
+            f"Betix closed order {order_id} as an exception and {approver} approved it, but it is NOT marked: {why}",
+            "Mark it Success in Illunise by hand.",
+        )
+        return "escalated"
+
+
+async def close_past_exception_notices(session: AsyncSession) -> dict[str, int]:
+    """Runs on every sweep: an exception-close notice that reached the group BEFORE the bot knew the wording (it
+    was read as a failure, or not understood) closes its case now - in the bot's own records only. Betix settled
+    those orders long ago: no approval is asked, no button is sent and nothing is touched in the panel.
+    A notice handled by the approval flow (its event reads EXCEPTION_CLOSED) is never taken here."""
+    import re
+
+    from sqlalchemy import select
+
+    from app.db.models import BetixMessage, VerificationEvent
+    from app.db.repository import find_case_by_order_id
+    from app.telegram.confirmation import OUTCOME_EXCEPTION, is_exception_close
+
+    rows = (
+        (
+            await session.execute(
+                select(BetixMessage)
+                .where(BetixMessage.direction == "in", BetixMessage.text.ilike("%exception%"))
+                .order_by(BetixMessage.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    n = 0
+    for m in rows:
+        if not is_exception_close(m.text or ""):
+            continue
+        named = [x.upper() for x in re.findall(r"\b[A-Za-z]{3,10}-\d{10,}\b", m.text or "")]
+        case = await get_case(session, m.case_id) if m.case_id else None
+        if case is None:
+            for oid in named:
+                case = await find_case_by_order_id(session, oid)
+                if case is not None:
+                    break
+        if not _exception_open(case):
+            continue
+        handled = await session.execute(
+            select(VerificationEvent.id)
+            .where(
+                VerificationEvent.case_id == case.case_id,
+                VerificationEvent.betix_message_id == m.message_id,
+                VerificationEvent.event_type.like(f"%{OUTCOME_EXCEPTION}"),
+            )
+            .limit(1)
+        )
+        if handled.first() is not None or await _audit_row(session, case.case_id, "BETIX_EXCEPTION_CLOSED"):
+            continue  # the approval flow has this one
+        own = {x.upper() for x in case_order_ids(case)}
+        if named and not own & set(named):
+            continue  # the notice is about another order
+        case = await get_case_for_update(session, case.case_id)
+        who = f"@{m.sender_username}" if m.sender_username else (m.sender_name or "Betix")
+        await audit(
+            session,
+            "EXCEPTION_CLOSED_RECORDED",
+            case_id=case.case_id,
+            actor=who,
+            result="saved as success",
+            source="betix_group",
+            details={"betix_message_id": m.message_id, "order_ids": sorted(own & set(named))},
+        )
+        if await verify_case(
+            session,
+            case,
+            confirmed_by=who,
+            confirmation_message_id=m.message_id,
+            confirmation_user_id=m.sender_id,
+            confirmation_username=m.sender_username,
+        ):
+            n += 1
+    return {"exception_notices_closed": n} if n else {}
+
+
 # ------------------------------------------------------------------ withdrawal reversed by Betix
 # Betix says "Reversed" -> the payout is READ -> the operator gets a "Refund now" button -> only their tap makes
 # the bot click Refund -> "solved" is reported only once the panel shows Refunded. No refund without a person.
@@ -2373,6 +2636,7 @@ async def confirmation_safety_net(session: AsyncSession) -> dict[str, int]:
     out.update(await reopen_wrongly_confirmed_withdrawals(session, since))
     out.update(await relink_unlinked_reversals(session, since))
     out.update(await requeue_unhandled_reversals(session, since))
+    out.update(await close_past_exception_notices(session))
 
     recorded = (
         (
@@ -2591,6 +2855,16 @@ async def apply_verification_signal(
             ),
         )
         return "partial"
+    if cls.outcome == "EXCEPTION_CLOSED" and case.kind != KIND_WITHDRAWAL:
+        return await start_exception_close(
+            session,
+            case,
+            cls,
+            actor=actor,
+            betix_message_id=betix_message_id,
+            sender_id=sender_id,
+            sender_username=sender_username,
+        )
     if cls.outcome == "FAILED":
         await audit(
             session,

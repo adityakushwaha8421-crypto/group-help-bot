@@ -105,6 +105,13 @@ async def refund_withdrawal_job(ctx, case_id: str) -> str:
     return outcome
 
 
+async def mark_success_job(ctx, case_id: str) -> str:
+    """The operator approved it: mark the order Success in Illunise (callback included), then report (see manager)."""
+    outcome = await manager.mark_success_approved(case_id)
+    log.info("mark_success", case_id=case_id, outcome=outcome)
+    return outcome
+
+
 async def late_evidence_job(ctx, case_id: str) -> int:
     async with session_scope() as session:
         case = await get_case(session, case_id)
@@ -280,6 +287,7 @@ class WorkerSettings:
         post_case_job,
         reversal_check_job,
         refund_withdrawal_job,
+        mark_success_job,
         late_evidence_job,
         added_evidence_job,
         betix_message_job,
