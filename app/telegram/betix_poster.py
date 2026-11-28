@@ -29,6 +29,9 @@ class BetixPostError(Exception):
 NATIVE_ORDER_POST = "evidence_screenshot_order"
 
 
+BULK_REMINDER = "bulk_reminder"  # an operator-asked reminder (/bulk reminder), outside the automatic chain
+
+
 def followup_text(case: Case, number: int) -> str:  # noqa: ARG001
     """Short and plain: the follow-up is a REPLY to our screenshot post, so the order id is already in view."""
     return get_settings().betix_followup_text.strip() or "Any update?"
@@ -393,6 +396,17 @@ class BetixPoster:
         await self._record(session, case, mid, "pi_query", text)
         await audit(session, "BETIX_PI_QUERY_SENT", case_id=case.case_id, result=order_id, details={"message_id": mid})
         await session.commit()
+        return mid
+
+    async def send_reminder(self, session: AsyncSession, case: Case) -> int:
+        """/bulk reminder: one more "Any update?" on the operator's word - always a REPLY to the case's own post, in
+        the group it was posted to (Betix or Native). Not part of the automatic chain: sent every time it is asked."""
+        self.bind(case)
+        if not case.betix_root_message_id:
+            raise BetixPostError("no posted message to reply to; refusing a standalone reminder")
+        text = followup_text(case, 0)
+        mid = await self._send_text(text, reply_to=case.betix_root_message_id)
+        await self._record(session, case, mid, BULK_REMINDER, text, case.betix_root_message_id)
         return mid
 
     async def send_followup(self, session: AsyncSession, case: Case, number: int) -> int:

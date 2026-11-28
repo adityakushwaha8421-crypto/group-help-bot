@@ -126,6 +126,7 @@ def help_text() -> str:
         f"{code('/cases')} — all open cases\n"
         f"{code('/summary [DAYS]')} — overview by stage\n"
         f"{code('/push')} — force send the current case when it is “Already with Betix”\n"
+        f"{code('/bulk reminder')} — send “Any update?” under every pending case\n"
         f"{code('/stopr ORDER-ID')} — stop the reminders of a case, keep everything else\n"
         f"{code('/cancel')} — discard what's in progress\n"
         f"{code('/restart')} — pull the latest code and restart",
@@ -416,6 +417,36 @@ async def cmd_stopr(message: Message, command: CommandObject):
         f"\U0001f6d1 Reminders stopped for {code(label)}" + ("" if n else "\n" + i("There was no reminder pending.")),
         parse_mode="HTML",
     )
+
+
+@router.message(Command("bulk"))
+async def cmd_bulk(message: Message, command: CommandObject):
+    """/bulk reminder: "Any update?" under every posted case that is still waiting for an answer."""
+    what = (command.args or "reminder").strip().lower()
+    if what not in ("reminder", "reminders", "remind"):
+        await message.answer(f"\u2139\ufe0f Use {code('/bulk reminder')}.", parse_mode="HTML")
+        return
+    from app.followups.service import bulk_reminder
+
+    who = f"@{message.from_user.username}" if message.from_user.username else str(message.from_user.id)
+    wait = await message.answer("\U0001f4e3 Sending reminders to every pending case...", parse_mode="HTML")
+    res = await bulk_reminder(manager.get_poster, actor=who)
+    sent, failed = res["sent"], res["failed"]
+    if not sent and not failed:
+        text = para("\U0001f4ed " + b("NO PENDING CASES"), "Nothing is waiting for an answer in the groups.")
+    else:
+        shown = "\n".join(code(x) for x in sent[:40]) + (
+            f"\n\u2026 and {len(sent) - 40} more" if len(sent) > 40 else ""
+        )
+        text = para(
+            "\U0001f4e3 " + b("BULK REMINDER SENT"),
+            f"\u2705 Reminded: {len(sent)}" + (f"\n\u26a0\ufe0f Failed: {len(failed)}" if failed else ""),
+            shown,
+        )
+    try:
+        await wait.edit_text(text, parse_mode="HTML")
+    except Exception:  # noqa: BLE001
+        await message.answer(text, parse_mode="HTML")
 
 
 @router.message(Command("status"))
@@ -1102,6 +1133,7 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("cases", "All open cases"),
     ("summary", "All-time overview by stage (or /summary 7 for a week)"),
     ("push", "Force send the CURRENT case when it is 'Already with Betix'"),
+    ("bulk", "/bulk reminder - remind the group about EVERY pending case"),
     ("stopr", "Stop all reminders / follow-ups of a case (/stopr ORDER-ID)"),
     ("cancel", "Discard the case (or search) in progress"),
     ("restart", "Pull the latest code and restart the bot"),

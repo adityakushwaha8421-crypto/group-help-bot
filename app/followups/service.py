@@ -122,3 +122,50 @@ async def execute_followup(session: AsyncSession, fu: Followup, poster) -> str:
     await transition(session, case, target, reason=f"follow-up #{fu.number} sent", strict=False)
     await audit(session, f"FOLLOWUP_{fu.number}_SENT", case_id=case.case_id, result="ok", details={"message_id": mid})
     return "sent"
+
+
+async def bulk_reminder(poster_factory, *, actor: str = "operator") -> dict:
+    """/bulk reminder: reply "Any update?" under EVERY case that is posted and still unanswered - waiting, already
+    followed up, or escalated for silence - in the group it was posted to. Skipped: a case never posted, one
+    already solved, a withdrawal Betix has reversed (it has answered). Every case is handled on its own, so one
+    failed send does not stop the rest. Returns {"sent": [...], "failed": [...], "skipped": n} (case labels)."""
+    from app.db.models import KIND_WITHDRAWAL
+    from app.db.repository import list_monitoring_cases
+    from app.db.session import session_scope
+    from app.telegram.ui import case_label
+
+    async with session_scope() as session:
+        ids = [c.case_id for c in reversed(await list_monitoring_cases(session))]  # oldest first
+    out: dict = {"sent": [], "failed": [], "skipped": 0}
+    for case_id in ids:
+        try:
+            async with session_scope() as session:
+                case = await get_case_for_update(session, case_id)
+                pending = (
+                    case is not None
+                    and case.status in WAITING | {CaseStatus.ESCALATED.value}
+                    and case.betix_root_message_id
+                    and not case.verified_at
+                )
+                if pending and case.kind == KIND_WITHDRAWAL:
+                    from app.cases.manager import _reversal_info
+
+                    pending = await _reversal_info(session, case_id) is None
+                if not pending:
+                    out["skipped"] += 1
+                    continue
+                label = case_label(case)
+                mid = await poster_factory().send_reminder(session, case)
+                await audit(
+                    session,
+                    "BULK_REMINDER_SENT",
+                    case_id=case_id,
+                    actor=actor,
+                    result="ok",
+                    details={"message_id": mid, "chat_id": case.betix_chat_id},
+                )
+            out["sent"].append(label)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bulk reminder failed", case_id=case_id, error=str(exc)[:200])
+            out["failed"].append(case_id)
+    return out
