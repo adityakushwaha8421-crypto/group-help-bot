@@ -1112,3 +1112,34 @@ async def test_a_file_added_to_a_native_case_goes_under_every_orders_post(
     assert fake_poster.media_replies[2:] == [("bank_statement", 501), ("bank_statement", 502)]
     assert set(fake_poster.chats) == {NATIVE_CHAT}
     del attach_message
+
+
+async def test_a_native_case_takes_the_statement_its_password_and_the_video_along(
+    db, fake_bot, fake_ai, order_search, no_download, fake_poster
+):
+    """Everything the operator gave goes to the Native group: the statement (password in its caption) and the
+    video as replies under EACH order's post."""
+    from app.cases.correlation import attach_message
+
+    paid(fake_ai, 6500.0)
+    case_id = await two_items(db)
+    async with db.session_scope() as s:
+        await attach_message(s, make_input(3, "document"))
+        await attach_message(s, make_input(4, "video"))
+        (await get_case(s, case_id)).statement_password = "RAVI1234"
+    order_search(NATIVE_TWO)
+    async with db.session_scope() as s:
+        assert await manager.process_case(s, case_id, force=True, force_send=True) == "ready"
+        assert await manager.post_case_to_betix(s, case_id, fake_poster) == "posted"
+        ids = (await get_case(s, case_id)).native_order_ids
+        assert await manager.post_case_to_betix(s, case_id, fake_poster) == "already"  # again: nothing repeats
+    assert set(fake_poster.chats) == {NATIVE_CHAT}
+    shots = [c for t, c in fake_poster.media if t == "payment_screenshot"]
+    assert shots == ids  # one screenshot per order id
+    roots = [r for t, r in fake_poster.media_replies if t == "payment_screenshot"]
+    stmts = [(c, r) for (t, c), (_, r) in zip(fake_poster.media, fake_poster.media_replies) if t == "bank_statement"]
+    videos = [(c, r) for (t, c), (_, r) in zip(fake_poster.media, fake_poster.media_replies) if t == "payment_video"]
+    assert len(stmts) == len(videos) == len(ids)  # under each order's post
+    assert [c for c, _ in stmts] == [f"{i}\nPassword:- RAVI1234" for i in ids]
+    assert [c for c, _ in videos] == ids and all(r is not None for _, r in stmts + videos)
+    assert roots == [None] * len(ids)

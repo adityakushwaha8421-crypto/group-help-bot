@@ -1739,7 +1739,11 @@ async def post_case_to_betix(session: AsyncSession, case_id: str, poster, *, for
         reason="monitoring Native group replies" if native else "monitoring Betix replies",
     )
     if native:
-        return "posted"  # no reminders in the Native group, nothing else to send there
+        # No reminders in the Native group. Everything the operator gave goes with the screenshot: the bank
+        # statement (its password in the caption) and the payment video, as replies under each order's post.
+        if get_settings().betix_extra_evidence_policy == "always":
+            await post_late_evidence(session, case, poster, requested=True)
+        return "posted"
     await schedule_case_followups(session, case)
     if get_settings().betix_extra_evidence_policy == "always":
         await post_late_evidence(session, case, poster, requested=True)
@@ -1807,6 +1811,8 @@ async def post_late_evidence(session: AsyncSession, case: Case, poster, *, reque
     if not pending:
         return 0
     try:
+        if is_native(case):  # every order of a Native case has its own post: the file goes under each of them
+            return await poster.post_native_added(session, case, pending)
         return await poster.post_late_evidence(session, case, pending)
     except Exception as exc:  # noqa: BLE001
         log.exception("late evidence post failed", case_id=case.case_id)

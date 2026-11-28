@@ -1149,7 +1149,11 @@ def case_status_lines(case, evidence) -> list[str]:
         (f"\u2705 Mobile: {code(case.mobile)}" if case.mobile else "\u23f3 Mobile \u2014 waiting"),
     ]
     if is_native(case):
-        lines.append("\U0001f500 Gateway: " + b("Native") + " \u2014 no statement or video needed")
+        lines.append(
+            "\U0001f500 Gateway: "
+            + b("Native")
+            + " \u2014 statement and video are optional; whatever you send goes along"
+        )
         return lines
     lines += [
         ("\u2705 Bank Statement" if "bank_statement" in types else "\u23f3 Bank Statement \u2014 waiting"),

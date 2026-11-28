@@ -181,7 +181,8 @@ class BetixPoster:
         """NATIVE: the payment screenshot goes to the Native group ONCE PER ORDER ID - one message per order created
         under the mobile at the payment time, each carrying the screenshot and that single order id as its caption
         (closest to the payment first; never several ids in one caption). The first is the case's anchor. Nothing
-        else: no statement, no video, no amount note, no reminders. Idempotent per order id."""
+        else here: the statement and the video follow as replies (post_native_added); no amount note, no reminders.
+        Idempotent per order id."""
         self.bind(case)
         ids = [x for x in (case.native_order_ids or []) if x] or (
             [case.betex_pay_order_id] if case.betex_pay_order_id else []
